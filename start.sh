@@ -45,13 +45,39 @@ else:
 ' "$1"
 }
 
-API_PORT="$(find_free_port 8000)"
-FRONTEND_PORT="$(find_free_port 5173)"
+select_port() {
+  local variable_name="$1"
+  local default_port="$2"
+  local requested_port="${!variable_name:-}"
+  if [[ -z "$requested_port" && -f "$ROOT_DIR/.env" ]]; then
+    requested_port="$(sed -n "s/^${variable_name}=//p" "$ROOT_DIR/.env" | head -n 1 | tr -d '\r')"
+    requested_port="${requested_port%\"}"
+    requested_port="${requested_port#\"}"
+  fi
+  if [[ -z "$requested_port" ]]; then
+    find_free_port "$default_port"
+    return
+  fi
+  if [[ ! "$requested_port" =~ ^[0-9]{1,5}$ ]] || (( requested_port < 1024 || requested_port > 65535 )); then
+    printf '%s must be a port number between 1024 and 65535.\n' "$variable_name" >&2
+    return 1
+  fi
+  if ! "$ROOT_DIR/.venv/bin/python" -c 'import socket,sys; s=socket.socket(); s.bind(("127.0.0.1", int(sys.argv[1]))); s.close()' "$requested_port"; then
+    printf '%s port %s is already in use.\n' "$variable_name" "$requested_port" >&2
+    return 1
+  fi
+  printf '%s\n' "$requested_port"
+}
+
+API_PORT="$(select_port NORN_API_PORT 8000)"
+FRONTEND_PORT="$(select_port NORN_FRONTEND_PORT 5173)"
 API_URL="http://127.0.0.1:$API_PORT"
 
 export PATH="$(dirname -- "$NODE_EXECUTABLE"):$PATH"
 
-"$UVICORN" app:app --app-dir "$ROOT_DIR/backend" --host 127.0.0.1 --port "$API_PORT" &
+NORN_API_URL="$API_URL" NORN_FRONTEND_URL="http://127.0.0.1:$FRONTEND_PORT" \
+  NORN_GOOGLE_REDIRECT_URI="$API_URL/" \
+  "$UVICORN" app:app --app-dir "$ROOT_DIR/backend" --host 127.0.0.1 --port "$API_PORT" &
 BACKEND_PID=$!
 (
   cd "$ROOT_DIR/frontend"

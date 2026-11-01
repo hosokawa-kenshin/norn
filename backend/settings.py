@@ -9,6 +9,16 @@ load_dotenv(PROJECT_ROOT / '.env')
 
 DATA_DIR = Path(os.getenv('NORN_DATA_DIR', PROJECT_ROOT / 'data'))
 DB_PATH = Path(os.getenv('NORN_DB_PATH', DATA_DIR / 'norn.sqlite3'))
+NORN_API_URL = os.getenv('NORN_API_URL', 'http://127.0.0.1:8000').rstrip('/')
+NORN_FRONTEND_URL = os.getenv('NORN_FRONTEND_URL', 'http://127.0.0.1:5173').rstrip('/')
+GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '')
+GOOGLE_REDIRECT_URI = os.getenv(
+	'NORN_GOOGLE_REDIRECT_URI', f'{NORN_API_URL}/'
+)
+GOOGLE_CALENDAR_ID = os.getenv('NORN_GOOGLE_CALENDAR_ID', 'primary')
+GOOGLE_SYNC_INTERVAL_SECONDS = 300
+GOOGLE_TOKEN_PATH = DATA_DIR / 'google-calendar-token.json'
 STT_MODEL_NAME = os.getenv('STT_MODEL', 'small')
 STT_DEVICE = os.getenv('STT_DEVICE', 'cpu')
 STT_COMPUTE_TYPE = os.getenv('STT_COMPUTE_TYPE', 'int8')

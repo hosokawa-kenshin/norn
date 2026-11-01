@@ -37,7 +37,33 @@ type EventItem = {
   description: string
   start_at: string
   end_at: string
+  is_all_day: boolean
+  recurrence: string[]
+  series_id?: string | null
+  occurrence_id?: string
+  series_title?: string
+  series_description?: string
+  series_start_at?: string
+  series_end_at?: string
+  series_is_all_day?: boolean
+  series_recurrence?: string[]
 }
+type CalendarConflict = {
+  event_id: string
+  title: string
+  local: { title: string; start_at: string; end_at: string; description: string; deleted?: boolean }
+  remote: { title?: string; start_at?: string; end_at?: string; description?: string; deleted?: boolean }
+}
+type GoogleCalendarStatus = {
+  configured: boolean
+  connected: boolean
+  calendar_id: string
+  sync_interval_seconds: number
+  last_sync_at: string | null
+  last_error: string | null
+  conflicts: CalendarConflict[]
+}
+type GoogleCalendarChoice = { id: string; name: string; primary: boolean; time_zone: string }
 type TaskAllocation = {
   id: string
   task_id: string
@@ -51,8 +77,12 @@ type EventDraft = {
   title: string
   description: string
   date: string
+  endDate: string
   startTime: string
   endTime: string
+  isAllDay: boolean
+  recurrence: string[]
+  repeat: string
 }
 
 function localDateKey(date: Date) {
@@ -87,7 +117,26 @@ function formatEventTime(value: string) {
 }
 
 function createEventDraft(date: string): EventDraft {
-  return { title: '', description: '', date, startTime: '10:00', endTime: '11:00' }
+  return {
+    title: '', description: '', date, endDate: date, startTime: '10:00', endTime: '11:00',
+    isAllDay: false, recurrence: [], repeat: 'NONE',
+  }
+}
+
+function recurrenceChoice(recurrence: string[]) {
+  if (!recurrence.length) return 'NONE'
+  if (recurrence.length !== 1) return 'CUSTOM'
+  const rule = recurrence.find((line) => line.startsWith('RRULE:')) ?? ''
+  if (rule === 'RRULE:FREQ=DAILY') return 'DAILY'
+  if (rule === 'RRULE:FREQ=MONTHLY') return 'MONTHLY'
+  if (/^RRULE:FREQ=WEEKLY;BYDAY=(SU|MO|TU|WE|TH|FR|SA)$/.test(rule)) return 'WEEKLY'
+  return 'CUSTOM'
+}
+
+function nextLocalDate(value: string) {
+  const date = new Date(`${value}T00:00:00`)
+  date.setDate(date.getDate() + 1)
+  return localDateKey(date)
 }
 
 function formatTime(seconds: number) {
@@ -117,7 +166,9 @@ export default function NornApp() {
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState('')
-  const [showSettings, setShowSettings] = useState(false)
+  const [showSettings, setShowSettings] = useState(
+    () => new URLSearchParams(window.location.search).get('googleCalendar') === 'connected',
+  )
   const [view, setView] = useState<AppView>('chat')
   const [calendarMode, setCalendarMode] = useState<CalendarMode>('week')
   const [selectedDate, setSelectedDate] = useState(() => localDateKey(new Date()))
@@ -127,6 +178,11 @@ export default function NornApp() {
   const [showEventEditor, setShowEventEditor] = useState(false)
   const [editingEventId, setEditingEventId] = useState<string | null>(null)
   const [eventDraft, setEventDraft] = useState<EventDraft>(() => createEventDraft(localDateKey(new Date())))
+  const [calendarRefresh, setCalendarRefresh] = useState(0)
+  const [googleCalendar, setGoogleCalendar] = useState<GoogleCalendarStatus | null>(null)
+  const [googleCalendars, setGoogleCalendars] = useState<GoogleCalendarChoice[]>([])
+  const [googleCalendarError, setGoogleCalendarError] = useState('')
+  const [googleCalendarBusy, setGoogleCalendarBusy] = useState(false)
   const recorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const chunksRef = useRef<Blob[]>([])
@@ -148,6 +204,38 @@ export default function NornApp() {
       .catch(() => undefined)
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('googleCalendar') !== 'connected') return
+    window.history.replaceState({}, '', window.location.pathname)
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    const refresh = () => fetch('/api/google-calendar/status')
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await responseError(response))
+        return response.json() as Promise<GoogleCalendarStatus>
+      })
+      .then((value) => { if (active) setGoogleCalendar(value) })
+      .catch((reason) => { if (active) setGoogleCalendarError(reason instanceof Error ? reason.message : 'Google Calendar状態を取得できません。') })
+    void refresh()
+    const timer = window.setInterval(() => { void refresh() }, 30000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [calendarRefresh])
+
+  useEffect(() => {
+    if (!showSettings || !googleCalendar?.connected) return
+    let active = true
+    fetch('/api/google-calendar/calendars')
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await responseError(response))
+        return response.json() as Promise<{ selected_calendar_id: string; calendars: GoogleCalendarChoice[] }>
+      })
+      .then((value) => { if (active) setGoogleCalendars(value.calendars) })
+      .catch((reason) => { if (active) setGoogleCalendarError(reason instanceof Error ? reason.message : 'カレンダー一覧を取得できません。') })
+    return () => { active = false }
+  }, [showSettings, googleCalendar?.connected, calendarRefresh])
 
   useEffect(() => {
     if (view !== 'schedule') return
@@ -173,7 +261,13 @@ export default function NornApp() {
         if (active) setEventError(reason instanceof Error ? reason.message : '予定を取得できませんでした。')
       })
     return () => { active = false }
-  }, [view, selectedDate, calendarMode])
+  }, [view, selectedDate, calendarMode, calendarRefresh])
+
+  useEffect(() => {
+    if (view !== 'schedule') return
+    const timer = window.setInterval(() => setCalendarRefresh((current) => current + 1), 300000)
+    return () => window.clearInterval(timer)
+  }, [view])
 
   useEffect(() => {
     if (!activeId) {
@@ -364,13 +458,22 @@ export default function NornApp() {
   }
 
   function openEditEvent(event: EventItem) {
-    setEditingEventId(event.id)
+    const startAt = event.series_start_at ?? event.start_at
+    const endAt = event.series_end_at ?? event.end_at
+    const isAllDay = event.series_is_all_day ?? event.is_all_day
+    const recurrence = event.series_recurrence ?? event.recurrence
+    const endDate = localDateKey(new Date(new Date(endAt).getTime() - (isAllDay ? 86400000 : 0)))
+    setEditingEventId(event.series_id ?? event.id)
     setEventDraft({
-      title: event.title,
-      description: event.description,
-      date: localDateKey(new Date(event.start_at)),
-      startTime: timeInputValue(event.start_at),
-      endTime: timeInputValue(event.end_at),
+      title: event.series_title ?? event.title,
+      description: event.series_description ?? event.description,
+      date: localDateKey(new Date(startAt)),
+      endDate,
+      startTime: timeInputValue(startAt),
+      endTime: timeInputValue(endAt),
+      isAllDay,
+      recurrence,
+      repeat: recurrenceChoice(recurrence),
     })
     setEventError('')
     setShowEventEditor(true)
@@ -379,14 +482,26 @@ export default function NornApp() {
   async function saveEvent(formEvent: FormEvent<HTMLFormElement>) {
     formEvent.preventDefault()
     setEventError('')
+    if (eventDraft.isAllDay && eventDraft.endDate < eventDraft.date) {
+      setEventError('終了日は開始日以降を指定してください。')
+      return
+    }
+    const repeat = eventDraft.repeat
+    const weeklyDay = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'][new Date(`${eventDraft.date}T00:00:00`).getDay()]
+    const recurrence = repeat === 'CUSTOM'
+      ? eventDraft.recurrence
+      : repeat === 'NONE' ? [] : [`RRULE:FREQ=${repeat}${repeat === 'WEEKLY' ? `;BYDAY=${weeklyDay}` : ''}`]
+    const endDate = eventDraft.isAllDay ? nextLocalDate(eventDraft.endDate) : eventDraft.date
     const response = await fetch(editingEventId ? `/api/events/${editingEventId}` : '/api/events', {
       method: editingEventId ? 'PUT' : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         title: eventDraft.title,
         description: eventDraft.description,
-        start_at: `${eventDraft.date}T${eventDraft.startTime}:00+09:00`,
-        end_at: `${eventDraft.date}T${eventDraft.endTime}:00+09:00`,
+        start_at: `${eventDraft.date}T${eventDraft.isAllDay ? '00:00' : eventDraft.startTime}:00+09:00`,
+        end_at: `${endDate}T${eventDraft.isAllDay ? '00:00' : eventDraft.endTime}:00+09:00`,
+        is_all_day: eventDraft.isAllDay,
+        recurrence,
       }),
     }).catch(() => null)
 
@@ -399,18 +514,14 @@ export default function NornApp() {
       return
     }
 
-    const saved = (await response.json()) as EventItem
-    setEvents((current) => {
-      const next = editingEventId
-        ? current.map((event) => event.id === saved.id ? saved : event)
-        : [...current, saved]
-      return next.sort((left, right) => left.start_at.localeCompare(right.start_at))
-    })
+    setCalendarRefresh((current) => current + 1)
     setShowEventEditor(false)
   }
 
   async function deleteEvent(event: EventItem) {
-    const response = await fetch(`/api/events/${event.id}`, { method: 'DELETE' }).catch(() => null)
+    const eventId = event.series_id ?? event.id
+    if (event.series_id && !window.confirm('この予定の繰り返しシリーズ全体を削除しますか？')) return
+    const response = await fetch(`/api/events/${eventId}`, { method: 'DELETE' }).catch(() => null)
     if (!response) {
       setEventError('バックエンドに接続できません。')
       return
@@ -419,7 +530,68 @@ export default function NornApp() {
       setEventError(await responseError(response))
       return
     }
-    setEvents((current) => current.filter((item) => item.id !== event.id))
+    setCalendarRefresh((current) => current + 1)
+  }
+
+  async function connectGoogleCalendar() {
+    setGoogleCalendarBusy(true)
+    setGoogleCalendarError('')
+    try {
+      const response = await fetch('/api/google-calendar/authorize', { method: 'POST' })
+      if (!response.ok) throw new Error(await responseError(response))
+      const result = await response.json() as { authorization_url: string }
+      window.location.assign(result.authorization_url)
+    } catch (reason) {
+      setGoogleCalendarError(reason instanceof Error ? reason.message : 'Google認証を開始できません。')
+      setGoogleCalendarBusy(false)
+    }
+  }
+
+  async function syncGoogleCalendar() {
+    setGoogleCalendarBusy(true)
+    setGoogleCalendarError('')
+    try {
+      const response = await fetch('/api/google-calendar/sync', { method: 'POST' })
+      if (!response.ok) throw new Error(await responseError(response))
+      setCalendarRefresh((current) => current + 1)
+    } catch (reason) {
+      setGoogleCalendarError(reason instanceof Error ? reason.message : '同期に失敗しました。')
+    } finally {
+      setGoogleCalendarBusy(false)
+    }
+  }
+
+  async function selectGoogleCalendar(calendarId: string) {
+    setGoogleCalendarBusy(true)
+    setGoogleCalendarError('')
+    try {
+      const response = await fetch('/api/google-calendar/calendar', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ calendar_id: calendarId }),
+      })
+      if (!response.ok) throw new Error(await responseError(response))
+      setCalendarRefresh((current) => current + 1)
+    } catch (reason) {
+      setGoogleCalendarError(reason instanceof Error ? reason.message : '同期先カレンダーを変更できません。')
+    } finally {
+      setGoogleCalendarBusy(false)
+    }
+  }
+
+  async function resolveGoogleConflict(eventId: string, choice: 'local' | 'google') {
+    setGoogleCalendarBusy(true)
+    setGoogleCalendarError('')
+    try {
+      const response = await fetch(`/api/google-calendar/conflicts/${eventId}/resolve`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ choice }),
+      })
+      if (!response.ok) throw new Error(await responseError(response))
+      setCalendarRefresh((current) => current + 1)
+    } catch (reason) {
+      setGoogleCalendarError(reason instanceof Error ? reason.message : '競合を解決できません。')
+    } finally {
+      setGoogleCalendarBusy(false)
+    }
   }
 
   async function unscheduleTask(task: TaskAllocation) {
@@ -494,8 +666,8 @@ export default function NornApp() {
             </div>
             <Activity size={15} className="status-activity" />
           </div>
-          <button className="settings-link" type="button" onClick={() => setShowSettings(true)}>
-            <Settings2 size={16} /><span>設定</span><ChevronRight size={15} />
+            <button className="settings-link" type="button" onClick={() => setShowSettings(true)}>
+              <Settings2 size={16} /><span>設定</span>{!!googleCalendar?.conflicts.length && <span className="settings-conflict-count">{googleCalendar.conflicts.length}</span>}<ChevronRight size={15} />
           </button>
         </div>
       </aside>
@@ -513,6 +685,7 @@ export default function NornApp() {
             <div className="topbar-state"><span className={`llm-dot ${status?.llm.configured ? 'is-ready' : ''}`} />
               <span>{status?.llm.configured ? 'AI接続済み' : 'AI未設定'}</span>
             </div>
+            <button className={`icon-button topbar-settings ${googleCalendar?.conflicts.length ? 'has-conflict' : ''}`} type="button" onClick={() => setShowSettings(true)} aria-label={googleCalendar?.conflicts.length ? '同期競合あり、設定' : '設定'} title={googleCalendar?.conflicts.length ? '同期競合があります' : '設定'}><Settings2 size={16} />{!!googleCalendar?.conflicts.length && <span className="settings-alert-dot" />}</button>
           </div>
         </header>
 
@@ -570,7 +743,12 @@ export default function NornApp() {
           <div className={`calendar-days ${calendarMode}`}>
             {calendarDays.map((day) => {
               const dayKey = localDateKey(day)
-              const dayEvents = events.filter((event) => localDateKey(new Date(event.start_at)) === dayKey)
+              const dayEvents = events.filter((event) => {
+                const startKey = localDateKey(new Date(event.start_at))
+                if (!event.is_all_day) return startKey === dayKey
+                const exclusiveEndKey = localDateKey(new Date(new Date(event.end_at).getTime() - 1))
+                return startKey <= dayKey && exclusiveEndKey >= dayKey
+              })
               const dayTaskAllocations = taskAllocations.filter((task) => localDateKey(new Date(task.start_at)) === dayKey)
               return <section className="calendar-day" key={dayKey} aria-label={formatLongDate(day)}>
                 <header className="calendar-day-heading">
@@ -578,10 +756,10 @@ export default function NornApp() {
                   <span className="event-count">{dayEvents.length}予定 / {dayTaskAllocations.length}タスク</span>
                 </header>
                 {dayEvents.length === 0 && dayTaskAllocations.length === 0 ? <p className="day-empty">予定なし</p> : <div className="event-list">
-                  {dayEvents.map((event) => <article className="event-row" key={event.id}>
-                    <div className="event-time"><strong>{formatEventTime(event.start_at)}</strong><span>{formatEventTime(event.end_at)}</span></div>
+                  {dayEvents.map((event) => <article className="event-row" key={event.occurrence_id ?? event.id}>
+                    <div className="event-time"><strong>{event.is_all_day ? '終日' : formatEventTime(event.start_at)}</strong>{!event.is_all_day && <span>{formatEventTime(event.end_at)}</span>}</div>
                     <div className="event-color-mark" />
-                    <div className="event-content"><h3>{event.title}</h3>{event.description && <p>{event.description}</p>}</div>
+                    <div className="event-content"><h3>{event.title}</h3>{event.recurrence.length > 0 && <span className="event-repeat-label">繰り返し</span>}{event.description && <p>{event.description}</p>}</div>
                     <div className="event-controls">
                       <button className="calendar-icon-button" type="button" onClick={() => openEditEvent(event)} aria-label={`${event.title}を編集`} title="編集"><Pencil size={15} /></button>
                       <button className="calendar-icon-button danger" type="button" onClick={() => void deleteEvent(event)} aria-label={`${event.title}を削除`} title="削除"><Trash2 size={15} /></button>
@@ -642,13 +820,51 @@ export default function NornApp() {
       {showSettings && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
         if (event.target === event.currentTarget) setShowSettings(false)
       }}>
-        <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <section className="settings-dialog calendar-settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
           <div className="dialog-heading"><div><div className="eyebrow">SYSTEM CONFIGURATION</div><h2 id="settings-title">接続設定</h2></div>
             <button className="icon-button" type="button" onClick={() => setShowSettings(false)} aria-label="閉じる">×</button>
           </div>
           <div className="setting-row"><span>音声認識</span><strong>ローカル / {status?.stt.model ?? '未接続'}</strong></div>
           <div className="setting-row"><span>LLM</span><strong>{status?.llm.configured ? status.llm.model : '未設定'}</strong></div>
           <p className="settings-help">LLMの接続先とAPIキーは、NORN直下の <code>.env</code> で設定します。キーはブラウザーへ送られません。</p>
+          <div className="calendar-settings-heading"><CalendarDays size={16} /><strong>Google Calendar</strong></div>
+          <div className="setting-row"><span>接続状態</span><strong>{googleCalendar?.connected ? '接続済み' : googleCalendar?.configured ? '未接続' : '未設定'}</strong></div>
+          <div className="setting-row"><span>自動同期</span><strong>{googleCalendar ? `${googleCalendar.sync_interval_seconds / 60}分ごと` : '確認中'}</strong></div>
+          {googleCalendar?.last_sync_at && <p className="calendar-sync-time">最終同期 {formatDate(googleCalendar.last_sync_at)}</p>}
+          {googleCalendar?.last_error && <div className="error-banner" role="alert"><CircleAlert size={15} /><span>{googleCalendar.last_error}</span></div>}
+          {googleCalendarError && <div className="error-banner" role="alert"><CircleAlert size={15} /><span>{googleCalendarError}</span></div>}
+          {googleCalendar?.connected && googleCalendars.length > 0 && <>
+            <label className="event-field calendar-picker">同期するカレンダー
+              <select value={googleCalendar.calendar_id} disabled={googleCalendarBusy} onChange={(event) => void selectGoogleCalendar(event.target.value)}>
+                {googleCalendars.map((calendar) => <option key={calendar.id} value={calendar.id}>{calendar.name}{calendar.primary ? '（メイン）' : ''}</option>)}
+              </select>
+            </label>
+            <p className="settings-help">選択した1つのカレンダーを双方向同期します。別のカレンダーへ切り替えても、以前同期した予定はNORNに残り、そのカレンダーを再選択すると同期を再開します。</p>
+          </>}
+          {!googleCalendar?.configured && <p className="settings-help">NORNの <code>.env</code> にGoogle OAuth client ID/secretとredirect URIを設定してください。tokenはGit管理外のdataフォルダーに保存されます。</p>}
+          <div className="calendar-connect-actions">
+            {!googleCalendar?.connected
+              ? <button className="dialog-close" type="button" onClick={() => void connectGoogleCalendar()} disabled={!googleCalendar?.configured || googleCalendarBusy}>{googleCalendarBusy ? '接続中…' : 'Googleに接続'}</button>
+              : <>
+                <button className="dialog-close" type="button" onClick={() => void syncGoogleCalendar()} disabled={googleCalendarBusy}>{googleCalendarBusy ? '同期中…' : '今すぐ同期'}</button>
+                <button className="calendar-reconnect-button" type="button" onClick={() => void connectGoogleCalendar()} disabled={googleCalendarBusy}>Googleの権限を更新 / 再接続</button>
+              </>}
+          </div>
+          {!!googleCalendar?.conflicts.length && <section className="calendar-conflicts" aria-label="同期の競合">
+            <h3>同期を保留中の予定 ({googleCalendar.conflicts.length})</h3>
+            <p>両側で変更された予定です。どちらを残すか選ぶまで自動同期を停止しています。</p>
+            {googleCalendar.conflicts.map((conflict) => <article className="calendar-conflict" key={conflict.event_id}>
+              <strong>{conflict.title}</strong>
+              <div className="conflict-values">
+                <div><span>NORN</span><p>{conflict.local.deleted ? 'NORN側で削除' : <>{conflict.local.title}<br />{formatDate(conflict.local.start_at)} - {formatDate(conflict.local.end_at)}<br />{conflict.local.description}</>}</p></div>
+                <div><span>Google</span><p>{conflict.remote.deleted ? 'Google側で削除' : <>{conflict.remote.title}<br />{conflict.remote.start_at ? formatDate(conflict.remote.start_at) : ''}{conflict.remote.end_at ? ` - ${formatDate(conflict.remote.end_at)}` : ''}<br />{conflict.remote.description}</>}</p></div>
+              </div>
+              <div className="conflict-actions">
+                <button type="button" onClick={() => void resolveGoogleConflict(conflict.event_id, 'local')} disabled={googleCalendarBusy}>NORNを採用</button>
+                <button type="button" onClick={() => void resolveGoogleConflict(conflict.event_id, 'google')} disabled={googleCalendarBusy}>Googleを採用</button>
+              </div>
+            </article>)}
+          </section>}
           <button className="dialog-close" type="button" onClick={() => setShowSettings(false)}>閉じる</button>
         </section>
       </div>}
@@ -657,16 +873,24 @@ export default function NornApp() {
         if (event.target === event.currentTarget) setShowEventEditor(false)
       }}>
         <form className="settings-dialog event-dialog" role="dialog" aria-modal="true" aria-labelledby="event-dialog-title" onSubmit={saveEvent}>
-          <div className="dialog-heading"><div><div className="eyebrow">SCHEDULE / EVENT</div><h2 id="event-dialog-title">{editingEventId ? '予定を編集' : '予定を追加'}</h2></div>
+          <div className="dialog-heading"><div><div className="eyebrow">SCHEDULE / EVENT</div><h2 id="event-dialog-title">{editingEventId ? eventDraft.recurrence.length ? '繰り返しを編集' : '予定を編集' : '予定を追加'}</h2></div>
             <button className="icon-button" type="button" onClick={() => setShowEventEditor(false)} aria-label="閉じる">×</button>
           </div>
+          {editingEventId && eventDraft.recurrence.length > 0 && <p className="event-series-note">変更は繰り返しシリーズ全体に適用されます。</p>}
           {eventError && <div className="error-banner" role="alert"><CircleAlert size={15} /><span>{eventError}</span></div>}
           <label className="event-field">予定名<input autoFocus required maxLength={120} value={eventDraft.title} onChange={(event) => setEventDraft({ ...eventDraft, title: event.target.value })} placeholder="例: 定例ミーティング" /></label>
-          <label className="event-field">日付<input required type="date" value={eventDraft.date} onChange={(event) => setEventDraft({ ...eventDraft, date: event.target.value })} /></label>
-          <div className="event-time-fields">
-            <label className="event-field">開始<input required type="time" value={eventDraft.startTime} onChange={(event) => setEventDraft({ ...eventDraft, startTime: event.target.value })} /></label>
-            <label className="event-field">終了<input required type="time" value={eventDraft.endTime} onChange={(event) => setEventDraft({ ...eventDraft, endTime: event.target.value })} /></label>
-          </div>
+          <label className="event-field">日付<input required type="date" value={eventDraft.date} onChange={(event) => setEventDraft({ ...eventDraft, date: event.target.value, endDate: eventDraft.isAllDay ? event.target.value : eventDraft.endDate })} /></label>
+          <label className="event-toggle"><input type="checkbox" checked={eventDraft.isAllDay} onChange={(event) => setEventDraft({ ...eventDraft, isAllDay: event.target.checked, endDate: eventDraft.date })} />終日</label>
+          {eventDraft.isAllDay
+            ? <label className="event-field">終了日（含む）<input required type="date" min={eventDraft.date} value={eventDraft.endDate} onChange={(event) => setEventDraft({ ...eventDraft, endDate: event.target.value })} /></label>
+            : <div className="event-time-fields">
+              <label className="event-field">開始<input required type="time" value={eventDraft.startTime} onChange={(event) => setEventDraft({ ...eventDraft, startTime: event.target.value })} /></label>
+              <label className="event-field">終了<input required type="time" value={eventDraft.endTime} onChange={(event) => setEventDraft({ ...eventDraft, endTime: event.target.value })} /></label>
+            </div>}
+          <label className="event-field">繰り返し<select value={eventDraft.repeat} onChange={(event) => setEventDraft({ ...eventDraft, repeat: event.target.value })}>
+            <option value="NONE">なし</option><option value="DAILY">毎日</option><option value="WEEKLY">毎週</option><option value="MONTHLY">毎月</option>
+            {eventDraft.repeat === 'CUSTOM' && <option value="CUSTOM">Googleの設定を維持</option>}
+          </select></label>
           <label className="event-field">メモ<textarea maxLength={2000} rows={3} value={eventDraft.description} onChange={(event) => setEventDraft({ ...eventDraft, description: event.target.value })} placeholder="場所や準備事項" /></label>
           <div className="event-dialog-actions"><button className="cancel-button" type="button" onClick={() => setShowEventEditor(false)}>キャンセル</button><button className="dialog-close" type="submit">{editingEventId ? '変更を保存' : '予定を保存'}</button></div>
         </form>

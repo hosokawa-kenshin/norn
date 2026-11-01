@@ -3,7 +3,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from settings import DB_PATH
+from settings import DB_PATH, GOOGLE_CALENDAR_ID
 
 
 def now_iso() -> str:
@@ -66,11 +66,42 @@ def initialize_database() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 start_at TEXT NOT NULL,
                 end_at TEXT NOT NULL,
+                is_all_day INTEGER NOT NULL DEFAULT 0,
+                recurrence_timezone TEXT NOT NULL DEFAULT 'Asia/Tokyo',
+                recurrence_json TEXT NOT NULL DEFAULT '[]',
+                google_event_id TEXT UNIQUE,
+                google_calendar_id TEXT,
+                google_etag TEXT,
+                google_updated_at TEXT,
+                sync_snapshot TEXT,
+                sync_status TEXT NOT NULL DEFAULT 'local',
+                conflict_payload TEXT,
+                recurring_event_id TEXT,
+                original_start_at TEXT,
+                is_cancelled INTEGER NOT NULL DEFAULT 0,
+                deleted_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_events_start_end
                 ON events(start_at, end_at);
+            CREATE TABLE IF NOT EXISTS google_calendar_sync_state (
+                calendar_id TEXT PRIMARY KEY,
+                sync_token TEXT,
+                last_sync_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS google_calendar_preferences (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                calendar_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS google_calendar_oauth_states (
+                state TEXT PRIMARY KEY,
+                code_verifier TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS goals (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -135,6 +166,39 @@ def initialize_database() -> None:
         }
         if 'last_reviewed_at' not in goal_columns:
             connection.execute('ALTER TABLE goals ADD COLUMN last_reviewed_at TEXT')
+        event_columns = {
+            row['name'] for row in connection.execute('PRAGMA table_info(events)').fetchall()
+        }
+        event_migrations = {
+            'is_all_day': 'INTEGER NOT NULL DEFAULT 0',
+            'recurrence_timezone': "TEXT NOT NULL DEFAULT 'Asia/Tokyo'",
+            'recurrence_json': "TEXT NOT NULL DEFAULT '[]'",
+            'google_event_id': 'TEXT',
+            'google_calendar_id': 'TEXT',
+            'google_etag': 'TEXT',
+            'google_updated_at': 'TEXT',
+            'sync_snapshot': 'TEXT',
+            'sync_status': "TEXT NOT NULL DEFAULT 'local'",
+            'conflict_payload': 'TEXT',
+            'recurring_event_id': 'TEXT',
+            'original_start_at': 'TEXT',
+            'is_cancelled': 'INTEGER NOT NULL DEFAULT 0',
+            'deleted_at': 'TEXT',
+        }
+        for column, definition in event_migrations.items():
+            if column not in event_columns:
+                connection.execute(f'ALTER TABLE events ADD COLUMN {column} {definition}')
+        connection.execute(
+            'CREATE UNIQUE INDEX IF NOT EXISTS ix_events_google_event_id ON events(google_event_id)'
+        )
+        connection.execute(
+            'INSERT OR IGNORE INTO google_calendar_sync_state (calendar_id, updated_at) VALUES (?, ?)',
+            (GOOGLE_CALENDAR_ID, now_iso()),
+        )
+        connection.execute(
+            'INSERT OR IGNORE INTO google_calendar_preferences (id, calendar_id, updated_at) VALUES (1, ?, ?)',
+            (GOOGLE_CALENDAR_ID, now_iso()),
+        )
         connection.execute(
             'CREATE INDEX IF NOT EXISTS ix_tasks_project_status ON tasks(project_id, status)'
         )

@@ -1,9 +1,11 @@
 import json
 import sqlite3
+import stat
 import struct
 import uuid
 from datetime import datetime, time, timedelta
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
@@ -12,6 +14,7 @@ import app as norn_app
 import chat as chat_module
 import database as database_module
 import events as events_module
+import google_calendar as google_calendar_module
 import memory as memory_module
 import planning as planning_module
 import settings as settings_module
@@ -256,6 +259,24 @@ def test_event_rejects_overlapping_times(monkeypatch, tmp_path):
     assert first.status_code == 201
     assert overlap.status_code == 409
     assert '予定A' in overlap.json()['detail']
+
+
+def test_event_rejects_overlap_with_future_recurring_occurrence(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        series = client.post('/api/events', json={
+            'title': '毎週の会議', 'start_at': '2026-11-02T10:00:00+09:00',
+            'end_at': '2026-11-02T11:00:00+09:00',
+            'recurrence': ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+        })
+        overlap = client.post('/api/events', json={
+            'title': '別の予定', 'start_at': '2026-11-09T10:30:00+09:00',
+            'end_at': '2026-11-09T11:30:00+09:00',
+        })
+
+    assert series.status_code == 201
+    assert overlap.status_code == 409
+    assert '毎週の会議' in overlap.json()['detail']
 
 
 def test_event_requires_end_after_start(monkeypatch, tmp_path):
@@ -918,6 +939,445 @@ def test_gemini_creates_goal_and_linked_project_without_approval(monkeypatch, tm
     assert len(goals) == 1
     assert goals[0]['projects'][0]['title'] == 'アルバム制作'
     assert goals[0]['projects'][0]['goal_id'] == goals[0]['id']
+
+
+class FakeGoogleRequest:
+    def __init__(self, response):
+        self.response = response
+
+    def execute(self):
+        return self.response
+
+
+class FakeGoogleCalendarService:
+    def __init__(self, items=None, calendars=None):
+        self.items = items or []
+        self.calendars = calendars or [
+            {'id': 'user@example.com', 'summary': '個人用', 'primary': True, 'accessRole': 'owner'},
+            {'id': 'work@example.com', 'summary': '仕事', 'accessRole': 'writer'},
+            {'id': 'readonly@example.com', 'summary': '閲覧のみ', 'accessRole': 'reader'},
+        ]
+        self.inserted = []
+        self.inserted_calendar_ids = []
+        self.list_options = []
+        self.deleted = []
+
+    def events(self):
+        return self
+
+    def calendarList(self):
+        return self
+
+    def list(self, **kwargs):
+        if 'minAccessRole' in kwargs:
+            return FakeGoogleRequest({'items': self.calendars})
+        self.list_options.append(kwargs)
+        return FakeGoogleRequest({'items': self.items, 'nextSyncToken': 'test-sync-token'})
+
+    def insert(self, calendarId, body):
+        self.inserted.append(body)
+        self.inserted_calendar_ids.append(calendarId)
+        return FakeGoogleRequest({
+            **body, 'id': f'google-event-{len(self.inserted)}', 'etag': 'etag-1',
+            'updated': '2026-11-01T00:00:00.000Z',
+        })
+
+    def update(self, **kwargs):
+        return FakeGoogleRequest(kwargs['body'])
+
+    def get(self, calendarId):
+        for item in self.calendars:
+            if calendarId in {item['id'], 'primary' if item.get('primary') else item['id']}:
+                return FakeGoogleRequest(item)
+        raise ValueError('calendar not found')
+
+    def delete(self, **kwargs):
+        self.deleted.append(kwargs)
+        return FakeGoogleRequest({})
+
+
+def test_google_calendar_imports_all_day_and_expands_recurring_series(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService([
+        {
+            'id': 'all-day', 'summary': '祝日', 'start': {'date': '2026-11-02'},
+            'end': {'date': '2026-11-03'}, 'etag': 'etag-a',
+        },
+        {
+            'id': 'weekly', 'summary': '週次会議', 'start': {'dateTime': '2026-10-26T10:00:00+09:00'},
+            'end': {'dateTime': '2026-10-26T11:00:00+09:00'},
+            'recurrence': ['RRULE:FREQ=WEEKLY;BYDAY=MO'], 'etag': 'etag-b',
+        },
+    ])
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        result = google_calendar_module.sync_calendar(service)
+        response = client.get('/api/events', params={
+            'start': '2026-11-02T00:00:00+09:00', 'end': '2026-11-09T00:00:00+09:00',
+        })
+
+    assert result['ok'] is True
+    events = response.json()
+    assert [(event['title'], event['is_all_day']) for event in events] == [
+        ('祝日', True), ('週次会議', False),
+    ]
+    assert events[0]['end_at'] == '2026-11-03T00:00:00+09:00'
+    assert events[1]['start_at'] == '2026-11-02T10:00:00+09:00'
+    assert events[1]['series_id']
+    assert str(uuid.UUID(events[1]['id'])) == events[1]['id']
+    assert events[1]['occurrence_id'] != events[1]['id']
+
+
+def test_google_calendar_lists_only_writable_calendars(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService()
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(google_calendar_module, '_calendar_service', lambda: service)
+    with TestClient(norn_app.app) as client:
+        response = client.get('/api/google-calendar/calendars')
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result['selected_calendar_id'] == 'primary'
+    assert [calendar['id'] for calendar in result['calendars']] == ['primary', 'work@example.com']
+    assert result['calendars'][0]['primary'] is True
+
+
+def test_google_calendar_selection_persists_and_syncs_selected_calendar(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService(items=[{
+        'id': 'work-event', 'summary': '仕事の予定',
+        'start': {'dateTime': '2026-11-02T10:00:00+09:00'},
+        'end': {'dateTime': '2026-11-02T11:00:00+09:00'},
+    }])
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(google_calendar_module, '_calendar_service', lambda: service)
+    with TestClient(norn_app.app) as client:
+        local_event = client.post('/api/events', json={
+            'title': 'NORNから仕事へ', 'start_at': '2026-11-02T12:00:00+09:00',
+            'end_at': '2026-11-02T13:00:00+09:00',
+        })
+        selected = client.put('/api/google-calendar/calendar', json={'calendar_id': 'work@example.com'})
+        status = client.get('/api/google-calendar/status').json()
+        events = client.get('/api/events').json()
+
+    assert selected.status_code == 200
+    assert selected.json()['calendar_id'] == 'work@example.com'
+    assert selected.json()['sync']['ok'] is True
+    assert status['calendar_id'] == 'work@example.com'
+    assert service.list_options[0]['calendarId'] == 'work@example.com'
+    assert local_event.status_code == 201
+    assert service.inserted_calendar_ids == ['work@example.com']
+    assert events[0]['title'] == '仕事の予定'
+
+
+def test_google_calendar_rejects_read_only_calendar_selection(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService()
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(google_calendar_module, '_calendar_service', lambda: service)
+    with TestClient(norn_app.app) as client:
+        response = client.put('/api/google-calendar/calendar', json={'calendar_id': 'readonly@example.com'})
+        status = client.get('/api/google-calendar/status').json()
+
+    assert response.status_code == 403
+    assert status['calendar_id'] == 'primary'
+
+
+def test_google_calendar_cancelled_series_occurrence_is_not_displayed(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService([
+        {
+            'id': 'weekly', 'summary': '週次会議',
+            'start': {'dateTime': '2026-11-02T10:00:00+09:00'},
+            'end': {'dateTime': '2026-11-02T11:00:00+09:00'},
+            'recurrence': ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+        },
+        {
+            'id': 'weekly-cancelled-occurrence', 'status': 'cancelled',
+            'recurringEventId': 'weekly',
+            'originalStartTime': {'dateTime': '2026-11-09T10:00:00+09:00'},
+        },
+    ])
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        sync_result = google_calendar_module.sync_calendar(service)
+        cancelled_week = client.get('/api/events', params={
+            'start': '2026-11-09T00:00:00+09:00', 'end': '2026-11-16T00:00:00+09:00',
+        })
+        active_week = client.get('/api/events', params={
+            'start': '2026-11-16T00:00:00+09:00', 'end': '2026-11-23T00:00:00+09:00',
+        })
+        with database_module.open_database() as connection:
+            mapped_events = [dict(row) for row in connection.execute(
+                'SELECT google_event_id, recurring_event_id, original_start_at, deleted_at '
+                'FROM events ORDER BY google_event_id',
+            )]
+
+    assert sync_result['ok'] is True, sync_result
+    assert cancelled_week.json() == []
+    assert any(
+        row['google_event_id'] == 'weekly-cancelled-occurrence'
+        and row['recurring_event_id'] == 'weekly'
+        and row['deleted_at'] is not None
+        for row in mapped_events
+    )
+    assert [event['start_at'] for event in active_week.json()] == ['2026-11-16T10:00:00+09:00']
+
+
+def test_google_calendar_recurring_timezone_preserves_dst_wall_time(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService([{
+        'id': 'los-angeles-weekly', 'summary': '西海岸の定例',
+        'start': {'dateTime': '2026-03-01T09:00:00-08:00', 'timeZone': 'America/Los_Angeles'},
+        'end': {'dateTime': '2026-03-01T10:00:00-08:00', 'timeZone': 'America/Los_Angeles'},
+        'recurrence': ['RRULE:FREQ=WEEKLY;BYDAY=SU'],
+    }])
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        result = google_calendar_module.sync_calendar(service)
+        response = client.get('/api/events', params={
+            'start': '2026-03-01T00:00:00+09:00', 'end': '2026-03-17T00:00:00+09:00',
+        })
+        with database_module.open_database() as connection:
+            row = connection.execute(
+                'SELECT * FROM events WHERE google_event_id = ?', ('los-angeles-weekly',),
+            ).fetchone()
+            outbound = google_calendar_module._google_payload(row)
+
+    assert result['ok'] is True
+    assert [event['start_at'] for event in response.json()] == [
+        '2026-03-02T02:00:00+09:00',
+        '2026-03-09T01:00:00+09:00',
+        '2026-03-16T01:00:00+09:00',
+    ]
+    assert {event['recurrence_timezone'] for event in response.json()} == {'America/Los_Angeles'}
+    assert outbound['start'] == {
+        'dateTime': '2026-03-01T09:00:00-08:00', 'timeZone': 'America/Los_Angeles',
+    }
+
+
+def test_google_calendar_all_day_exdate_uses_date_only_boundaries(monkeypatch, tmp_path):
+    service = FakeGoogleCalendarService([{
+        'id': 'daily-holiday', 'summary': '連休',
+        'start': {'date': '2026-11-02'}, 'end': {'date': '2026-11-03'},
+        'recurrence': ['RRULE:FREQ=DAILY', 'EXDATE;VALUE=DATE:20261103'],
+    }])
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        google_calendar_module.sync_calendar(service)
+        response = client.get('/api/events', params={
+            'start': '2026-11-02T00:00:00+09:00', 'end': '2026-11-05T00:00:00+09:00',
+        })
+
+    assert [event['start_at'] for event in response.json()] == [
+        '2026-11-02T00:00:00+09:00', '2026-11-04T00:00:00+09:00',
+    ]
+
+
+def test_google_calendar_exports_all_day_and_recurrence(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    service = FakeGoogleCalendarService()
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/events', json={
+            'title': '毎週の休み', 'start_at': '2026-11-02T00:00:00+09:00',
+            'end_at': '2026-11-03T00:00:00+09:00', 'is_all_day': True,
+            'recurrence': ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+        })
+        result = google_calendar_module.sync_calendar(service)
+
+    assert created.status_code == 201
+    assert result['ok'] is True
+    assert service.inserted == [{
+        'start': {'date': '2026-11-02'}, 'end': {'date': '2026-11-03'},
+        'summary': '毎週の休み', 'description': '',
+        'recurrence': ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+    }]
+
+
+def test_google_calendar_first_sync_maps_one_exact_local_match(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    service = FakeGoogleCalendarService([{
+        'id': 'existing-google-event', 'summary': '同じ予定', 'description': '同じメモ',
+        'start': {'dateTime': '2026-11-02T10:00:00+09:00'},
+        'end': {'dateTime': '2026-11-02T11:00:00+09:00'},
+    }])
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/events', json={
+            'title': '同じ予定', 'description': '同じメモ',
+            'start_at': '2026-11-02T10:00:00+09:00',
+            'end_at': '2026-11-02T11:00:00+09:00',
+        }).json()
+        result = google_calendar_module.sync_calendar(service)
+        events = client.get('/api/events').json()
+
+    assert result['ok'] is True
+    assert len(events) == 1
+    assert events[0]['id'] == created['id']
+    assert events[0]['google_event_id'] == 'existing-google-event'
+    assert service.inserted == []
+
+
+def test_google_calendar_conflict_pauses_until_user_resolution(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/events', json={
+            'title': '元の予定', 'start_at': '2026-11-02T10:00:00+09:00',
+            'end_at': '2026-11-02T11:00:00+09:00',
+        }).json()
+        with database_module.open_database() as connection:
+            row = connection.execute('SELECT * FROM events WHERE id = ?', (created['id'],)).fetchone()
+            snapshot = google_calendar_module._snapshot(google_calendar_module._canonical_local(row))
+            connection.execute(
+                "UPDATE events SET google_event_id = 'google-1', google_calendar_id = 'primary', "
+                "sync_snapshot = ?, sync_status = 'synced' WHERE id = ?",
+                (snapshot, created['id']),
+            )
+            connection.commit()
+        client.put(f"/api/events/{created['id']}", json={
+            'title': 'NORN側の変更', 'start_at': '2026-11-02T10:00:00+09:00',
+            'end_at': '2026-11-02T11:00:00+09:00',
+        })
+        service = FakeGoogleCalendarService([{
+            'id': 'google-1', 'summary': 'Google側の変更',
+            'start': {'dateTime': '2026-11-02T10:00:00+09:00'},
+            'end': {'dateTime': '2026-11-02T11:00:00+09:00'}, 'etag': 'etag-2',
+        }])
+
+        result = google_calendar_module.sync_calendar(service)
+        status = client.get('/api/google-calendar/status').json()
+        paused_sync = google_calendar_module.sync_calendar(service)
+        blocked_update = client.put(f"/api/events/{created['id']}", json={
+            'title': '上書きしない', 'start_at': '2026-11-02T10:00:00+09:00',
+            'end_at': '2026-11-02T11:00:00+09:00',
+        })
+        resolved = client.post(f"/api/google-calendar/conflicts/{created['id']}/resolve", json={'choice': 'google'})
+        final_event = client.get('/api/events').json()[0]
+
+    assert result['ok'] is True
+    assert len(status['conflicts']) == 1
+    assert paused_sync['paused'] is True
+    assert len(service.list_options) == 1
+    assert blocked_update.status_code == 409
+    assert resolved.status_code == 200
+    assert final_event['title'] == 'Google側の変更'
+
+
+def test_google_calendar_recovers_expired_sync_token(monkeypatch, tmp_path):
+    from googleapiclient.errors import HttpError
+
+    class ExpiredRequest:
+        def execute(self):
+            raise HttpError(SimpleNamespace(status=410, reason='Gone'), b'expired', uri='https://example.test')
+
+    class ExpiredTokenService(FakeGoogleCalendarService):
+        def list(self, **kwargs):
+            self.list_options.append(kwargs)
+            if kwargs.get('syncToken'):
+                return ExpiredRequest()
+            return FakeGoogleRequest({'items': self.items, 'nextSyncToken': 'recovered-token'})
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    service = ExpiredTokenService([{
+        'id': 'still-active', 'summary': '残っている予定',
+        'start': {'dateTime': '2026-11-02T10:00:00+09:00'},
+        'end': {'dateTime': '2026-11-02T11:00:00+09:00'},
+    }])
+    with TestClient(norn_app.app) as client:
+        client.post('/api/events', json={
+            'title': 'Google側で削除済み', 'start_at': '2026-11-03T10:00:00+09:00',
+            'end_at': '2026-11-03T11:00:00+09:00',
+        })
+        with database_module.open_database() as connection:
+            row = connection.execute('SELECT * FROM events').fetchone()
+            snapshot = google_calendar_module._snapshot(google_calendar_module._canonical_local(row))
+            connection.execute(
+                "UPDATE events SET google_event_id = 'deleted-remotely', google_calendar_id = 'primary', "
+                "sync_snapshot = ?, sync_status = 'synced' WHERE id = ?",
+                (snapshot, row['id']),
+            )
+            connection.execute(
+                "UPDATE google_calendar_sync_state SET sync_token = 'expired' WHERE calendar_id = 'primary'",
+            )
+            connection.commit()
+        result = google_calendar_module.sync_calendar(service)
+        events = client.get('/api/events').json()
+        with database_module.open_database() as connection:
+            deleted_mapping = connection.execute(
+                'SELECT is_cancelled, deleted_at FROM events WHERE google_event_id = ?',
+                ('deleted-remotely',),
+            ).fetchone()
+
+    assert result['ok'] is True
+    assert service.list_options[0]['syncToken'] == 'expired'
+    assert 'syncToken' not in service.list_options[1]
+    assert service.deleted == []
+    assert deleted_mapping['is_cancelled'] == 1
+    assert deleted_mapping['deleted_at'] is not None
+    assert [event['title'] for event in events] == ['残っている予定']
+
+
+def test_google_calendar_authorize_uses_pkce_and_persists_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(google_calendar_module, 'GOOGLE_CLIENT_ID', 'desktop-client-id')
+    monkeypatch.setattr(google_calendar_module, 'GOOGLE_CLIENT_SECRET', 'desktop-client-secret')
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/google-calendar/authorize')
+        query = parse_qs(urlparse(response.json()['authorization_url']).query)
+        with database_module.open_database() as connection:
+            state = connection.execute(
+                'SELECT code_verifier FROM google_calendar_oauth_states WHERE state = ?',
+                (query['state'][0],),
+            ).fetchone()
+
+    assert response.status_code == 200
+    assert query['redirect_uri'] == ['http://127.0.0.1:8000/']
+    assert query['code_challenge_method'] == ['S256']
+    assert 'https://www.googleapis.com/auth/calendar.events' in query['scope'][0].split()
+    assert 'https://www.googleapis.com/auth/calendar.calendarlist.readonly' in query['scope'][0].split()
+    assert state is not None
+    assert len(state['code_verifier']) >= 43
+
+
+def test_google_calendar_token_file_is_owner_only_even_when_rewritten(monkeypatch, tmp_path):
+    token_path = tmp_path / 'google-calendar-token.json'
+    token_path.write_text('old token', encoding='utf-8')
+    token_path.chmod(0o644)
+    monkeypatch.setattr(google_calendar_module, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(google_calendar_module, 'GOOGLE_TOKEN_PATH', token_path)
+
+    google_calendar_module._write_credentials(SimpleNamespace(to_json=lambda: 'new token'))
+
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+
+
+def test_legacy_event_table_migrates_google_fields_without_losing_rows(monkeypatch, tmp_path):
+    database_path = tmp_path / 'legacy-events.sqlite3'
+    connection = sqlite3.connect(database_path)
+    connection.execute('''
+        CREATE TABLE events (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            start_at TEXT NOT NULL, end_at TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    connection.execute(
+        'INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)',
+        ('legacy-event', '既存予定', '', '2026-11-02T10:00:00+09:00',
+         '2026-11-02T11:00:00+09:00', '2026-01-01', '2026-01-01'),
+    )
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(database_module, 'DB_PATH', database_path)
+
+    database_module.initialize_database()
+    with database_module.open_database() as migrated:
+        row = migrated.execute('SELECT * FROM events WHERE id = ?', ('legacy-event',)).fetchone()
+        columns = {column['name'] for column in migrated.execute('PRAGMA table_info(events)')}
+        calendar = migrated.execute(
+            'SELECT calendar_id FROM google_calendar_preferences WHERE id = 1',
+        ).fetchone()
+
+    assert row['title'] == '既存予定'
+    assert row['is_all_day'] == 0
+    assert row['recurrence_json'] == '[]'
+    assert row['google_event_id'] is None
+    assert 'conflict_payload' in columns
+    assert calendar['calendar_id'] == 'primary'
 
 
 def test_gemini_generates_multiple_tasks_for_new_project(monkeypatch, tmp_path):
