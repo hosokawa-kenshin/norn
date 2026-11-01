@@ -15,7 +15,13 @@ from pydantic import BaseModel, Field
 from database import get_conversation_messages, now_iso, open_database
 from events import SCHEDULE_TOOLS, execute_schedule_tool
 from memory import MEMORY_TOOLS, execute_memory_tool, save_memory_record
-from planning import GOAL_PROJECT_TOOLS, execute_goal_project_tool
+from planning import (
+    GOAL_PROJECT_TOOLS,
+    execute_goal_project_tool,
+    format_goal_review_context,
+    get_goals_due_for_review,
+    mark_goals_reviewed,
+)
 from tasks import TASK_TOOLS, execute_task_tool
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
@@ -389,6 +395,10 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
 
     history = get_conversation_messages(conversation_id) if request.conversation_id else []
     history.append({'role': 'user', 'content': content})
+    due_goal_reviews = get_goals_due_for_review()
+    review_context = format_goal_review_context(due_goal_reviews)
+    if review_context:
+        history.insert(0, {'role': 'system', 'content': review_context})
     reply = await generate_llm_reply(history, conversation_id)
     timestamp = now_iso()
 
@@ -410,6 +420,8 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
         )
         connection.commit()
 
+    if due_goal_reviews:
+        mark_goals_reviewed([goal['id'] for goal in due_goal_reviews])
     await extract_due_memories()
 
     return {

@@ -1,6 +1,6 @@
 import uuid
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -504,3 +504,84 @@ def execute_goal_project_tool(name: str, arguments: dict[str, Any]) -> dict[str,
         return {'ok': False, 'error': '許可されていない目標・プロジェクト操作です。'}
     except ValueError as error:
         return {'ok': False, 'error': str(error)}
+
+
+WEEKLY_GOAL_REVIEW_INTERVAL = timedelta(days=7)
+
+
+def get_goals_due_for_review(now: datetime | None = None, limit: int = 8) -> list[dict[str, Any]]:
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - WEEKLY_GOAL_REVIEW_INTERVAL).isoformat(timespec='seconds')
+    with closing(open_database()) as connection:
+        goals = connection.execute(
+            '''
+            SELECT * FROM goals
+            WHERE status = 'active'
+                AND COALESCE(last_reviewed_at, created_at) <= ?
+            ORDER BY target_date IS NULL, target_date, created_at
+            LIMIT ?
+            ''',
+            (cutoff, max(1, min(limit, 20))),
+        ).fetchall()
+        reviews: list[dict[str, Any]] = []
+        for row in goals:
+            goal = dict(row)
+            projects = _project_rows(connection, goal['id'])
+            for project in projects:
+                project['tasks'] = [dict(task) for task in connection.execute(
+                    '''
+                    SELECT title, status, due_at FROM tasks
+                    WHERE project_id = ? ORDER BY due_at IS NULL, due_at, created_at LIMIT 12
+                    ''',
+                    (project['id'],),
+                ).fetchall()]
+            goal['projects'] = projects
+            goal['project_count'] = len(projects)
+            goal['completed_project_count'] = sum(project['status'] == 'completed' for project in projects)
+            goal['progress'] = 100 if goal['status'] == 'completed' else (
+                round(sum(project['progress'] for project in projects) / len(projects))
+                if projects else 0
+            )
+            reviews.append(goal)
+    return reviews
+
+
+def format_goal_review_context(goals: list[dict[str, Any]], today: date | None = None) -> str:
+    if not goals:
+        return ''
+    today = today or datetime.now(timezone.utc).date()
+    lines = [
+        f'週次目標レビューの対象があります（基準日: {today.isoformat()}）。今回の返答に短い振り返りを含めてください。',
+        '観測できるタスク状態・期限・進捗だけを根拠にし、理由や実績を推測しないでください。',
+        '次の一歩は登録済みのnext_actionまたは未完了タスクから提案し、依頼されていない変更やタスク作成は行わないでください。',
+        '根拠が足りなければ順調/遅延を断定せず、その旨を率直に伝えてください。',
+    ]
+    for goal in goals:
+        target = goal['target_date'] or '期限なし'
+        lines.append(
+            f'目標「{goal["title"]}」: 進捗{goal["progress"]}%、期限{target}、'
+            f'関連プロジェクト{goal["project_count"]}件。'
+        )
+        for project in goal['projects']:
+            lines.append(
+                f'  プロジェクト「{project["title"]}」: {project["status"]}、進捗{project["progress"]}%、'
+                f'期限{project["target_date"] or "期限なし"}、次のアクション: {project["next_action"] or "未設定"}。'
+            )
+            for task in project['tasks']:
+                lines.append(
+                    f'    タスク「{task["title"]}」: {task["status"]}、期限{task["due_at"] or "期限なし"}。'
+                )
+    return '\n'.join(lines)
+
+
+def mark_goals_reviewed(goal_ids: list[str], reviewed_at: str | None = None) -> None:
+    normalized_ids = [_normalize_id(goal_id, '目標') for goal_id in goal_ids]
+    if not normalized_ids:
+        return
+    timestamp = reviewed_at or now_iso()
+    with closing(open_database()) as connection:
+        connection.executemany(
+            'UPDATE goals SET last_reviewed_at = ? WHERE id = ? AND status = \'active\'',
+            [(timestamp, goal_id) for goal_id in normalized_ids],
+        )
+        connection.commit()

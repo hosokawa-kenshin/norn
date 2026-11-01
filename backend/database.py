@@ -77,6 +77,7 @@ def initialize_database() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL CHECK(status IN ('active', 'paused', 'completed', 'cancelled')),
                 target_date TEXT,
+                last_reviewed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -129,6 +130,11 @@ def initialize_database() -> None:
             connection.execute(
                 'ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL'
             )
+        goal_columns = {
+            row['name'] for row in connection.execute('PRAGMA table_info(goals)').fetchall()
+        }
+        if 'last_reviewed_at' not in goal_columns:
+            connection.execute('ALTER TABLE goals ADD COLUMN last_reviewed_at TEXT')
         connection.execute(
             'CREATE INDEX IF NOT EXISTS ix_tasks_project_status ON tasks(project_id, status)'
         )

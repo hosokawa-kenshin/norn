@@ -1010,6 +1010,62 @@ def test_gemini_generates_multiple_tasks_for_new_project(monkeypatch, tmp_path):
     assert all(task['due_at'] is None and task['estimated_minutes'] is None for task in tasks)
 
 
+def test_weekly_goal_review_runs_once_after_seven_days(monkeypatch, tmp_path):
+    review_contexts = []
+
+    async def fake_reply(messages, conversation_id=None):
+        review_contexts.append([
+            message['content'] for message in messages
+            if message.get('role') == 'system' and '週次目標レビュー' in message.get('content', '')
+        ])
+        return '今週の目標を振り返ると、次は歌詞の下書きがよさそう。'
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'generate_llm_reply', fake_reply)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    with TestClient(norn_app.app) as client:
+        active_goal = client.post('/api/goals', json={
+            'title': 'アルバムを完成する',
+            'target_date': '2027-12-31',
+        }).json()
+        paused_goal = client.post('/api/goals', json={
+            'title': '保留中の動画制作',
+            'status': 'paused',
+        }).json()
+        project = client.post('/api/projects', json={
+            'goal_id': active_goal['id'],
+            'title': 'アルバム制作',
+            'next_action': '歌詞の下書きを作る',
+        }).json()
+        client.post('/api/tasks', json={
+            'title': 'Aメロを書く',
+            'project_id': project['id'],
+            'due_at': '2026-10-25T18:00:00+09:00',
+        })
+        connection = database_module.open_database()
+        connection.execute(
+            "UPDATE goals SET created_at = '2000-01-01T00:00:00+00:00' WHERE id IN (?, ?)",
+            (active_goal['id'], paused_goal['id']),
+        )
+        connection.commit()
+        connection.close()
+
+        first = client.post('/api/chat', json={'content': 'こんにちは'})
+        reviewed_goal = next(
+            goal for goal in client.get('/api/goals').json() if goal['id'] == active_goal['id']
+        )
+        second = client.post('/api/chat', json={'content': 'ありがとう'})
+
+    assert first.status_code == second.status_code == 200
+    assert len(review_contexts[0]) == 1
+    assert 'アルバムを完成する' in review_contexts[0][0]
+    assert '歌詞の下書きを作る' in review_contexts[0][0]
+    assert '保留中の動画制作' not in review_contexts[0][0]
+    assert reviewed_goal['last_reviewed_at'] is not None
+    assert review_contexts[1] == []
+
+
 def test_initialize_database_migrates_legacy_tasks(monkeypatch, tmp_path):
     database_path = tmp_path / 'legacy.sqlite3'
     connection = sqlite3.connect(database_path)
