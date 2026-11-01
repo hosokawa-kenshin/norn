@@ -1,7 +1,9 @@
 import json
+import re
+import sqlite3
 import uuid
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -11,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from database import get_conversation_messages, now_iso, open_database
 from events import SCHEDULE_TOOLS, execute_schedule_tool
+from memory import MEMORY_TOOLS, execute_memory_tool, save_memory_record
 from tasks import TASK_TOOLS, execute_task_tool
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
@@ -28,11 +31,31 @@ SYSTEM_PROMPT = (
     '見積時間付きタスクを新規作成した場合は、期限があれば期限まで、期限がなければ現在から5営業日以内の空き時間を検索し、最も早い候補へ自動で割り当ててください。'
     'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
     '見積時間がなく時間枠を決められない場合は、見積時間だけを質問してください。'
-    '見積時間付きタスクを新規作成した場合は、期限があれば期限まで、期限がなければ現在から5営業日以内の空き時間を検索し、最も早い候補へ自動で割り当ててください。'
-    'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
-    '見積時間がなく時間枠を決められない場合は、見積時間だけを質問してください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
+    '親しみがあり自然な友人のような話し方をしてください。ただし人間だと偽ったり、根拠のない親密さを演じたりしないでください。'
+    '会話の記憶はスレッドと別に保存されます。昔の出来事、人、好み、以前の発言について答える前に記憶検索ツールを使ってください。'
+    '通常の会話中に自動で記憶保存toolを呼ばないでください。自動抽出は1時間に1回、別処理でまとめて行います。ユーザーが明示的に覚えるよう依頼した場合だけ、記憶保存toolをその場で使ってください。'
+    'パスワード、APIキー、認証情報、決済情報、正確な住所は記録しないでください。健康・法務・金融等の非常に慎重な情報は、ユーザーが明確に保存を依頼しない限り記録しないでください。'
+    'ユーザーが内容を訂正したら対象の記憶を検索して更新し、忘れるよう頼んだら対象を特定して削除してください。保存のたびに承認を求めないでください。'
+    '該当する記憶が見つからない場合は、覚えているふりをせず、そのことを率直に伝えてください。'
     'ユーザーの確認なしに外部操作を実行したと主張してはいけません。'
+)
+MEMORY_EXTRACTION_PROMPT = (
+    '前回の抽出後に蓄積した会話から、今後の会話に役立つ長期記憶を最大3件抽出してください。'
+    '対象は継続的な事実・好み・価値観と、本人にとって意味のある出来事や思い出です。'
+    '一時的な予定、単発の依頼、雑談の全発言、仮定・創作・ロールプレイは記録しないでください。'
+    'assistantの発言は文脈としてのみ使い、事実の根拠はuserの発言に限定してください。'
+    'パスワード、APIキー、認証情報、決済情報、正確な住所は絶対に記録しないでください。'
+    '記憶は短く、後から思い出すのに十分な具体性を保ってください。'
+    'source_typeはユーザーが明言した場合explicit、文脈から控えめに推定した場合inferredにしてください。'
+    '各記憶に根拠となったuserメッセージのconversation_idを含めてください。'
+    '適切な記憶がなければ空配列を返してください。JSON objectのみを返し、形式は'
+    '{"memories":[{"category":"fact|preference|episode","content":"...","source_type":"explicit|inferred","source_conversation_id":"..."}]}です。'
+)
+MEMORY_CHANGE_PATTERN = re.compile(
+    r'忘れて|忘れといて|忘れてください|忘れたい|覚えないで|覚えなくて|覚えておいて|覚えてね|記憶して|記録して|'
+    r'記録しないで|記録しなくて|保存しないで|保存しなくて|記憶しないで|記憶しなくて|記憶から消して|記憶を削除|'
+    r'訂正|修正|間違って覚え|ではなく|じゃなく|違うよ'
 )
 
 
@@ -41,7 +64,9 @@ class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
 
 
-async def generate_llm_reply(messages: list[dict[str, str]]) -> str:
+async def generate_llm_reply(
+    messages: list[dict[str, str]], conversation_id: str | None = None
+) -> str:
     headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
     local_now = datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes')
     llm_messages: list[dict[str, Any]] = [
@@ -55,7 +80,7 @@ async def generate_llm_reply(messages: list[dict[str, str]]) -> str:
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
-            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS],
+            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS],
             'tool_choice': 'auto',
             'temperature': 0.2,
         }
@@ -116,6 +141,7 @@ async def generate_llm_reply(messages: list[dict[str, str]]) -> str:
                     'create_event', 'update_event', 'delete_event',
                     'create_task', 'update_task', 'complete_task', 'delete_task',
                     'schedule_task', 'unschedule_task',
+                    'save_memory', 'update_memory', 'forget_memory',
                 }
                 if name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
@@ -126,11 +152,13 @@ async def generate_llm_reply(messages: list[dict[str, str]]) -> str:
                         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
                         'find_task_slots', 'schedule_task', 'unschedule_task',
                     }
-                    result = (
-                        execute_task_tool(name, arguments)
-                        if name in task_tools
-                        else execute_schedule_tool(name, arguments)
-                    )
+                    memory_tools = {tool['function']['name'] for tool in MEMORY_TOOLS}
+                    if name in memory_tools:
+                        result = execute_memory_tool(name, arguments, conversation_id)
+                    elif name in task_tools:
+                        result = execute_task_tool(name, arguments)
+                    else:
+                        result = execute_schedule_tool(name, arguments)
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 result = {'ok': False, 'error': f'ツール引数が不正です: {error}'}
 
@@ -145,6 +173,135 @@ async def generate_llm_reply(messages: list[dict[str, str]]) -> str:
     if completed_actions:
         return '操作を実行しました。' + '。'.join(completed_actions)
     raise HTTPException(status_code=502, detail='Geminiが予定操作を完了できませんでした。')
+
+
+MEMORY_EXTRACTION_INTERVAL = timedelta(hours=1)
+MEMORY_EXTRACTION_MAX_MESSAGES = 50
+MEMORY_EXTRACTION_MAX_CHARACTERS = 24000
+
+
+def claim_memory_extraction_batch() -> tuple[list[dict[str, Any]], int] | None:
+    now = datetime.now(timezone.utc)
+    attempted_at = now.isoformat(timespec='seconds')
+    with closing(open_database()) as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        state = connection.execute(
+            'SELECT last_attempted_at, last_processed_message_id FROM memory_extraction_state WHERE id = 1'
+        ).fetchone()
+        if state['last_attempted_at']:
+            last_attempted = datetime.fromisoformat(state['last_attempted_at'])
+            if now - last_attempted < MEMORY_EXTRACTION_INTERVAL:
+                connection.commit()
+                return None
+
+        rows = connection.execute(
+            '''
+            SELECT id, conversation_id, role, content FROM messages
+            WHERE id > ? ORDER BY id LIMIT ?
+            ''',
+            (state['last_processed_message_id'], MEMORY_EXTRACTION_MAX_MESSAGES),
+        ).fetchall()
+        if not rows:
+            connection.commit()
+            return None
+
+        batch: list[dict[str, Any]] = []
+        last_processed_id = state['last_processed_message_id']
+        character_count = 0
+        for row in rows:
+            message = dict(row)
+            if message['role'] == 'user' and MEMORY_CHANGE_PATTERN.search(message['content']):
+                last_processed_id = message['id']
+                continue
+            if batch and character_count + len(message['content']) > MEMORY_EXTRACTION_MAX_CHARACTERS:
+                break
+            batch.append(message)
+            character_count += len(message['content'])
+            last_processed_id = message['id']
+
+        if not batch:
+            connection.execute(
+                'UPDATE memory_extraction_state SET last_processed_message_id = ? WHERE id = 1',
+                (last_processed_id,),
+            )
+            connection.commit()
+            return None
+
+        connection.execute(
+            'UPDATE memory_extraction_state SET last_attempted_at = ? WHERE id = 1',
+            (attempted_at,),
+        )
+        connection.commit()
+    return batch, last_processed_id
+
+
+def mark_memory_batch_processed(message_id: int) -> None:
+    with closing(open_database()) as connection:
+        connection.execute(
+            '''
+            UPDATE memory_extraction_state
+            SET last_processed_message_id = MAX(last_processed_message_id, ?)
+            WHERE id = 1
+            ''',
+            (message_id,),
+        )
+        connection.commit()
+
+
+async def extract_due_memories() -> None:
+    claimed = claim_memory_extraction_batch()
+    if claimed is None:
+        return
+    messages, last_processed_id = claimed
+    user_conversation_ids = {
+        message['conversation_id'] for message in messages if message['role'] == 'user'
+    }
+    if not user_conversation_ids:
+        mark_memory_batch_processed(last_processed_id)
+        return
+
+    headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
+    payload = {
+        'model': LLM_MODEL,
+        'messages': [
+            {'role': 'system', 'content': MEMORY_EXTRACTION_PROMPT},
+            {'role': 'user', 'content': json.dumps(messages, ensure_ascii=False)},
+        ],
+        'response_format': {'type': 'json_object'},
+        'temperature': 0,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5)) as client:
+            response = await client.post(
+                f'{LLM_BASE_URL}/chat/completions', json=payload, headers=headers,
+            )
+        if response.is_error:
+            logger.warning('Memory extraction returned HTTP %s', response.status_code)
+            return
+        content = response.json()['choices'][0]['message']['content']
+        if not isinstance(content, str):
+            return
+        extracted = json.loads(content)
+        memories = extracted.get('memories', []) if isinstance(extracted, dict) else []
+        if not isinstance(memories, list):
+            return
+        for item in memories[:3]:
+            if not isinstance(item, dict) or set(item) != {
+                'category', 'content', 'source_type', 'source_conversation_id'
+            }:
+                continue
+            source_conversation_id = item['source_conversation_id']
+            if source_conversation_id not in user_conversation_ids:
+                continue
+            try:
+                save_memory_record(
+                    item['category'], item['content'], item['source_type'], source_conversation_id,
+                )
+            except (TypeError, ValueError):
+                continue
+        mark_memory_batch_processed(last_processed_id)
+    except (httpx.HTTPError, sqlite3.Error, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning('Memory extraction failed: %s', type(error).__name__)
 
 
 @router.get('/api/conversations')
@@ -199,7 +356,7 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
 
     history = get_conversation_messages(conversation_id) if request.conversation_id else []
     history.append({'role': 'user', 'content': content})
-    reply = await generate_llm_reply(history)
+    reply = await generate_llm_reply(history, conversation_id)
     timestamp = now_iso()
 
     with closing(open_database()) as connection:
@@ -219,6 +376,8 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
             ],
         )
         connection.commit()
+
+    await extract_due_memories()
 
     return {
         'conversation_id': conversation_id,

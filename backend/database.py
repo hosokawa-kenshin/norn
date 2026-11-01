@@ -37,6 +37,23 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_messages_conversation
                 ON messages(conversation_id, id);
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                category TEXT NOT NULL CHECK(category IN ('fact', 'preference', 'episode')),
+                content TEXT NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('explicit', 'inferred')),
+                source_conversation_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_memories_category_updated
+                ON memories(category, updated_at);
+            CREATE TABLE IF NOT EXISTS memory_extraction_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                last_attempted_at TEXT,
+                last_processed_message_id INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO memory_extraction_state (id) VALUES (1);
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,

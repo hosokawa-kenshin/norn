@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -9,10 +10,14 @@ import app as norn_app
 import chat as chat_module
 import database as database_module
 import events as events_module
+import memory as memory_module
 import settings as settings_module
 import tasks as tasks_module
-import tasks as tasks_module
 import voice as voice_module
+
+
+async def no_op_memory_extraction(*args, **kwargs):
+    return None
 
 
 def test_status_reports_local_stt_and_unconfigured_llm():
@@ -50,13 +55,14 @@ def test_transcription_uses_model_and_returns_text(monkeypatch, tmp_path):
 
 
 def test_chat_saves_messages_and_returns_reply(monkeypatch, tmp_path):
-    async def fake_reply(messages):
+    async def fake_reply(messages, conversation_id=None):
         assert messages[-1] == {'role': 'user', 'content': '明日の予定を教えて'}
         return '明日の予定を確認します。'
 
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
     monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
     monkeypatch.setattr(chat_module, 'generate_llm_reply', fake_reply)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
     with TestClient(norn_app.app) as client:
         response = client.post('/api/chat', json={'content': '明日の予定を教えて'})
         conversation_id = response.json()['conversation_id']
@@ -121,6 +127,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
     monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
     monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
     with TestClient(norn_app.app) as client:
         response = client.post('/api/chat', json={'content': '明日14時から15時にGemini連携テストを追加して'})
         events = client.get('/api/events').json()
@@ -134,6 +141,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         'list_events', 'create_event', 'update_event', 'delete_event',
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
         'find_task_slots', 'schedule_task', 'unschedule_task',
+        'save_memory', 'search_memories', 'update_memory', 'forget_memory',
     }
     assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
 
@@ -338,6 +346,7 @@ def test_chat_executes_gemini_task_tool_without_approval(monkeypatch, tmp_path):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
     monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
     monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
     with TestClient(norn_app.app) as client:
         response = client.post('/api/chat', json={'content': '金曜までに30分の高優先度タスクを追加して'})
         tasks = client.get('/api/tasks').json()
@@ -480,6 +489,7 @@ def test_gemini_auto_assigns_new_task_to_earliest_slot(monkeypatch, tmp_path):
     import json as json_module
 
     monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
     with TestClient(norn_app.app) as client:
         response = client.post('/api/chat', json={'content': '見積30分、期限は指定日の18時のタスクを追加して予定に割り当てて'})
         tasks = client.get('/api/tasks').json()
@@ -489,3 +499,179 @@ def test_gemini_auto_assigns_new_task_to_earliest_slot(monkeypatch, tmp_path):
     assert len(calls) == 4
     assert len(tasks) == 1
     assert tasks[0]['scheduled_start'].endswith('T09:00:00+09:00')
+
+
+def test_gemini_saves_and_recalls_memory_across_conversations(monkeypatch, tmp_path):
+    def tool_response(call_id, name, arguments):
+        return {'choices': [{'message': {
+            'role': 'assistant',
+            'content': None,
+            'tool_calls': [{
+                'id': call_id,
+                'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments)},
+            }],
+        }}]}
+
+    responses = iter([
+        tool_response('call-save-memory', 'save_memory', {
+            'category': 'episode',
+            'content': '子どもの頃、祖父と長野の温泉へ行った思い出がある。',
+            'source_type': 'explicit',
+        }),
+        {'choices': [{'message': {'role': 'assistant', 'content': 'その思い出を覚えておくね。'}}]},
+        tool_response('call-search-memory', 'search_memories', {
+            'query': '祖父 長野 温泉',
+            'category': 'episode',
+        }),
+        {'choices': [{'message': {'role': 'assistant', 'content': 'おじいさまと長野の温泉へ行った思い出だね。'}}]},
+    ])
+    request_payloads = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            return SimpleNamespace(is_error=False, json=lambda: next(responses))
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    with TestClient(norn_app.app) as client:
+        remembered = client.post('/api/chat', json={'content': '子どもの頃の大切な思い出を話す。'})
+        recalled = client.post('/api/chat', json={'content': '昔、祖父と行った場所を覚えてる？'})
+        memories = client.get('/api/memories').json()
+
+    assert remembered.status_code == 200
+    assert recalled.status_code == 200
+    assert 'おじいさまと長野の温泉' in recalled.json()['assistant_message']['content']
+    assert len(memories) == 1
+    assert memories[0]['source_conversation_id'] == remembered.json()['conversation_id']
+    memory_tool_result = next(
+        message for message in request_payloads[3]['messages']
+        if message.get('role') == 'tool' and message.get('tool_call_id') == 'call-search-memory'
+    )
+    assert '長野の温泉' in memory_tool_result['content']
+
+
+def test_memory_can_be_corrected_and_forgotten_without_a_gui(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        created = memory_module.execute_memory_tool('save_memory', {
+            'category': 'preference',
+            'content': 'コーヒーが好き。',
+            'source_type': 'inferred',
+        }, 'first-thread')
+        memory_id = created['memory']['id']
+        corrected = memory_module.execute_memory_tool('update_memory', {
+            'memory_id': memory_id,
+            'content': '紅茶が好き。',
+        }, 'second-thread')
+        listed = client.get('/api/memories').json()
+        forgotten = memory_module.execute_memory_tool('forget_memory', {'memory_id': memory_id})
+        remaining = client.get('/api/memories').json()
+
+    assert created['ok'] is True
+    assert corrected['memory']['content'] == '紅茶が好き。'
+    assert corrected['memory']['source_type'] == 'explicit'
+    assert len(listed) == 1
+    assert forgotten['summary'] == '記憶を忘れました。'
+    assert remaining == []
+
+
+def test_chat_automatically_extracts_memory_without_explicit_request(monkeypatch, tmp_path):
+    json_module = json
+    chat_response = {'choices': [{'message': {'role': 'assistant', 'content': 'それは素敵な思い出だね。'}}]}
+    request_payloads = []
+    extraction_batches = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            if json.get('response_format'):
+                batch = json_module.loads(json['messages'][1]['content'])
+                extraction_batches.append(batch)
+                memories = []
+                if len(extraction_batches) == 1:
+                    source = next(message for message in batch if message['role'] == 'user')
+                    memories.append({
+                        'category': 'episode',
+                        'content': '子どもの頃、祖母と青い風車を見に行った思い出がある。',
+                        'source_type': 'explicit',
+                        'source_conversation_id': source['conversation_id'],
+                    })
+                extraction_response = {
+                    'choices': [{'message': {'role': 'assistant', 'content': json_module.dumps({'memories': memories}, ensure_ascii=False)}}],
+                }
+                response = extraction_response
+            else:
+                response = chat_response
+            return SimpleNamespace(is_error=False, json=lambda: response)
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        first = client.post('/api/chat', json={
+            'content': '小学生のころ祖母と青い風車を見に行ったのが、今でも好きな思い出なんだ。',
+        })
+        second = client.post('/api/chat', json={'content': '今日は別の話をしよう。'})
+        connection = database_module.open_database()
+        connection.execute(
+            'UPDATE memory_extraction_state SET last_attempted_at = ? WHERE id = 1',
+            ('2000-01-01T00:00:00+00:00',),
+        )
+        connection.commit()
+        connection.close()
+        third = client.post('/api/chat', json={'content': '最近の出来事について話したい。'})
+        memories = client.get('/api/memories').json()
+
+    assert first.status_code == second.status_code == third.status_code == 200
+    assert len([payload for payload in request_payloads if payload.get('response_format')]) == 2
+    assert len(extraction_batches) == 2
+    batched_user_content = {
+        message['content'] for message in extraction_batches[1] if message['role'] == 'user'
+    }
+    assert {'今日は別の話をしよう。', '最近の出来事について話したい。'} <= batched_user_content
+    assert len(memories) == 1
+    assert memories[0]['content'] == '子どもの頃、祖母と青い風車を見に行った思い出がある。'
+    assert memories[0]['source_conversation_id'] == first.json()['conversation_id']
+
+
+def test_memory_rejects_credentials(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        result = memory_module.execute_memory_tool('save_memory', {
+            'category': 'fact',
+            'content': 'API key: sk-test-credential-value',
+            'source_type': 'explicit',
+        })
+        memories = client.get('/api/memories').json()
+
+    assert result['ok'] is False
+    assert '認証情報' in result['error']
+    assert memories == []
+
+
+def test_memory_change_requests_are_excluded_from_automatic_extraction():
+    assert chat_module.MEMORY_CHANGE_PATTERN.search('この話は保存しないで。')
+    assert chat_module.MEMORY_CHANGE_PATTERN.search('祖父じゃなく叔父だよ。')
+    assert chat_module.MEMORY_CHANGE_PATTERN.search('このことは覚えておいて。')
