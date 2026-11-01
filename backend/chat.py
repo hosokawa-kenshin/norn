@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import sqlite3
@@ -34,6 +35,10 @@ SYSTEM_PROMPT = (
     'タスク操作の結果もツールの戻り値に従って報告してください。'
     '親しみがあり自然な友人のような話し方をしてください。ただし人間だと偽ったり、根拠のない親密さを演じたりしないでください。'
     '会話の記憶はスレッドと別に保存されます。昔の出来事、人、好み、以前の発言について答える前に記憶検索ツールを使ってください。'
+    '記憶検索のquery_variantsには、検索意図と人物・場所・時期などの具体的条件を保った言い換えだけを入れてください。'
+    '検索結果は意味的に近い候補であり、事実の一致を保証しません。回答前に候補文を証拠として読み、質問が求める人物、行動、場所、時期、対象の各要素が候補に裏付けられているか判定してください。'
+    '質問文に含まれる前提は記憶の証拠ではありません。候補にない具体的条件を補って答えたり、別の出来事を同じ出来事として扱ったりしないでください。'
+    '一部だけ関連する記憶があれば、覚えている部分と確認できない部分を分けて伝えてください。裏付ける記憶がなければ、思い出せないと率直に伝えてください。'
     '通常の会話中に自動で記憶保存toolを呼ばないでください。自動抽出は1時間に1回、別処理でまとめて行います。ユーザーが明示的に覚えるよう依頼した場合だけ、記憶保存toolをその場で使ってください。'
     'パスワード、APIキー、認証情報、決済情報、正確な住所は記録しないでください。健康・法務・金融等の非常に慎重な情報は、ユーザーが明確に保存を依頼しない限り記録しないでください。'
     'ユーザーが内容を訂正したら対象の記憶を検索して更新し、忘れるよう頼んだら対象を特定して削除してください。保存のたびに承認を求めないでください。'
@@ -44,6 +49,7 @@ MEMORY_EXTRACTION_PROMPT = (
     '前回の抽出後に蓄積した会話から、今後の会話に役立つ長期記憶を最大3件抽出してください。'
     '対象は継続的な事実・好み・価値観と、本人にとって意味のある出来事や思い出です。'
     '一時的な予定、単発の依頼、雑談の全発言、仮定・創作・ロールプレイは記録しないでください。'
+    '質問、確認、推測、以前の出来事を思い出せるか尋ねる発言は、ユーザー自身の事実として保存しないでください。'
     'assistantの発言は文脈としてのみ使い、事実の根拠はuserの発言に限定してください。'
     'パスワード、APIキー、認証情報、決済情報、正確な住所は絶対に記録しないでください。'
     '記憶は短く、後から思い出すのに十分な具体性を保ってください。'
@@ -56,6 +62,10 @@ MEMORY_CHANGE_PATTERN = re.compile(
     r'忘れて|忘れといて|忘れてください|忘れたい|覚えないで|覚えなくて|覚えておいて|覚えてね|記憶して|記録して|'
     r'記録しないで|記録しなくて|保存しないで|保存しなくて|記憶しないで|記憶しなくて|記憶から消して|記憶を削除|'
     r'訂正|修正|間違って覚え|ではなく|じゃなく|違うよ'
+)
+MEMORY_NON_ASSERTION_PATTERN = re.compile(
+    r'[?？]|覚えてる|覚えてます|覚えてた|話したっけ|言ったっけ|だったっけ|何だっけ|なんだっけ|'
+    r'思い出せる|思い出して|覚えているかな|記憶にあるかな'
 )
 
 
@@ -154,7 +164,9 @@ async def generate_llm_reply(
                     }
                     memory_tools = {tool['function']['name'] for tool in MEMORY_TOOLS}
                     if name in memory_tools:
-                        result = execute_memory_tool(name, arguments, conversation_id)
+                        result = await asyncio.to_thread(
+                            execute_memory_tool, name, arguments, conversation_id
+                        )
                     elif name in task_tools:
                         result = execute_task_tool(name, arguments)
                     else:
@@ -208,9 +220,18 @@ def claim_memory_extraction_batch() -> tuple[list[dict[str, Any]], int] | None:
         batch: list[dict[str, Any]] = []
         last_processed_id = state['last_processed_message_id']
         character_count = 0
+        suppressed_assistant_conversations: set[str] = set()
         for row in rows:
             message = dict(row)
-            if message['role'] == 'user' and MEMORY_CHANGE_PATTERN.search(message['content']):
+            if message['role'] == 'user' and (
+                MEMORY_CHANGE_PATTERN.search(message['content'])
+                or MEMORY_NON_ASSERTION_PATTERN.search(message['content'])
+            ):
+                suppressed_assistant_conversations.add(message['conversation_id'])
+                last_processed_id = message['id']
+                continue
+            if message['role'] == 'assistant' and message['conversation_id'] in suppressed_assistant_conversations:
+                suppressed_assistant_conversations.remove(message['conversation_id'])
                 last_processed_id = message['id']
                 continue
             if batch and character_count + len(message['content']) > MEMORY_EXTRACTION_MAX_CHARACTERS:
@@ -294,7 +315,8 @@ async def extract_due_memories() -> None:
             if source_conversation_id not in user_conversation_ids:
                 continue
             try:
-                save_memory_record(
+                await asyncio.to_thread(
+                    save_memory_record,
                     item['category'], item['content'], item['source_type'], source_conversation_id,
                 )
             except (TypeError, ValueError):

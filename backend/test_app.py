@@ -1,4 +1,5 @@
 import json
+import struct
 import uuid
 from datetime import datetime, time, timedelta
 from types import SimpleNamespace
@@ -18,6 +19,35 @@ import voice as voice_module
 
 async def no_op_memory_extraction(*args, **kwargs):
     return None
+
+
+def fake_memory_embeddings(texts):
+    vectors = []
+    for text in texts:
+        normalized = text.casefold()
+        vector = [0.0] * 10
+        if any(term in normalized for term in ('祖母', 'おばあちゃん', 'ばあちゃん')):
+            vector[0] = 1.0
+        if any(term in normalized for term in ('祖父', 'じいちゃん', 'おじいちゃん')):
+            vector[1] = 1.0
+        if '風車' in normalized:
+            vector[2] = 1.0
+        if '温泉' in normalized or '長野' in normalized:
+            vector[3] = 1.0
+        if '姉' in normalized or '兄' in normalized or '楽器' in normalized:
+            vector[4] = 1.0
+        if '上司' in normalized or '設計' in normalized:
+            vector[5] = 1.0
+        if 'コーヒー' in normalized or '浅煎り' in normalized:
+            vector[6] = 1.0
+        if '青い' in normalized or '青色' in normalized:
+            vector[8] = 1.0
+        if '旅行' in normalized or '出かけ' in normalized:
+            vector[9] = 1.0
+        if not any(vector):
+            vector[7] = 1.0
+        vectors.append(struct.pack('10f', *vector))
+    return vectors
 
 
 def test_status_reports_local_stt_and_unconfigured_llm():
@@ -543,6 +573,7 @@ def test_gemini_saves_and_recalls_memory_across_conversations(monkeypatch, tmp_p
             return SimpleNamespace(is_error=False, json=lambda: next(responses))
 
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(memory_module, 'embed_texts', fake_memory_embeddings)
     monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
     monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
     monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
@@ -565,6 +596,7 @@ def test_gemini_saves_and_recalls_memory_across_conversations(monkeypatch, tmp_p
 
 def test_memory_can_be_corrected_and_forgotten_without_a_gui(monkeypatch, tmp_path):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(memory_module, 'embed_texts', fake_memory_embeddings)
     with TestClient(norn_app.app) as client:
         created = memory_module.execute_memory_tool('save_memory', {
             'category': 'preference',
@@ -627,6 +659,7 @@ def test_chat_automatically_extracts_memory_without_explicit_request(monkeypatch
             return SimpleNamespace(is_error=False, json=lambda: response)
 
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(memory_module, 'embed_texts', fake_memory_embeddings)
     monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
     monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
     with TestClient(norn_app.app) as client:
@@ -675,3 +708,87 @@ def test_memory_change_requests_are_excluded_from_automatic_extraction():
     assert chat_module.MEMORY_CHANGE_PATTERN.search('この話は保存しないで。')
     assert chat_module.MEMORY_CHANGE_PATTERN.search('祖父じゃなく叔父だよ。')
     assert chat_module.MEMORY_CHANGE_PATTERN.search('このことは覚えておいて。')
+    assert chat_module.MEMORY_NON_ASSERTION_PATTERN.search('祖父と青い風車に行った話、覚えてる？')
+
+
+def test_memory_extraction_skips_questions_and_their_replies(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app):
+        connection = database_module.open_database()
+        timestamp = database_module.now_iso()
+        conversation_id = 'synthetic-memory-question'
+        connection.execute(
+            'INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)',
+            (conversation_id, '架空質問', timestamp, timestamp),
+        )
+        connection.executemany(
+            'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
+            [
+                (conversation_id, 'user', '祖父と青い風車に行った話、覚えてる？', timestamp),
+                (conversation_id, 'assistant', '祖父との思い出を確認するね。', timestamp),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        batch = chat_module.claim_memory_extraction_batch()
+        connection = database_module.open_database()
+        state = connection.execute(
+            'SELECT last_processed_message_id FROM memory_extraction_state WHERE id = 1'
+        ).fetchone()
+        connection.close()
+
+    assert batch is None
+    assert state['last_processed_message_id'] == 2
+
+
+def test_memory_search_matches_paraphrases_and_rejects_unrelated_queries(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(memory_module, 'embed_texts', fake_memory_embeddings)
+    with TestClient(norn_app.app):
+        grandmother = memory_module.save_memory_record(
+            'episode', '子どもの頃、祖母と青い風車を見に行った。', 'explicit'
+        )
+        grandfather = memory_module.save_memory_record(
+            'episode', '子どもの頃、祖父と長野の温泉に出かけた。', 'explicit'
+        )
+        work = memory_module.save_memory_record(
+            'episode', '仕事で会った上司と風車の設計を話し合った。', 'explicit'
+        )
+        paraphrase = memory_module.search_memory_records(
+            'おばあちゃんと昔見に行ったものは何？',
+            query_variants=['祖母と青い風車を見に行った思い出'],
+        )
+        wrong_grandfather = memory_module.search_memory_records('祖父と昔見に行った青いものは何？')
+        wrong_grandmother = memory_module.search_memory_records('祖母と長野で入った温泉はどこ？')
+        variant_search = memory_module.execute_memory_tool('search_memories', {
+            'query': '昔の家族旅行について',
+            'query_variants': ['じいちゃんと旅行した場所'],
+        })
+        unrelated = memory_module.search_memory_records('今日の夕飯は何にする？')
+
+    assert [memory['id'] for memory in paraphrase] == [grandmother['id']]
+    assert wrong_grandfather == []
+    assert wrong_grandmother == []
+    assert paraphrase[0]['similarity'] >= memory_module.MIN_MEMORY_SIMILARITY
+    assert variant_search['memories'][0]['id'] == grandfather['id']
+    assert work['id'] not in {memory['id'] for memory in paraphrase}
+    assert unrelated == []
+
+    memory_module.update_memory_record(
+        grandmother['id'], '祖父と青い風車を見に行った。', source_type='explicit'
+    )
+    corrected_search = memory_module.search_memory_records('おばあちゃんと昔見に行ったものは何？')
+    assert grandmother['id'] not in {memory['id'] for memory in corrected_search}
+
+
+def test_memory_search_falls_back_to_lexical_matching(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(memory_module, 'embed_texts', lambda texts: None)
+    with TestClient(norn_app.app):
+        saved = memory_module.save_memory_record(
+            'episode', '祖母と温泉に行った。', 'explicit'
+        )
+        results = memory_module.search_memory_records('祖母と温泉に行った')
+
+    assert [memory['id'] for memory in results] == [saved['id']]

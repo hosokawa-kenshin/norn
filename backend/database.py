@@ -48,6 +48,12 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_memories_category_updated
                 ON memories(category, updated_at);
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+                memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                model_name TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS memory_extraction_state (
                 id INTEGER PRIMARY KEY CHECK(id = 1),
                 last_attempted_at TEXT,
