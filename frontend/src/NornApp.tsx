@@ -2,16 +2,20 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   Activity,
   AudioLines,
+  CalendarDays,
   Check,
   ChevronRight,
+  ChevronLeft,
   CircleAlert,
   Clock3,
   Mic,
   MicOff,
   Plus,
+  Pencil,
   Send,
   Settings2,
   Sparkles,
+  Trash2,
 } from 'lucide-react'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
@@ -21,6 +25,57 @@ type ApiStatus = {
   llm: { configured: boolean; model: string }
 }
 type VoiceState = 'idle' | 'recording' | 'transcribing'
+type AppView = 'chat' | 'schedule'
+type CalendarMode = 'day' | 'week'
+type EventItem = {
+  id: string
+  title: string
+  description: string
+  start_at: string
+  end_at: string
+}
+type EventDraft = {
+  title: string
+  description: string
+  date: string
+  startTime: string
+  endTime: string
+}
+
+function localDateKey(date: Date) {
+  const year = date.getFullYear()
+  const month = (date.getMonth() + 1).toString().padStart(2, '0')
+  const day = date.getDate().toString().padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function getDateRange(value: string, mode: CalendarMode) {
+  const selected = new Date(`${value}T00:00:00`)
+  const start = new Date(selected)
+  if (mode === 'week') start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
+  const end = new Date(start)
+  end.setDate(end.getDate() + (mode === 'week' ? 7 : 1))
+  return { start, end }
+}
+
+function formatLongDate(date: Date) {
+  return new Intl.DateTimeFormat('ja-JP', {
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
+  }).format(date)
+}
+
+function timeInputValue(value: string) {
+  const date = new Date(value)
+  return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
+}
+
+function formatEventTime(value: string) {
+  return new Intl.DateTimeFormat('ja-JP', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+}
+
+function createEventDraft(date: string): EventDraft {
+  return { title: '', description: '', date, startTime: '10:00', endTime: '11:00' }
+}
 
 function formatTime(seconds: number) {
   return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`
@@ -50,6 +105,14 @@ export default function NornApp() {
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState('')
   const [showSettings, setShowSettings] = useState(false)
+  const [view, setView] = useState<AppView>('chat')
+  const [calendarMode, setCalendarMode] = useState<CalendarMode>('week')
+  const [selectedDate, setSelectedDate] = useState(() => localDateKey(new Date()))
+  const [events, setEvents] = useState<EventItem[]>([])
+  const [eventError, setEventError] = useState('')
+  const [showEventEditor, setShowEventEditor] = useState(false)
+  const [editingEventId, setEditingEventId] = useState<string | null>(null)
+  const [eventDraft, setEventDraft] = useState<EventDraft>(() => createEventDraft(localDateKey(new Date())))
   const recorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const chunksRef = useRef<Blob[]>([])
@@ -71,6 +134,27 @@ export default function NornApp() {
       .catch(() => undefined)
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    if (view !== 'schedule') return
+    const range = getDateRange(selectedDate, calendarMode)
+    const params = new URLSearchParams({ start: range.start.toISOString(), end: range.end.toISOString() })
+    let active = true
+    fetch(`/api/events?${params}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await responseError(response))
+        return (await response.json()) as EventItem[]
+      })
+      .then((value) => {
+        if (!active) return
+        setEvents(value)
+        setEventError('')
+      })
+      .catch((reason) => {
+        if (active) setEventError(reason instanceof Error ? reason.message : '予定を取得できませんでした。')
+      })
+    return () => { active = false }
+  }, [view, selectedDate, calendarMode])
 
   useEffect(() => {
     if (!activeId) {
@@ -212,6 +296,89 @@ export default function NornApp() {
     setError('')
   }
 
+  function openNewEvent() {
+    setEditingEventId(null)
+    setEventDraft(createEventDraft(selectedDate))
+    setEventError('')
+    setShowEventEditor(true)
+  }
+
+  function openEditEvent(event: EventItem) {
+    setEditingEventId(event.id)
+    setEventDraft({
+      title: event.title,
+      description: event.description,
+      date: localDateKey(new Date(event.start_at)),
+      startTime: timeInputValue(event.start_at),
+      endTime: timeInputValue(event.end_at),
+    })
+    setEventError('')
+    setShowEventEditor(true)
+  }
+
+  async function saveEvent(formEvent: FormEvent<HTMLFormElement>) {
+    formEvent.preventDefault()
+    setEventError('')
+    const response = await fetch(editingEventId ? `/api/events/${editingEventId}` : '/api/events', {
+      method: editingEventId ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: eventDraft.title,
+        description: eventDraft.description,
+        start_at: `${eventDraft.date}T${eventDraft.startTime}:00+09:00`,
+        end_at: `${eventDraft.date}T${eventDraft.endTime}:00+09:00`,
+      }),
+    }).catch(() => null)
+
+    if (!response) {
+      setEventError('バックエンドに接続できません。')
+      return
+    }
+    if (!response.ok) {
+      setEventError(await responseError(response))
+      return
+    }
+
+    const saved = (await response.json()) as EventItem
+    setEvents((current) => {
+      const next = editingEventId
+        ? current.map((event) => event.id === saved.id ? saved : event)
+        : [...current, saved]
+      return next.sort((left, right) => left.start_at.localeCompare(right.start_at))
+    })
+    setShowEventEditor(false)
+  }
+
+  async function deleteEvent(event: EventItem) {
+    if (!window.confirm(`「${event.title}」を削除しますか？`)) return
+    const response = await fetch(`/api/events/${event.id}`, { method: 'DELETE' }).catch(() => null)
+    if (!response) {
+      setEventError('バックエンドに接続できません。')
+      return
+    }
+    if (!response.ok) {
+      setEventError(await responseError(response))
+      return
+    }
+    setEvents((current) => current.filter((item) => item.id !== event.id))
+  }
+
+  function moveCalendar(offset: number) {
+    const date = new Date(`${selectedDate}T00:00:00`)
+    date.setDate(date.getDate() + offset * (calendarMode === 'week' ? 7 : 1))
+    setSelectedDate(localDateKey(date))
+  }
+
+  const calendarRange = getDateRange(selectedDate, calendarMode)
+  const calendarDays = Array.from({ length: calendarMode === 'week' ? 7 : 1 }, (_, index) => {
+    const day = new Date(calendarRange.start)
+    day.setDate(day.getDate() + index)
+    return day
+  })
+  const rangeLabel = calendarMode === 'day'
+    ? formatLongDate(calendarRange.start)
+    : `${new Intl.DateTimeFormat('ja-JP', { month: 'long', day: 'numeric' }).format(calendarRange.start)} - ${new Intl.DateTimeFormat('ja-JP', { month: 'long', day: 'numeric' }).format(new Date(calendarRange.end.getTime() - 86400000))}`
+
   const stateLabel = voiceState === 'recording' ? '録音中' : voiceState === 'transcribing' ? '文字起こし中' : '音声入力'
 
   return (
@@ -256,13 +423,19 @@ export default function NornApp() {
 
       <main className="main-panel">
         <header className="topbar">
-          <div><div className="eyebrow">NORN / VOICE INTERFACE</div><h1>会話</h1></div>
-          <div className="topbar-state"><span className={`llm-dot ${status?.llm.configured ? 'is-ready' : ''}`} />
-            <span>{status?.llm.configured ? 'AI接続済み' : 'AI未設定'}</span>
+          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : '予定'}</h1></div>
+          <div className="topbar-actions">
+            <nav className="main-view-switch" aria-label="表示切替">
+              <button className={view === 'chat' ? 'is-active' : ''} type="button" onClick={() => setView('chat')}><AudioLines size={15} />会話</button>
+              <button className={view === 'schedule' ? 'is-active' : ''} type="button" onClick={() => setView('schedule')}><CalendarDays size={15} />予定</button>
+            </nav>
+            <div className="topbar-state"><span className={`llm-dot ${status?.llm.configured ? 'is-ready' : ''}`} />
+              <span>{status?.llm.configured ? 'AI接続済み' : 'AI未設定'}</span>
+            </div>
           </div>
         </header>
 
-        <section className="conversation-stage" aria-label="会話">
+        {view === 'chat' ? <section className="conversation-stage" aria-label="会話">
           {messages.length === 0 ? (
             <div className="welcome-state">
               <div className="welcome-orbit" aria-hidden="true">
@@ -296,7 +469,48 @@ export default function NornApp() {
               <div ref={messagesEndRef} />
             </div>
           )}
-        </section>
+        </section> : <section className="calendar-stage" aria-label="予定管理">
+          <div className="calendar-toolbar">
+            <div className="calendar-range-controls">
+              <button className="calendar-icon-button" type="button" onClick={() => moveCalendar(-1)} aria-label="前の期間" title="前の期間"><ChevronLeft size={17} /></button>
+              <button className="today-button" type="button" onClick={() => setSelectedDate(localDateKey(new Date()))}>今日</button>
+              <button className="calendar-icon-button" type="button" onClick={() => moveCalendar(1)} aria-label="次の期間" title="次の期間"><ChevronRight size={17} /></button>
+              <h2>{rangeLabel}</h2>
+            </div>
+            <div className="calendar-actions">
+              <div className="calendar-mode-switch" aria-label="表示期間">
+                <button className={calendarMode === 'day' ? 'is-active' : ''} type="button" onClick={() => setCalendarMode('day')}>日</button>
+                <button className={calendarMode === 'week' ? 'is-active' : ''} type="button" onClick={() => setCalendarMode('week')}>週</button>
+              </div>
+              <button className="add-event-button" type="button" onClick={openNewEvent}><Plus size={16} />予定を追加</button>
+            </div>
+          </div>
+          {eventError && <div className="error-banner calendar-error" role="alert"><CircleAlert size={16} /><span>{eventError}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setEventError('')}>×</button></div>}
+          <div className={`calendar-days ${calendarMode}`}>
+            {calendarDays.map((day) => {
+              const dayKey = localDateKey(day)
+              const dayEvents = events.filter((event) => localDateKey(new Date(event.start_at)) === dayKey)
+              return <section className="calendar-day" key={dayKey} aria-label={formatLongDate(day)}>
+                <header className="calendar-day-heading">
+                  <div><span className="calendar-day-name">{new Intl.DateTimeFormat('ja-JP', { weekday: 'long' }).format(day)}</span><strong>{new Intl.DateTimeFormat('ja-JP', { month: 'numeric', day: 'numeric' }).format(day)}</strong></div>
+                  <span className="event-count">{dayEvents.length}件</span>
+                </header>
+                {dayEvents.length === 0 ? <p className="day-empty">予定なし</p> : <div className="event-list">
+                  {dayEvents.map((event) => <article className="event-row" key={event.id}>
+                    <div className="event-time"><strong>{formatEventTime(event.start_at)}</strong><span>{formatEventTime(event.end_at)}</span></div>
+                    <div className="event-color-mark" />
+                    <div className="event-content"><h3>{event.title}</h3>{event.description && <p>{event.description}</p>}</div>
+                    <div className="event-controls">
+                      <button className="calendar-icon-button" type="button" onClick={() => openEditEvent(event)} aria-label={`${event.title}を編集`} title="編集"><Pencil size={15} /></button>
+                      <button className="calendar-icon-button danger" type="button" onClick={() => void deleteEvent(event)} aria-label={`${event.title}を削除`} title="削除"><Trash2 size={15} /></button>
+                    </div>
+                  </article>)}
+                </div>}
+              </section>
+            })}
+          </div>
+          {events.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
+        </section>}
 
         <section className="composer-wrap" aria-label="音声入力">
           {error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{error}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setError('')}>×</button></div>}
@@ -347,6 +561,25 @@ export default function NornApp() {
           <p className="settings-help">LLMの接続先とAPIキーは、NORN直下の <code>.env</code> で設定します。キーはブラウザーへ送られません。</p>
           <button className="dialog-close" type="button" onClick={() => setShowSettings(false)}>閉じる</button>
         </section>
+      </div>}
+
+      {showEventEditor && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) setShowEventEditor(false)
+      }}>
+        <form className="settings-dialog event-dialog" role="dialog" aria-modal="true" aria-labelledby="event-dialog-title" onSubmit={saveEvent}>
+          <div className="dialog-heading"><div><div className="eyebrow">SCHEDULE / EVENT</div><h2 id="event-dialog-title">{editingEventId ? '予定を編集' : '予定を追加'}</h2></div>
+            <button className="icon-button" type="button" onClick={() => setShowEventEditor(false)} aria-label="閉じる">×</button>
+          </div>
+          {eventError && <div className="error-banner" role="alert"><CircleAlert size={15} /><span>{eventError}</span></div>}
+          <label className="event-field">予定名<input autoFocus required maxLength={120} value={eventDraft.title} onChange={(event) => setEventDraft({ ...eventDraft, title: event.target.value })} placeholder="例: 定例ミーティング" /></label>
+          <label className="event-field">日付<input required type="date" value={eventDraft.date} onChange={(event) => setEventDraft({ ...eventDraft, date: event.target.value })} /></label>
+          <div className="event-time-fields">
+            <label className="event-field">開始<input required type="time" value={eventDraft.startTime} onChange={(event) => setEventDraft({ ...eventDraft, startTime: event.target.value })} /></label>
+            <label className="event-field">終了<input required type="time" value={eventDraft.endTime} onChange={(event) => setEventDraft({ ...eventDraft, endTime: event.target.value })} /></label>
+          </div>
+          <label className="event-field">メモ<textarea maxLength={2000} rows={3} value={eventDraft.description} onChange={(event) => setEventDraft({ ...eventDraft, description: event.target.value })} placeholder="場所や準備事項" /></label>
+          <div className="event-dialog-actions"><button className="cancel-button" type="button" onClick={() => setShowEventEditor(false)}>キャンセル</button><button className="dialog-close" type="submit">{editingEventId ? '変更を保存' : '予定を保存'}</button></div>
+        </form>
       </div>}
     </div>
   )

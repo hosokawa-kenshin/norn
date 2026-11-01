@@ -64,3 +64,65 @@ def test_chat_requires_llm_configuration(monkeypatch, tmp_path):
         response = client.post('/api/chat', json={'content': 'こんにちは'})
 
     assert response.status_code == 503
+
+
+def test_event_crud_stores_japan_timezone(monkeypatch, tmp_path):
+    monkeypatch.setattr(norn_app, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/events', json={
+            'title': '定例ミーティング',
+            'description': '週次の確認',
+            'start_at': '2026-11-02T10:00',
+            'end_at': '2026-11-02T11:00',
+        })
+        event_id = created.json()['id']
+        listed = client.get('/api/events', params={
+            'start': '2026-11-02T00:00:00+09:00',
+            'end': '2026-11-03T00:00:00+09:00',
+        })
+        updated = client.put(f'/api/events/{event_id}', json={
+            'title': '定例ミーティング（変更）',
+            'description': '',
+            'start_at': '2026-11-02T11:00',
+            'end_at': '2026-11-02T12:00',
+        })
+        deleted = client.delete(f'/api/events/{event_id}')
+        remaining = client.get('/api/events')
+
+    assert created.status_code == 201
+    assert created.json()['start_at'].endswith('+09:00')
+    assert len(listed.json()) == 1
+    assert updated.json()['title'] == '定例ミーティング（変更）'
+    assert deleted.status_code == 204
+    assert remaining.json() == []
+
+
+def test_event_rejects_overlapping_times(monkeypatch, tmp_path):
+    monkeypatch.setattr(norn_app, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        first = client.post('/api/events', json={
+            'title': '予定A',
+            'start_at': '2026-11-02T10:00:00+09:00',
+            'end_at': '2026-11-02T11:00:00+09:00',
+        })
+        overlap = client.post('/api/events', json={
+            'title': '予定B',
+            'start_at': '2026-11-02T10:30:00+09:00',
+            'end_at': '2026-11-02T11:30:00+09:00',
+        })
+
+    assert first.status_code == 201
+    assert overlap.status_code == 409
+    assert '予定A' in overlap.json()['detail']
+
+
+def test_event_requires_end_after_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(norn_app, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/events', json={
+            'title': '時刻不正',
+            'start_at': '2026-11-02T11:00:00+09:00',
+            'end_at': '2026-11-02T10:00:00+09:00',
+        })
+
+    assert response.status_code == 422
