@@ -350,7 +350,6 @@ export default function NornApp() {
   }
 
   async function deleteEvent(event: EventItem) {
-    if (!window.confirm(`「${event.title}」を削除しますか？`)) return
     const response = await fetch(`/api/events/${event.id}`, { method: 'DELETE' }).catch(() => null)
     if (!response) {
       setEventError('バックエンドに接続できません。')
