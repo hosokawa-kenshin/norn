@@ -25,6 +25,12 @@ SYSTEM_PROMPT = (
     '予定操作の結果はツールの戻り値に従って報告し、失敗した操作を成功したと述べてはいけません。'
     'NORN内のタスク検索・追加・更新・完了・削除は、ユーザーから明確に依頼されたら承認なしでタスクツールから実行してください。'
     '期限や所要時間が示されていない場合は推測で設定せず、未設定のままにしてください。'
+    '見積時間付きタスクを新規作成した場合は、期限があれば期限まで、期限がなければ現在から5営業日以内の空き時間を検索し、最も早い候補へ自動で割り当ててください。'
+    'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
+    '見積時間がなく時間枠を決められない場合は、見積時間だけを質問してください。'
+    '見積時間付きタスクを新規作成した場合は、期限があれば期限まで、期限がなければ現在から5営業日以内の空き時間を検索し、最も早い候補へ自動で割り当ててください。'
+    'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
+    '見積時間がなく時間枠を決められない場合は、見積時間だけを質問してください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
     'ユーザーの確認なしに外部操作を実行したと主張してはいけません。'
 )
@@ -109,13 +115,17 @@ async def generate_llm_reply(messages: list[dict[str, str]]) -> str:
                 mutating_tools = {
                     'create_event', 'update_event', 'delete_event',
                     'create_task', 'update_task', 'complete_task', 'delete_task',
+                    'schedule_task', 'unschedule_task',
                 }
                 if name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
                 else:
                     if name in mutating_tools:
                         seen_tool_calls.add(call_key)
-                    task_tools = {'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task'}
+                    task_tools = {
+                        'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
+                        'find_task_slots', 'schedule_task', 'unschedule_task',
+                    }
                     result = (
                         execute_task_tool(name, arguments)
                         if name in task_tools

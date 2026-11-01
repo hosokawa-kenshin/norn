@@ -62,34 +62,16 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_tasks_status_due
                 ON tasks(status, due_at);
-            CREATE TABLE IF NOT EXISTS tasks (
+            CREATE TABLE IF NOT EXISTS task_allocations (
                 id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                due_at TEXT,
-                estimated_minutes INTEGER,
-                priority TEXT NOT NULL CHECK(priority IN ('low', 'normal', 'high')),
-                status TEXT NOT NULL CHECK(status IN ('open', 'in_progress', 'done', 'cancelled')),
+                task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT
+                updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS ix_tasks_status_due
-                ON tasks(status, due_at);
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                due_at TEXT,
-                estimated_minutes INTEGER,
-                priority TEXT NOT NULL CHECK(priority IN ('low', 'normal', 'high')),
-                status TEXT NOT NULL CHECK(status IN ('open', 'in_progress', 'done', 'cancelled')),
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS ix_tasks_status_due
-                ON tasks(status, due_at);
+            CREATE INDEX IF NOT EXISTS ix_task_allocations_start_end
+                ON task_allocations(start_at, end_at);
             '''
         )
         connection.commit()

@@ -160,6 +160,10 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .event-time { display: flex; flex-direction: column; gap: 3px; color: #728072; font: 9px var(--mono); }
 .event-time strong { color: #334d39; font-size: 10px; }
 .event-color-mark { align-self: stretch; min-height: 34px; background: #769468; border-radius: 2px; }
+.task-allocation-mark { background: var(--coral); }
+.task-allocation-row { background: rgba(253, 248, 243, .9); border-style: dashed; }
+.task-allocation-row:hover { border-color: #d7a58f; }
+.task-slot-label { display: block; margin-bottom: 3px; color: #a45b46; font-size: 8px; font-weight: 700; }
 .event-content { min-width: 0; }
 .event-content h3 { margin: 0; color: #26372b; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
 .event-content p { margin: 4px 0 0; color: #788176; font-size: 10px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -212,6 +216,9 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .task-due { color: #54684e; }
 .task-no-due { color: #a0a69b; }
 .task-estimate { display: inline-flex; align-items: center; gap: 4px; }
+.task-scheduled { display: inline-flex; align-items: center; gap: 4px; color: #a45b46; }
+.task-slot-button { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; color: #46634a; background: transparent; border: 1px solid #d5dfd0; border-radius: 4px; cursor: pointer; font-size: 9px; }
+.task-slot-button:hover { background: #eef3e9; border-color: #9fb495; }
 .task-controls { display: flex; align-items: center; gap: 3px; }
 .task-empty-state { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 170px; color: #8a9387; font-size: 11px; }
 .task-error { margin-top: 12px; }

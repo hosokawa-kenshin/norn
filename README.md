@@ -36,6 +36,8 @@ LLM_API_KEY=
 LLM_MODEL=qwen2.5:7b
 ```
 
+タスクの時間割当は既定で平日09:00〜18:00を使います。`.env`の`NORN_PLANNING_DAY_START`、`NORN_PLANNING_DAY_END`、`NORN_PLANNING_WORKDAYS`で変更できます。曜日は月曜を`0`、日曜を`6`としてカンマ区切りで指定します。見積時間のあるタスクはGeminiが期限まで（期限がなければ次の5営業日以内）の空き枠を検索して自動で割り当てます。予定・他タスクと重なる枠や営業時間外は登録されません。
+
 `.env`の接続先とAPIキーを設定したら、NORN直下で両方のサーバーを起動します。
 
 ```bash

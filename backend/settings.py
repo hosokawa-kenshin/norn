@@ -17,6 +17,13 @@ LLM_API_KEY = os.getenv('LLM_API_KEY', '')
 LLM_MODEL = os.getenv('LLM_MODEL', '')
 MAX_AUDIO_BYTES = int(os.getenv('MAX_AUDIO_MB', '20')) * 1024 * 1024
 MAX_MESSAGE_LENGTH = 4000
+PLANNING_DAY_START = os.getenv('NORN_PLANNING_DAY_START', '09:00')
+PLANNING_DAY_END = os.getenv('NORN_PLANNING_DAY_END', '18:00')
+PLANNING_WORKDAYS = frozenset(
+	int(day.strip())
+	for day in os.getenv('NORN_PLANNING_WORKDAYS', '0,1,2,3,4').split(',')
+	if day.strip()
+)
 
 logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
 logger = logging.getLogger('norn')

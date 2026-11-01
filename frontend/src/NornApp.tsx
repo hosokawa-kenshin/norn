@@ -36,6 +36,15 @@ type EventItem = {
   start_at: string
   end_at: string
 }
+type TaskAllocation = {
+  id: string
+  task_id: string
+  title: string
+  start_at: string
+  end_at: string
+  estimated_minutes: number
+  status: string
+}
 type EventDraft = {
   title: string
   description: string
@@ -111,6 +120,7 @@ export default function NornApp() {
   const [calendarMode, setCalendarMode] = useState<CalendarMode>('week')
   const [selectedDate, setSelectedDate] = useState(() => localDateKey(new Date()))
   const [events, setEvents] = useState<EventItem[]>([])
+  const [taskAllocations, setTaskAllocations] = useState<TaskAllocation[]>([])
   const [eventError, setEventError] = useState('')
   const [showEventEditor, setShowEventEditor] = useState(false)
   const [editingEventId, setEditingEventId] = useState<string | null>(null)
@@ -142,14 +152,19 @@ export default function NornApp() {
     const range = getDateRange(selectedDate, calendarMode)
     const params = new URLSearchParams({ start: range.start.toISOString(), end: range.end.toISOString() })
     let active = true
-    fetch(`/api/events?${params}`)
-      .then(async (response) => {
-        if (!response.ok) throw new Error(await responseError(response))
-        return (await response.json()) as EventItem[]
+    Promise.all([fetch(`/api/events?${params}`), fetch(`/api/task-allocations?${params}`)])
+      .then(async ([eventResponse, taskResponse]) => {
+        if (!eventResponse.ok) throw new Error(await responseError(eventResponse))
+        if (!taskResponse.ok) throw new Error(await responseError(taskResponse))
+        return Promise.all([
+          eventResponse.json() as Promise<EventItem[]>,
+          taskResponse.json() as Promise<TaskAllocation[]>,
+        ])
       })
-      .then((value) => {
+      .then(([eventItems, allocations]) => {
         if (!active) return
-        setEvents(value)
+        setEvents(eventItems)
+        setTaskAllocations(allocations)
         setEventError('')
       })
       .catch((reason) => {
@@ -364,6 +379,26 @@ export default function NornApp() {
     setEvents((current) => current.filter((item) => item.id !== event.id))
   }
 
+  async function unscheduleTask(task: TaskAllocation) {
+    const response = await fetch(`/api/tasks/${task.task_id}/schedule`, { method: 'DELETE' }).catch(() => null)
+    if (!response) {
+      setEventError('バックエンドに接続できません。')
+      return
+    }
+    if (!response.ok) {
+      setEventError(await responseError(response))
+      return
+    }
+    setTaskAllocations((current) => current.filter((allocation) => allocation.task_id !== task.task_id))
+  }
+
+  function requestTaskSchedule(task: { title: string; estimated_minutes: number | null; due_at: string | null }) {
+    const estimate = task.estimated_minutes ? `見積時間は${task.estimated_minutes}分` : '見積時間は未設定'
+    const due = task.due_at ? `期限は${formatDate(task.due_at)}` : '期限は未設定'
+    setDraft(`「${task.title}」の作業時間を予定と重ならない空き枠に割り当ててください。${estimate}、${due}です。`)
+    setView('chat')
+  }
+
   function moveCalendar(offset: number) {
     const date = new Date(`${selectedDate}T00:00:00`)
     date.setDate(date.getDate() + offset * (calendarMode === 'week' ? 7 : 1))
@@ -492,12 +527,13 @@ export default function NornApp() {
             {calendarDays.map((day) => {
               const dayKey = localDateKey(day)
               const dayEvents = events.filter((event) => localDateKey(new Date(event.start_at)) === dayKey)
+              const dayTaskAllocations = taskAllocations.filter((task) => localDateKey(new Date(task.start_at)) === dayKey)
               return <section className="calendar-day" key={dayKey} aria-label={formatLongDate(day)}>
                 <header className="calendar-day-heading">
                   <div><span className="calendar-day-name">{new Intl.DateTimeFormat('ja-JP', { weekday: 'long' }).format(day)}</span><strong>{new Intl.DateTimeFormat('ja-JP', { month: 'numeric', day: 'numeric' }).format(day)}</strong></div>
-                  <span className="event-count">{dayEvents.length}件</span>
+                  <span className="event-count">{dayEvents.length}予定 / {dayTaskAllocations.length}タスク</span>
                 </header>
-                {dayEvents.length === 0 ? <p className="day-empty">予定なし</p> : <div className="event-list">
+                {dayEvents.length === 0 && dayTaskAllocations.length === 0 ? <p className="day-empty">予定なし</p> : <div className="event-list">
                   {dayEvents.map((event) => <article className="event-row" key={event.id}>
                     <div className="event-time"><strong>{formatEventTime(event.start_at)}</strong><span>{formatEventTime(event.end_at)}</span></div>
                     <div className="event-color-mark" />
@@ -507,12 +543,18 @@ export default function NornApp() {
                       <button className="calendar-icon-button danger" type="button" onClick={() => void deleteEvent(event)} aria-label={`${event.title}を削除`} title="削除"><Trash2 size={15} /></button>
                     </div>
                   </article>)}
+                  {dayTaskAllocations.map((task) => <article className="event-row task-allocation-row" key={task.id}>
+                    <div className="event-time"><strong>{formatEventTime(task.start_at)}</strong><span>{formatEventTime(task.end_at)}</span></div>
+                    <div className="event-color-mark task-allocation-mark" />
+                    <div className="event-content"><span className="task-slot-label">タスク枠</span><h3>{task.title}</h3><p>見積 {task.estimated_minutes}分</p></div>
+                    <div className="event-controls"><button className="calendar-icon-button danger" type="button" onClick={() => void unscheduleTask(task)} aria-label={`${task.title}の時間枠を解除`} title="時間枠を解除"><Trash2 size={15} /></button></div>
+                  </article>)}
                 </div>}
               </section>
             })}
           </div>
-          {events.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
-        </section> : <TasksView />}
+          {events.length === 0 && taskAllocations.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
+        </section> : <TasksView onRequestSchedule={requestTaskSchedule} />}
 
         <section className="composer-wrap" aria-label="音声入力">
           {error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{error}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setError('')}>×</button></div>}

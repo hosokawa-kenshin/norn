@@ -1,5 +1,7 @@
 import json
+from datetime import datetime, time, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
@@ -131,6 +133,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
     assert tool_names == {
         'list_events', 'create_event', 'update_event', 'delete_event',
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
+        'find_task_slots', 'schedule_task', 'unschedule_task',
     }
     assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
 
@@ -344,102 +347,99 @@ def test_chat_executes_gemini_task_tool_without_approval(monkeypatch, tmp_path):
     assert len(tasks) == 1
     assert tasks[0]['title'] == 'Geminiタスクテスト'
     tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
-    assert {'create_task', 'update_task', 'complete_task', 'delete_task', 'list_tasks'} <= tool_names
+    assert {
+        'create_task', 'update_task', 'complete_task', 'delete_task', 'list_tasks',
+        'find_task_slots', 'schedule_task', 'unschedule_task',
+    } <= tool_names
     assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
 
 
-def test_task_crud_status_and_japan_timezone(monkeypatch, tmp_path):
+def test_task_slots_avoid_events_and_other_tasks(monkeypatch, tmp_path):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    now = datetime.now(ZoneInfo('Asia/Tokyo'))
+    workday = (now + timedelta(days=1)).date()
+    while workday.weekday() >= 5:
+        workday += timedelta(days=1)
+    workday_text = workday.isoformat()
+    range_start = datetime.combine(workday, time(9), ZoneInfo('Asia/Tokyo'))
+    range_end = datetime.combine(workday, time(18), ZoneInfo('Asia/Tokyo'))
+
     with TestClient(norn_app.app) as client:
-        created = client.post('/api/tasks', json={
-            'title': 'レポートを書く',
-            'description': '結果をまとめる',
-            'due_at': '2026-11-05T17:00',
-            'estimated_minutes': 45,
-            'priority': 'high',
+        event = client.post('/api/events', json={
+            'title': '朝会',
+            'start_at': f'{workday_text}T09:00:00+09:00',
+            'end_at': f'{workday_text}T10:00:00+09:00',
         })
-        task_id = created.json()['id']
-        in_progress = client.patch(f'/api/tasks/{task_id}', json={'status': 'in_progress'})
-        completed = tasks_module.execute_task_tool('complete_task', {'task_id': task_id})
-        listed = client.get('/api/tasks', params={'status': 'done'})
-        deleted = client.delete(f'/api/tasks/{task_id}')
-        remaining = client.get('/api/tasks')
+        first = client.post('/api/tasks', json={
+            'title': '集中作業A',
+            'estimated_minutes': 60,
+            'due_at': f'{workday_text}T18:00:00+09:00',
+        }).json()
+        first_slots = client.get(f"/api/tasks/{first['id']}/available-slots", params={
+            'from_at': range_start.isoformat(), 'through_at': range_end.isoformat(),
+        })
+        first_slot = first_slots.json()['slots'][0]
+        first_assignment = client.put(f"/api/tasks/{first['id']}/schedule", json={'start_at': first_slot['start_at']})
 
-    assert created.status_code == 201
-    assert created.json()['due_at'].endswith('+09:00')
-    assert created.json()['estimated_minutes'] == 45
-    assert in_progress.json()['status'] == 'in_progress'
-    assert completed['ok'] is True
-    assert listed.json()[0]['status'] == 'done'
-    assert listed.json()[0]['completed_at'] is not None
-    assert deleted.status_code == 204
-    assert remaining.json() == []
+        second = client.post('/api/tasks', json={
+            'title': '集中作業B',
+            'estimated_minutes': 30,
+            'due_at': f'{workday_text}T18:00:00+09:00',
+        }).json()
+        invalid_increment = client.put(f"/api/tasks/{second['id']}/schedule", json={
+            'start_at': f'{workday_text}T12:07:00+09:00',
+        })
+        second_slots = client.get(f"/api/tasks/{second['id']}/available-slots", params={
+            'from_at': range_start.isoformat(), 'through_at': range_end.isoformat(),
+        })
+        second_assignment = client.put(f"/api/tasks/{second['id']}/schedule", json={
+            'start_at': f'{workday_text}T10:30:00+09:00',
+        })
+        next_assignment = client.put(f"/api/tasks/{second['id']}/schedule", json={
+            'start_at': second_slots.json()['slots'][0]['start_at'],
+        })
+        allocations = client.get('/api/task-allocations', params={
+            'start': range_start.isoformat(), 'end': range_end.isoformat(),
+        })
+        completed = client.patch(f"/api/tasks/{first['id']}", json={'status': 'done'})
+        remaining_allocation = client.delete(f"/api/tasks/{second['id']}/schedule")
+        empty_allocations = client.get('/api/task-allocations', params={
+            'start': range_start.isoformat(), 'end': range_end.isoformat(),
+        })
+
+    assert event.status_code == 201
+    assert first_slot['start_at'].endswith('T10:00:00+09:00')
+    assert first_assignment.status_code == 200
+    assert second_slots.json()['slots'][0]['start_at'].endswith('T11:00:00+09:00')
+    assert invalid_increment.status_code == 409
+    assert second_assignment.status_code == 409
+    assert next_assignment.status_code == 200
+    assert len(allocations.json()) == 2
+    assert completed.json()['scheduled_start'] is None
+    assert remaining_allocation.status_code == 204
+    assert empty_allocations.json() == []
 
 
-def test_tasks_filter_by_status_and_due_date(monkeypatch, tmp_path):
+def test_gemini_auto_assigns_new_task_to_earliest_slot(monkeypatch, tmp_path):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
-    with TestClient(norn_app.app) as client:
-        client.post('/api/tasks', json={
-            'title': '今週の作業',
-            'due_at': '2026-11-03T17:00:00+09:00',
-        })
-        client.post('/api/tasks', json={
-            'title': '来週の作業',
-            'due_at': '2026-11-10T17:00:00+09:00',
-        })
-        response = client.get('/api/tasks', params={
-            'status': 'open',
-            'due_before': '2026-11-05T00:00:00+09:00',
-        })
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    now = datetime.now(ZoneInfo('Asia/Tokyo'))
+    workday = (now + timedelta(days=1)).date()
+    while workday.weekday() >= 5:
+        workday += timedelta(days=1)
+    workday_text = workday.isoformat()
+    calls = []
 
-    assert response.status_code == 200
-    assert [task['title'] for task in response.json()] == ['今週の作業']
-
-
-def test_task_rejects_invalid_estimate_and_unknown_status(monkeypatch, tmp_path):
-    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
-    with TestClient(norn_app.app) as client:
-        invalid_estimate = client.post('/api/tasks', json={
-            'title': '不正な見積もり',
-            'estimated_minutes': 0,
-        })
-        created = client.post('/api/tasks', json={'title': '状態テスト'})
-        invalid_status = client.patch(
-            f"/api/tasks/{created.json()['id']}",
-            json={'status': 'sleeping'},
-        )
-
-    assert invalid_estimate.status_code == 422
-    assert invalid_status.status_code == 422
-
-
-def test_chat_executes_gemini_task_tool_without_approval(monkeypatch, tmp_path):
-    tool_response = {
-        'choices': [{
-            'message': {
-                'role': 'assistant',
-                'content': None,
-                'tool_calls': [{
-                    'id': 'call-create-task',
-                    'type': 'function',
-                    'function': {
-                        'name': 'create_task',
-                        'arguments': json.dumps({
-                            'title': 'Geminiタスクテスト',
-                            'due_at': '2026-11-06T17:00:00+09:00',
-                            'estimated_minutes': 30,
-                            'priority': 'high',
-                        }),
-                    },
-                }],
-            },
-        }],
-    }
-    final_response = {
-        'choices': [{'message': {'role': 'assistant', 'content': 'タスクを追加しました。'}}],
-    }
-    responses = iter([tool_response, final_response])
-    request_payloads = []
+    def tool_response(name, arguments):
+        return {'choices': [{'message': {
+            'role': 'assistant',
+            'content': None,
+            'tool_calls': [{
+                'id': f'call-{len(calls)}',
+                'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments)},
+            }],
+        }}]}
 
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -452,20 +452,40 @@ def test_chat_executes_gemini_task_tool_without_approval(monkeypatch, tmp_path):
             return False
 
         async def post(self, url, json, headers):
-            request_payloads.append(json)
-            return SimpleNamespace(is_error=False, json=lambda: next(responses))
+            calls.append(json)
+            if len(calls) == 1:
+                reply = tool_response('create_task', {
+                    'title': '自動割当テスト',
+                    'estimated_minutes': 30,
+                    'due_at': f'{workday_text}T18:00:00+09:00',
+                })
+            elif len(calls) == 2:
+                created_result = json_module.loads(next(message['content'] for message in reversed(json['messages']) if message['role'] == 'tool'))
+                reply = tool_response('find_task_slots', {
+                    'task_id': created_result['task']['id'],
+                    'from_at': f'{workday_text}T09:00:00+09:00',
+                    'through_at': f'{workday_text}T18:00:00+09:00',
+                    'limit': 1,
+                })
+            elif len(calls) == 3:
+                slots_result = json_module.loads(next(message['content'] for message in reversed(json['messages']) if message['role'] == 'tool'))
+                reply = tool_response('schedule_task', {
+                    'task_id': slots_result['task_id'],
+                    'start_at': slots_result['slots'][0]['start_at'],
+                })
+            else:
+                reply = {'choices': [{'message': {'role': 'assistant', 'content': 'タスクを最短の空き時間に割り当てました。'}}]}
+            return SimpleNamespace(is_error=False, json=lambda: reply)
 
-    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
-    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    import json as json_module
+
     monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
     with TestClient(norn_app.app) as client:
-        response = client.post('/api/chat', json={'content': '金曜までに30分の高優先度タスクを追加して'})
+        response = client.post('/api/chat', json={'content': '見積30分、期限は指定日の18時のタスクを追加して予定に割り当てて'})
         tasks = client.get('/api/tasks').json()
 
     assert response.status_code == 200
-    assert 'タスクを追加しました' in response.json()['assistant_message']['content']
+    assert '最短の空き時間に割り当てました' in response.json()['assistant_message']['content']
+    assert len(calls) == 4
     assert len(tasks) == 1
-    assert tasks[0]['title'] == 'Geminiタスクテスト'
-    tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
-    assert {'create_task', 'update_task', 'complete_task', 'delete_task', 'list_tasks'} <= tool_names
-    assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
+    assert tasks[0]['scheduled_start'].endswith('T09:00:00+09:00')

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Check, CircleAlert, Clock3, Pencil, Plus, Trash2 } from 'lucide-react'
+import { CalendarClock, Check, CircleAlert, Clock3, Pencil, Plus, Trash2 } from 'lucide-react'
 
 type TaskStatus = 'open' | 'in_progress' | 'done' | 'cancelled'
 type TaskPriority = 'low' | 'normal' | 'high'
@@ -14,6 +14,8 @@ type TaskItem = {
   created_at: string
   updated_at: string
   completed_at: string | null
+  scheduled_start: string | null
+  scheduled_end: string | null
 }
 type TaskDraft = {
   title: string
@@ -23,6 +25,9 @@ type TaskDraft = {
   priority: TaskPriority
 }
 type TaskFilter = 'active' | 'done' | 'all'
+type TasksViewProps = {
+  onRequestSchedule: (task: Pick<TaskItem, 'title' | 'estimated_minutes' | 'due_at'>) => void
+}
 
 function emptyDraft(): TaskDraft {
   return { title: '', description: '', dueAt: '', estimatedMinutes: '', priority: 'normal' }
@@ -42,6 +47,13 @@ function formatDue(value: string | null) {
   }).format(new Date(value))
 }
 
+function formatScheduledRange(start: string, end: string) {
+  const date = new Intl.DateTimeFormat('ja-JP', { month: 'numeric', day: 'numeric' }).format(new Date(start))
+  const startTime = new Intl.DateTimeFormat('ja-JP', { hour: '2-digit', minute: '2-digit' }).format(new Date(start))
+  const endTime = new Intl.DateTimeFormat('ja-JP', { hour: '2-digit', minute: '2-digit' }).format(new Date(end))
+  return `${date} ${startTime}-${endTime}`
+}
+
 async function errorMessage(response: Response) {
   const result = await response.json().catch(() => null)
   return typeof result?.detail === 'string'
@@ -49,7 +61,7 @@ async function errorMessage(response: Response) {
     : `リクエストに失敗しました (${response.status})`
 }
 
-export default function TasksView() {
+export default function TasksView({ onRequestSchedule }: TasksViewProps) {
   const [tasks, setTasks] = useState<TaskItem[]>([])
   const [filter, setFilter] = useState<TaskFilter>('active')
   const [error, setError] = useState('')
@@ -204,6 +216,9 @@ export default function TasksView() {
               <span className={`task-priority ${task.priority}`}>優先度 {priorityLabel[task.priority]}</span>
               <span className={task.due_at ? 'task-due' : 'task-no-due'}>期限 {formatDue(task.due_at)}</span>
               {task.estimated_minutes && <span className="task-estimate"><Clock3 size={12} />{task.estimated_minutes}分</span>}
+              {task.scheduled_start && task.scheduled_end
+                ? <span className="task-scheduled"><CalendarClock size={12} />{formatScheduledRange(task.scheduled_start, task.scheduled_end)}</span>
+                : task.status !== 'done' && task.status !== 'cancelled' && <button className="task-slot-button" type="button" onClick={() => onRequestSchedule(task)}><CalendarClock size={13} />時間を割り当て</button>}
             </div>
           </div>
           <div className="task-controls">
