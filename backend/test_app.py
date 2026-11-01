@@ -8,6 +8,8 @@ import chat as chat_module
 import database as database_module
 import events as events_module
 import settings as settings_module
+import tasks as tasks_module
+import tasks as tasks_module
 import voice as voice_module
 
 
@@ -122,11 +124,14 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         events = client.get('/api/events').json()
 
     assert response.status_code == 200
-    assert response.json()['assistant_message']['content'] == '明日14時からの予定を追加しました。'
+    assert '予定を追加しました' in response.json()['assistant_message']['content']
     assert len(events) == 1
     assert events[0]['title'] == 'Gemini連携テスト'
     tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
-    assert tool_names == {'list_events', 'create_event', 'update_event', 'delete_event'}
+    assert tool_names == {
+        'list_events', 'create_event', 'update_event', 'delete_event',
+        'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
+    }
     assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
 
 
@@ -218,3 +223,249 @@ def test_event_requires_end_after_start(monkeypatch, tmp_path):
         })
 
     assert response.status_code == 422
+
+
+def test_task_crud_status_and_japan_timezone(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/tasks', json={
+            'title': 'レポートを書く',
+            'description': '結果をまとめる',
+            'due_at': '2026-11-05T17:00',
+            'estimated_minutes': 45,
+            'priority': 'high',
+        })
+        task_id = created.json()['id']
+        in_progress = client.patch(f'/api/tasks/{task_id}', json={'status': 'in_progress'})
+        completed = tasks_module.execute_task_tool('complete_task', {'task_id': task_id})
+        listed = client.get('/api/tasks', params={'status': 'done'})
+        deleted = client.delete(f'/api/tasks/{task_id}')
+        remaining = client.get('/api/tasks')
+
+    assert created.status_code == 201
+    assert created.json()['due_at'].endswith('+09:00')
+    assert created.json()['estimated_minutes'] == 45
+    assert in_progress.json()['status'] == 'in_progress'
+    assert completed['ok'] is True
+    assert listed.json()[0]['status'] == 'done'
+    assert listed.json()[0]['completed_at'] is not None
+    assert deleted.status_code == 204
+    assert remaining.json() == []
+
+
+def test_tasks_filter_by_status_and_due_date(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        client.post('/api/tasks', json={
+            'title': '今週の作業',
+            'due_at': '2026-11-03T17:00:00+09:00',
+        })
+        client.post('/api/tasks', json={
+            'title': '来週の作業',
+            'due_at': '2026-11-10T17:00:00+09:00',
+        })
+        response = client.get('/api/tasks', params={
+            'status': 'open',
+            'due_before': '2026-11-05T00:00:00+09:00',
+        })
+
+    assert response.status_code == 200
+    assert [task['title'] for task in response.json()] == ['今週の作業']
+
+
+def test_task_rejects_invalid_estimate_and_unknown_status(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        invalid_estimate = client.post('/api/tasks', json={
+            'title': '不正な見積もり',
+            'estimated_minutes': 0,
+        })
+        created = client.post('/api/tasks', json={'title': '状態テスト'})
+        invalid_status = client.patch(
+            f"/api/tasks/{created.json()['id']}",
+            json={'status': 'sleeping'},
+        )
+
+    assert invalid_estimate.status_code == 422
+    assert invalid_status.status_code == 422
+
+
+def test_chat_executes_gemini_task_tool_without_approval(monkeypatch, tmp_path):
+    tool_response = {
+        'choices': [{
+            'message': {
+                'role': 'assistant',
+                'content': None,
+                'tool_calls': [{
+                    'id': 'call-create-task',
+                    'type': 'function',
+                    'function': {
+                        'name': 'create_task',
+                        'arguments': json.dumps({
+                            'title': 'Geminiタスクテスト',
+                            'due_at': '2026-11-06T17:00:00+09:00',
+                            'estimated_minutes': 30,
+                            'priority': 'high',
+                        }),
+                    },
+                }],
+            },
+        }],
+    }
+    final_response = {
+        'choices': [{'message': {'role': 'assistant', 'content': 'タスクを追加しました。'}}],
+    }
+    responses = iter([tool_response, final_response])
+    request_payloads = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            return SimpleNamespace(is_error=False, json=lambda: next(responses))
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={'content': '金曜までに30分の高優先度タスクを追加して'})
+        tasks = client.get('/api/tasks').json()
+
+    assert response.status_code == 200
+    assert 'タスクを追加しました' in response.json()['assistant_message']['content']
+    assert len(tasks) == 1
+    assert tasks[0]['title'] == 'Geminiタスクテスト'
+    tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
+    assert {'create_task', 'update_task', 'complete_task', 'delete_task', 'list_tasks'} <= tool_names
+    assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
+
+
+def test_task_crud_status_and_japan_timezone(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/tasks', json={
+            'title': 'レポートを書く',
+            'description': '結果をまとめる',
+            'due_at': '2026-11-05T17:00',
+            'estimated_minutes': 45,
+            'priority': 'high',
+        })
+        task_id = created.json()['id']
+        in_progress = client.patch(f'/api/tasks/{task_id}', json={'status': 'in_progress'})
+        completed = tasks_module.execute_task_tool('complete_task', {'task_id': task_id})
+        listed = client.get('/api/tasks', params={'status': 'done'})
+        deleted = client.delete(f'/api/tasks/{task_id}')
+        remaining = client.get('/api/tasks')
+
+    assert created.status_code == 201
+    assert created.json()['due_at'].endswith('+09:00')
+    assert created.json()['estimated_minutes'] == 45
+    assert in_progress.json()['status'] == 'in_progress'
+    assert completed['ok'] is True
+    assert listed.json()[0]['status'] == 'done'
+    assert listed.json()[0]['completed_at'] is not None
+    assert deleted.status_code == 204
+    assert remaining.json() == []
+
+
+def test_tasks_filter_by_status_and_due_date(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        client.post('/api/tasks', json={
+            'title': '今週の作業',
+            'due_at': '2026-11-03T17:00:00+09:00',
+        })
+        client.post('/api/tasks', json={
+            'title': '来週の作業',
+            'due_at': '2026-11-10T17:00:00+09:00',
+        })
+        response = client.get('/api/tasks', params={
+            'status': 'open',
+            'due_before': '2026-11-05T00:00:00+09:00',
+        })
+
+    assert response.status_code == 200
+    assert [task['title'] for task in response.json()] == ['今週の作業']
+
+
+def test_task_rejects_invalid_estimate_and_unknown_status(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        invalid_estimate = client.post('/api/tasks', json={
+            'title': '不正な見積もり',
+            'estimated_minutes': 0,
+        })
+        created = client.post('/api/tasks', json={'title': '状態テスト'})
+        invalid_status = client.patch(
+            f"/api/tasks/{created.json()['id']}",
+            json={'status': 'sleeping'},
+        )
+
+    assert invalid_estimate.status_code == 422
+    assert invalid_status.status_code == 422
+
+
+def test_chat_executes_gemini_task_tool_without_approval(monkeypatch, tmp_path):
+    tool_response = {
+        'choices': [{
+            'message': {
+                'role': 'assistant',
+                'content': None,
+                'tool_calls': [{
+                    'id': 'call-create-task',
+                    'type': 'function',
+                    'function': {
+                        'name': 'create_task',
+                        'arguments': json.dumps({
+                            'title': 'Geminiタスクテスト',
+                            'due_at': '2026-11-06T17:00:00+09:00',
+                            'estimated_minutes': 30,
+                            'priority': 'high',
+                        }),
+                    },
+                }],
+            },
+        }],
+    }
+    final_response = {
+        'choices': [{'message': {'role': 'assistant', 'content': 'タスクを追加しました。'}}],
+    }
+    responses = iter([tool_response, final_response])
+    request_payloads = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            return SimpleNamespace(is_error=False, json=lambda: next(responses))
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={'content': '金曜までに30分の高優先度タスクを追加して'})
+        tasks = client.get('/api/tasks').json()
+
+    assert response.status_code == 200
+    assert 'タスクを追加しました' in response.json()['assistant_message']['content']
+    assert len(tasks) == 1
+    assert tasks[0]['title'] == 'Geminiタスクテスト'
+    tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
+    assert {'create_task', 'update_task', 'complete_task', 'delete_task', 'list_tasks'} <= tool_names
+    assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])

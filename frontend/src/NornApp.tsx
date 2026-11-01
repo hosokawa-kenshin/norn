@@ -6,6 +6,7 @@ import {
   Check,
   ChevronRight,
   ChevronLeft,
+  ClipboardList,
   CircleAlert,
   Clock3,
   Mic,
@@ -17,6 +18,7 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react'
+import TasksView from './TasksView'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
 type Conversation = { id: string; title: string; updated_at: string }
@@ -25,7 +27,7 @@ type ApiStatus = {
   llm: { configured: boolean; model: string }
 }
 type VoiceState = 'idle' | 'recording' | 'transcribing'
-type AppView = 'chat' | 'schedule'
+type AppView = 'chat' | 'schedule' | 'tasks'
 type CalendarMode = 'day' | 'week'
 type EventItem = {
   id: string
@@ -422,11 +424,12 @@ export default function NornApp() {
 
       <main className="main-panel">
         <header className="topbar">
-          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : '予定'}</h1></div>
+          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : view === 'schedule' ? '予定' : 'タスク'}</h1></div>
           <div className="topbar-actions">
             <nav className="main-view-switch" aria-label="表示切替">
               <button className={view === 'chat' ? 'is-active' : ''} type="button" onClick={() => setView('chat')}><AudioLines size={15} />会話</button>
               <button className={view === 'schedule' ? 'is-active' : ''} type="button" onClick={() => setView('schedule')}><CalendarDays size={15} />予定</button>
+              <button className={view === 'tasks' ? 'is-active' : ''} type="button" onClick={() => setView('tasks')}><ClipboardList size={15} />タスク</button>
             </nav>
             <div className="topbar-state"><span className={`llm-dot ${status?.llm.configured ? 'is-ready' : ''}`} />
               <span>{status?.llm.configured ? 'AI接続済み' : 'AI未設定'}</span>
@@ -468,7 +471,7 @@ export default function NornApp() {
               <div ref={messagesEndRef} />
             </div>
           )}
-        </section> : <section className="calendar-stage" aria-label="予定管理">
+        </section> : view === 'schedule' ? <section className="calendar-stage" aria-label="予定管理">
           <div className="calendar-toolbar">
             <div className="calendar-range-controls">
               <button className="calendar-icon-button" type="button" onClick={() => moveCalendar(-1)} aria-label="前の期間" title="前の期間"><ChevronLeft size={17} /></button>
@@ -509,7 +512,7 @@ export default function NornApp() {
             })}
           </div>
           {events.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
-        </section>}
+        </section> : <TasksView />}
 
         <section className="composer-wrap" aria-label="音声入力">
           {error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{error}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setError('')}>×</button></div>}
