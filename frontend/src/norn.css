@@ -213,6 +213,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .task-priority { color: #778071; }
 .task-priority.high { color: #b25240; }
 .task-priority.low { color: #818a7d; }
+.task-project { display: inline-flex; align-items: center; padding: 2px 6px; color: #456149; background: #e9eee2; border-radius: 3px; font-size: 9px; }
 .task-due { color: #54684e; }
 .task-no-due { color: #a0a69b; }
 .task-estimate { display: inline-flex; align-items: center; gap: 4px; }
@@ -230,6 +231,45 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .task-field input:focus, .task-field textarea:focus, .task-field select:focus { border-color: #78906f; outline: 2px solid rgba(102, 137, 83, .16); }
 .task-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .task-dialog .event-dialog-actions { margin-top: 4px; }
+.goal-stage { display: flex; flex: 1; flex-direction: column; width: min(100%, 1000px); margin: 0 auto; padding: 28px clamp(20px, 4vw, 50px) 32px; }
+.goal-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 17px; border-bottom: 1px solid var(--line); }
+.goal-toolbar h2 { margin: 7px 0 5px; color: var(--ink); font-size: 19px; }
+.goal-toolbar p { color: var(--muted); font-size: 10px; }
+.goal-toolbar-actions { display: flex; align-items: center; gap: 8px; }
+.goal-list { display: flex; flex-direction: column; }
+.goal-row { padding: 18px 0 14px; border-bottom: 1px solid var(--line); animation: enter 200ms ease both; }
+.goal-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.goal-title-block { display: flex; align-items: center; gap: 10px; min-width: 0; color: #577653; }
+.goal-title-block > div { min-width: 0; }
+.goal-title-block h3 { margin: 0; color: var(--ink); font-size: 14px; overflow-wrap: anywhere; }
+.goal-title-block span { display: block; margin-top: 4px; color: var(--muted); font-size: 9px; }
+.goal-controls { display: flex; align-items: center; gap: 2px; }
+.goal-description { margin: 10px 0 0 26px; color: #697467; font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.progress-line { display: flex; align-items: center; gap: 10px; margin: 12px 0 0 26px; color: #63725e; font: 10px var(--mono); }
+.progress-track { flex: 1; min-width: 70px; height: 5px; overflow: hidden; background: #e2e7dc; border-radius: 4px; }
+.progress-track span { display: block; height: 100%; background: #6b9366; border-radius: inherit; transition: width 180ms ease; }
+.goal-project-list { margin: 10px 0 0 26px; padding-left: 14px; border-left: 1px solid #dfe5da; }
+.project-row { display: grid; grid-template-columns: 17px minmax(0, 1fr) auto; align-items: start; gap: 9px; padding: 10px 0; color: #687869; border-bottom: 1px solid #e8ebe4; }
+.project-row:last-child { border-bottom: 0; }
+.project-main { min-width: 0; }
+.project-title-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.project-title-line h4 { margin: 0; color: #334236; font-size: 11px; overflow-wrap: anywhere; }
+.project-status, .project-deadline { color: #818a7d; font-size: 9px; }
+.project-status.paused { color: #896f32; }
+.project-status.completed { color: #50734e; }
+.project-status.cancelled { color: #9a574b; }
+.project-main > p { margin: 4px 0; color: #788176; font-size: 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.project-progress-line { display: flex; align-items: center; gap: 8px; margin-top: 6px; color: #849083; font: 9px var(--mono); }
+.project-progress-line .progress-track { max-width: 160px; height: 4px; }
+.project-next-action { display: flex; gap: 7px; margin-top: 6px; color: #5e6f5c; font-size: 9px; }
+.project-next-action strong { color: #8a965f; }
+.goal-no-projects { margin: 12px 0 0 40px; color: #92998e; font-size: 10px; }
+.loose-projects { padding-top: 17px; }
+.loose-projects > h3 { margin: 0 0 5px; color: #5a6858; font-size: 11px; }
+.goal-empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 220px; color: #8a9387; font-size: 11px; }
+.goal-error { margin-top: 12px; }
+.goal-dialog { display: flex; flex-direction: column; gap: 12px; }
+.goal-dialog .dialog-heading { margin-bottom: 2px; }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 19px; }
 .dialog-heading h2 { margin: 7px 0 0; font-size: 20px; }
 .icon-button { display: grid; place-items: center; width: 30px; height: 30px; color: #68746a; background: transparent; border: 1px solid #dbe0d5; border-radius: 5px; cursor: pointer; font-size: 19px; }
@@ -262,6 +302,11 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
   .conversation-stage { min-height: 260px; padding: 18px 16px 12px; }
   .calendar-stage { padding: 16px 12px 22px; }
   .task-stage { padding: 18px 14px 24px; }
+  .goal-stage { padding: 18px 14px 24px; }
+  .goal-toolbar { align-items: stretch; flex-direction: column; gap: 10px; }
+  .goal-toolbar-actions { align-self: flex-start; }
+  .goal-project-list { margin-left: 12px; padding-left: 10px; }
+  .goal-description, .progress-line { margin-left: 0; }
   .task-toolbar { align-items: stretch; flex-direction: column; gap: 10px; }
   .task-toolbar .add-event-button { align-self: flex-start; }
   .task-row { grid-template-columns: 25px minmax(0, 1fr) auto; gap: 8px; padding: 11px 0; }

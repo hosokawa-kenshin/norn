@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from database import get_conversation_messages, now_iso, open_database
 from events import SCHEDULE_TOOLS, execute_schedule_tool
 from memory import MEMORY_TOOLS, execute_memory_tool, save_memory_record
+from planning import GOAL_PROJECT_TOOLS, execute_goal_project_tool
 from tasks import TASK_TOOLS, execute_task_tool
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
@@ -33,6 +34,11 @@ SYSTEM_PROMPT = (
     'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
     '見積時間がなく時間枠を決められない場合は、見積時間だけを質問してください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
+    '目標とプロジェクトの検索・追加・更新・削除は、ユーザーの明確な依頼に基づいて専用ツールで実行してください。'
+    '目標を作成するときは長期的な到達状態、プロジェクトは具体的な取り組みとして区別し、プロジェクトは該当する目標へ関連付けてください。'
+    '新しい進行中プロジェクトを作成したら、project_idで既存タスクを確認し、まだ無ければ最初の実行可能な作業タスクを3〜5件考えて同じproject_idに登録してください。'
+    'タスクは具体的で重複しない順序にし、期限・見積時間・優先度はユーザーが示した場合だけ設定してください。目標やプロジェクトの更新では既存タスクを重複作成しないでください。'
+    'タスクをプロジェクトへ関連付ける場合は、ユーザーの意図が明らかな場合だけ行ってください。'
     '親しみがあり自然な友人のような話し方をしてください。ただし人間だと偽ったり、根拠のない親密さを演じたりしないでください。'
     '会話の記憶はスレッドと別に保存されます。昔の出来事、人、好み、以前の発言について答える前に記憶検索ツールを使ってください。'
     '記憶検索のquery_variantsには、検索意図と人物・場所・時期などの具体的条件を保った言い換えだけを入れてください。'
@@ -86,11 +92,11 @@ async def generate_llm_reply(
     completed_actions: list[str] = []
     seen_tool_calls: set[tuple[str, str]] = set()
 
-    for _ in range(5):
+    for _ in range(8):
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
-            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS],
+            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS],
             'tool_choice': 'auto',
             'temperature': 0.2,
         }
@@ -152,6 +158,8 @@ async def generate_llm_reply(
                     'create_task', 'update_task', 'complete_task', 'delete_task',
                     'schedule_task', 'unschedule_task',
                     'save_memory', 'update_memory', 'forget_memory',
+                    'create_goal', 'update_goal', 'delete_goal',
+                    'create_project', 'update_project', 'delete_project',
                 }
                 if name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
@@ -163,10 +171,13 @@ async def generate_llm_reply(
                         'find_task_slots', 'schedule_task', 'unschedule_task',
                     }
                     memory_tools = {tool['function']['name'] for tool in MEMORY_TOOLS}
+                    goal_project_tools = {tool['function']['name'] for tool in GOAL_PROJECT_TOOLS}
                     if name in memory_tools:
                         result = await asyncio.to_thread(
                             execute_memory_tool, name, arguments, conversation_id
                         )
+                    elif name in goal_project_tools:
+                        result = await asyncio.to_thread(execute_goal_project_tool, name, arguments)
                     elif name in task_tools:
                         result = execute_task_tool(name, arguments)
                     else:

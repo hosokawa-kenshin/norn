@@ -71,8 +71,33 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_events_start_end
                 ON events(start_at, end_at);
+            CREATE TABLE IF NOT EXISTS goals (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL CHECK(status IN ('active', 'paused', 'completed', 'cancelled')),
+                target_date TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_goals_status_target
+                ON goals(status, target_date);
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL CHECK(status IN ('active', 'paused', 'completed', 'cancelled')),
+                target_date TEXT,
+                next_action TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_projects_goal_status
+                ON projects(goal_id, status);
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
+                project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 due_at TEXT,
@@ -96,6 +121,16 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS ix_task_allocations_start_end
                 ON task_allocations(start_at, end_at);
             '''
+        )
+        task_columns = {
+            row['name'] for row in connection.execute('PRAGMA table_info(tasks)').fetchall()
+        }
+        if 'project_id' not in task_columns:
+            connection.execute(
+                'ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL'
+            )
+        connection.execute(
+            'CREATE INDEX IF NOT EXISTS ix_tasks_project_status ON tasks(project_id, status)'
         )
         connection.commit()
 

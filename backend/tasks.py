@@ -18,6 +18,7 @@ router = APIRouter()
 
 class TaskPayload(BaseModel):
     title: str = Field(min_length=1, max_length=160)
+    project_id: str | None = None
     description: str = Field(default='', max_length=4000)
     due_at: datetime | None = None
     estimated_minutes: int | None = Field(default=None, ge=1, le=1440)
@@ -31,6 +32,16 @@ class TaskPayload(BaseModel):
             raise ValueError('タスク名を入力してください。')
         return value
 
+    @field_validator('project_id')
+    @classmethod
+    def clean_project_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as error:
+            raise ValueError('プロジェクトIDが不正です。') from error
+
     @field_validator('due_at')
     @classmethod
     def use_tokyo_timezone(cls, value: datetime | None) -> datetime | None:
@@ -43,6 +54,7 @@ class TaskPayload(BaseModel):
 
 class TaskUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=160)
+    project_id: str | None = None
     description: str | None = Field(default=None, max_length=4000)
     due_at: datetime | None = None
     estimated_minutes: int | None = Field(default=None, ge=1, le=1440)
@@ -58,6 +70,16 @@ class TaskUpdate(BaseModel):
         if not value:
             raise ValueError('タスク名を空にはできません。')
         return value
+
+    @field_validator('project_id')
+    @classmethod
+    def clean_project_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as error:
+            raise ValueError('プロジェクトIDが不正です。') from error
 
     @field_validator('due_at')
     @classmethod
@@ -85,12 +107,13 @@ TASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'list_tasks',
-            'description': 'NORNのタスクを検索する。状態や期限で絞り込める。',
+            'description': 'NORNのタスクを検索する。状態、期限、プロジェクトで絞り込める。',
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'status': {'type': 'string', 'enum': ['open', 'in_progress', 'done', 'cancelled']},
                     'due_before': {'type': 'string', 'format': 'date-time'},
+                    'project_id': {'type': 'string'},
                 },
                 'additionalProperties': False,
             },
@@ -105,6 +128,7 @@ TASK_TOOLS = [
                 'type': 'object',
                 'properties': {
                     'title': {'type': 'string', 'minLength': 1, 'maxLength': 160},
+                    'project_id': {'type': 'string'},
                     'description': {'type': 'string', 'maxLength': 4000},
                     'due_at': {'type': 'string', 'format': 'date-time'},
                     'estimated_minutes': {'type': 'integer', 'minimum': 1, 'maximum': 1440},
@@ -124,6 +148,7 @@ TASK_TOOLS = [
                 'type': 'object',
                 'properties': {
                     'task_id': {'type': 'string'},
+                    'project_id': {'type': 'string'},
                     'title': {'type': 'string', 'minLength': 1, 'maxLength': 160},
                     'description': {'type': 'string', 'maxLength': 4000},
                     'due_at': {'type': 'string', 'format': 'date-time'},
@@ -402,23 +427,34 @@ def unschedule_task_record(task_id: str) -> bool:
         result = connection.execute('DELETE FROM task_allocations WHERE task_id = ?', (task_id,))
         connection.commit()
     return result.rowcount > 0
-def query_tasks(status: TaskStatus | None = None, due_before: datetime | None = None) -> list[dict[str, Any]]:
+def query_tasks(
+    status: TaskStatus | None = None,
+    due_before: datetime | None = None,
+    project_id: str | None = None,
+) -> list[dict[str, Any]]:
     conditions: list[str] = []
     parameters: list[str] = []
     if status is not None:
-        conditions.append('status = ?')
+        conditions.append('tasks.status = ?')
         parameters.append(status)
     if due_before is not None:
-        conditions.append('due_at IS NOT NULL AND due_at <= ?')
+        conditions.append('tasks.due_at IS NOT NULL AND tasks.due_at <= ?')
         parameters.append(task_datetime_iso(due_before) or '')
+    if project_id is not None:
+        project_id = str(uuid.UUID(project_id))
+        conditions.append('tasks.project_id = ?')
+        parameters.append(project_id)
     query = '''
-        SELECT tasks.*, task_allocations.start_at AS scheduled_start,
+        SELECT tasks.*, projects.title AS project_title,
+            task_allocations.start_at AS scheduled_start,
             task_allocations.end_at AS scheduled_end
-        FROM tasks LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
+        FROM tasks
+        LEFT JOIN projects ON projects.id = tasks.project_id
+        LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
     '''
     if conditions:
         query += ' WHERE ' + ' AND '.join(conditions)
-    query += ' ORDER BY CASE priority WHEN \'high\' THEN 0 WHEN \'normal\' THEN 1 ELSE 2 END, due_at IS NULL, due_at, created_at DESC'
+    query += ' ORDER BY CASE tasks.priority WHEN \'high\' THEN 0 WHEN \'normal\' THEN 1 ELSE 2 END, tasks.due_at IS NULL, tasks.due_at, tasks.created_at DESC'
     with closing(open_database()) as connection:
         rows = connection.execute(query, parameters).fetchall()
     return [dict(row) for row in rows]
@@ -428,15 +464,20 @@ def create_task_record(payload: TaskPayload) -> dict[str, Any]:
     task_id = str(uuid.uuid4())
     timestamp = now_iso()
     with closing(open_database()) as connection:
+        if payload.project_id and not connection.execute(
+            'SELECT id FROM projects WHERE id = ?', (payload.project_id,)
+        ).fetchone():
+            raise HTTPException(status_code=404, detail='関連付けるプロジェクトが見つかりません。')
         connection.execute(
             '''
             INSERT INTO tasks (
-                id, title, description, due_at, estimated_minutes, priority,
+                id, project_id, title, description, due_at, estimated_minutes, priority,
                 status, created_at, updated_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL)
             ''',
             (
                 task_id,
+                payload.project_id,
                 payload.title,
                 payload.description.strip(),
                 task_datetime_iso(payload.due_at),
@@ -450,8 +491,10 @@ def create_task_record(payload: TaskPayload) -> dict[str, Any]:
         row = connection.execute(
             '''
             SELECT tasks.*, task_allocations.start_at AS scheduled_start,
-                task_allocations.end_at AS scheduled_end
-            FROM tasks LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
+                task_allocations.end_at AS scheduled_end, projects.title AS project_title
+            FROM tasks
+            LEFT JOIN projects ON projects.id = tasks.project_id
+            LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
             WHERE tasks.id = ?
             ''',
             (task_id,),
@@ -468,6 +511,10 @@ def update_task_record(task_id: str, payload: TaskUpdate) -> dict[str, Any]:
         for field in payload.model_fields_set:
             value = getattr(payload, field)
             values[field] = task_datetime_iso(value) if field == 'due_at' else value
+        if 'project_id' in payload.model_fields_set and values['project_id'] and not connection.execute(
+            'SELECT id FROM projects WHERE id = ?', (values['project_id'],)
+        ).fetchone():
+            raise HTTPException(status_code=404, detail='関連付けるプロジェクトが見つかりません。')
         if 'description' in payload.model_fields_set:
             values['description'] = (values['description'] or '').strip()
         timestamp = now_iso()
@@ -478,12 +525,12 @@ def update_task_record(task_id: str, payload: TaskUpdate) -> dict[str, Any]:
             connection.execute('DELETE FROM task_allocations WHERE task_id = ?', (task_id,))
         connection.execute(
             '''
-            UPDATE tasks SET title = ?, description = ?, due_at = ?, estimated_minutes = ?,
+            UPDATE tasks SET title = ?, project_id = ?, description = ?, due_at = ?, estimated_minutes = ?,
                 priority = ?, status = ?, updated_at = ?, completed_at = ?
             WHERE id = ?
             ''',
             (
-                values['title'], values['description'], values['due_at'], values['estimated_minutes'],
+                values['title'], values['project_id'], values['description'], values['due_at'], values['estimated_minutes'],
                 values['priority'], values['status'], timestamp, completed_at, task_id,
             ),
         )
@@ -491,8 +538,10 @@ def update_task_record(task_id: str, payload: TaskUpdate) -> dict[str, Any]:
         updated = connection.execute(
             '''
             SELECT tasks.*, task_allocations.start_at AS scheduled_start,
-                task_allocations.end_at AS scheduled_end
-            FROM tasks LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
+                task_allocations.end_at AS scheduled_end, projects.title AS project_title
+            FROM tasks
+            LEFT JOIN projects ON projects.id = tasks.project_id
+            LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
             WHERE tasks.id = ?
             ''',
             (task_id,),
@@ -514,8 +563,9 @@ def delete_task_record(task_id: str) -> str:
 def list_tasks(
     status: TaskStatus | None = None,
     due_before: datetime | None = None,
+    project_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    return query_tasks(status, due_before)
+    return query_tasks(status, due_before, project_id)
 
 
 @router.post('/api/tasks', status_code=201)
@@ -575,13 +625,18 @@ def unschedule_task(task_id: str) -> None:
 def execute_task_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         if name == 'list_tasks':
-            if not set(arguments) <= {'status', 'due_before'}:
+            if not set(arguments) <= {'status', 'due_before', 'project_id'}:
                 raise ValueError('許可されていない検索条件です。')
             due_before = datetime.fromisoformat(arguments['due_before']) if arguments.get('due_before') else None
-            return {'ok': True, 'tasks': query_tasks(arguments.get('status'), due_before)}
+            return {
+                'ok': True,
+                'tasks': query_tasks(arguments.get('status'), due_before, arguments.get('project_id')),
+            }
 
         if name == 'create_task':
-            if not set(arguments) <= {'title', 'description', 'due_at', 'estimated_minutes', 'priority'}:
+            if not set(arguments) <= {
+                'title', 'project_id', 'description', 'due_at', 'estimated_minutes', 'priority'
+            }:
                 raise ValueError('許可されていないタスク項目が含まれています。')
             task = create_task_record(TaskPayload(**arguments))
             due_text = f'、期限は{task["due_at"]}' if task['due_at'] else ''
@@ -638,7 +693,9 @@ def execute_task_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 return {'ok': True, 'summary': f'タスク「{title}」を削除しました。'}
 
             changes = set(arguments) - {'task_id'}
-            allowed = {'title', 'description', 'due_at', 'estimated_minutes', 'priority', 'status'}
+            allowed = {
+                'title', 'project_id', 'description', 'due_at', 'estimated_minutes', 'priority', 'status'
+            }
             if not changes or not changes <= allowed:
                 raise ValueError('更新するタスク項目を指定してください。')
             task = update_task_record(task_id, TaskUpdate(**{key: value for key, value in arguments.items() if key != 'task_id'}))

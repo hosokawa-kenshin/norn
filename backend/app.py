@@ -8,6 +8,7 @@ from chat import router as chat_router
 from database import initialize_database
 from events import router as events_router
 from memory import router as memory_router
+from planning import router as planning_router
 from tasks import router as tasks_router
 import settings
 from voice import is_model_loaded, router as voice_router
@@ -29,6 +30,7 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(events_router)
 app.include_router(memory_router)
+app.include_router(planning_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
 

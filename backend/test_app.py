@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import struct
 import uuid
 from datetime import datetime, time, timedelta
@@ -12,6 +13,7 @@ import chat as chat_module
 import database as database_module
 import events as events_module
 import memory as memory_module
+import planning as planning_module
 import settings as settings_module
 import tasks as tasks_module
 import voice as voice_module
@@ -172,6 +174,8 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
         'find_task_slots', 'schedule_task', 'unschedule_task',
         'save_memory', 'search_memories', 'update_memory', 'forget_memory',
+        'list_goals', 'create_goal', 'update_goal', 'delete_goal',
+        'list_projects', 'create_project', 'update_project', 'delete_project',
     }
     assert any(message.get('role') == 'tool' for message in request_payloads[1]['messages'])
 
@@ -792,3 +796,322 @@ def test_memory_search_falls_back_to_lexical_matching(monkeypatch, tmp_path):
         results = memory_module.search_memory_records('祖母と温泉に行った')
 
     assert [memory['id'] for memory in results] == [saved['id']]
+
+
+def test_goals_projects_and_task_progress_api(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        goal_response = client.post('/api/goals', json={
+            'title': '自作曲を完成させる',
+            'description': '来年までに公開する',
+            'target_date': '2027-12-31',
+        })
+        goal = goal_response.json()
+        project_response = client.post('/api/projects', json={
+            'goal_id': goal['id'],
+            'title': 'アルバム制作',
+            'next_action': '歌詞の下書きを作る',
+        })
+        project = project_response.json()
+        first_task = client.post('/api/tasks', json={
+            'title': 'Aメロを書く',
+            'project_id': project['id'],
+        }).json()
+        second_task = client.post('/api/tasks', json={
+            'title': 'コード進行を決める',
+            'project_id': project['id'],
+        }).json()
+        completed = client.patch(f"/api/tasks/{first_task['id']}", json={'status': 'done'})
+        projects = client.get('/api/projects', params={'goal_id': goal['id']})
+        goals = client.get('/api/goals')
+        updated_project = client.patch(f"/api/projects/{project['id']}", json={
+            'next_action': 'サビのメロディを録る',
+            'status': 'paused',
+        })
+        invalid_project = client.post('/api/projects', json={
+            'goal_id': str(uuid.uuid4()),
+            'title': '存在しない目標への案件',
+        })
+        deleted_project = client.delete(f"/api/projects/{project['id']}")
+        unassigned_tasks = client.get('/api/tasks')
+        goal_after_delete = client.get('/api/goals').json()[0]
+
+    assert goal_response.status_code == 201
+    assert project_response.status_code == 201
+    assert first_task['project_id'] == project['id']
+    assert completed.status_code == 200
+    assert projects.json()[0]['task_count'] == 2
+    assert projects.json()[0]['completed_task_count'] == 1
+    assert projects.json()[0]['progress'] == 50
+    assert goals.json()[0]['progress'] == 50
+    assert goals.json()[0]['projects'][0]['next_action'] == '歌詞の下書きを作る'
+    assert updated_project.json()['next_action'] == 'サビのメロディを録る'
+    assert invalid_project.status_code == 422
+    assert deleted_project.status_code == 204
+    assert all(task['project_id'] is None for task in unassigned_tasks.json())
+    assert goal_after_delete['projects'] == []
+
+
+def test_gemini_creates_goal_and_linked_project_without_approval(monkeypatch, tmp_path):
+    request_payloads = []
+
+    def tool_response(call_id, name, arguments):
+        return {'choices': [{'message': {
+            'role': 'assistant',
+            'content': None,
+            'tool_calls': [{
+                'id': call_id,
+                'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments)},
+            }],
+        }}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            if len(request_payloads) == 1:
+                reply = tool_response('call-create-goal', 'create_goal', {
+                    'title': '自作曲を完成させる',
+                    'target_date': '2027-12-31',
+                })
+            elif len(request_payloads) == 2:
+                previous_result = json_module.loads(next(
+                    message['content'] for message in reversed(json['messages'])
+                    if message.get('role') == 'tool'
+                ))
+                reply = tool_response('call-create-project', 'create_project', {
+                    'title': 'アルバム制作',
+                    'goal_id': previous_result['goal']['id'],
+                    'next_action': '歌詞の下書きを作る',
+                })
+            else:
+                reply = {'choices': [{'message': {
+                    'role': 'assistant', 'content': '目標に結びつけてプロジェクトを作成したよ。',
+                }}]}
+            return SimpleNamespace(is_error=False, json=lambda: reply)
+
+    import json as json_module
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={
+            'content': '「自作曲を完成させる」を目標にして、「アルバム制作」をプロジェクトとして追加して',
+        })
+        goals = client.get('/api/goals').json()
+
+    assert response.status_code == 200
+    assert len(request_payloads) == 3
+    tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
+    assert {'create_goal', 'create_project', 'list_goals', 'list_projects'} <= tool_names
+    assert len(goals) == 1
+    assert goals[0]['projects'][0]['title'] == 'アルバム制作'
+    assert goals[0]['projects'][0]['goal_id'] == goals[0]['id']
+
+
+def test_gemini_generates_multiple_tasks_for_new_project(monkeypatch, tmp_path):
+    request_payloads = []
+    json_module = json
+
+    def tool_call(call_id, name, arguments):
+        return {
+            'id': call_id,
+            'type': 'function',
+            'function': {'name': name, 'arguments': json.dumps(arguments)},
+        }
+
+    def tool_response(call_id, name, arguments):
+        return {'choices': [{'message': {
+            'role': 'assistant', 'content': None,
+            'tool_calls': [tool_call(call_id, name, arguments)],
+        }}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            if len(request_payloads) == 1:
+                reply = tool_response('call-create-project', 'create_project', {
+                    'title': '架空ポッドキャスト制作',
+                })
+            elif len(request_payloads) == 2:
+                created_project = json_module.loads(next(
+                    message['content'] for message in reversed(json['messages'])
+                    if message.get('role') == 'tool'
+                ))
+                reply = tool_response('call-list-project-tasks', 'list_tasks', {
+                    'project_id': created_project['project']['id'],
+                })
+            elif len(request_payloads) == 3:
+                list_arguments = json_module.loads(next(
+                    tool_call['function']['arguments'] for message in reversed(json['messages'])
+                    if message.get('role') == 'assistant'
+                    for tool_call in message.get('tool_calls', [])
+                    if tool_call['function']['name'] == 'list_tasks'
+                ))
+                project_id = list_arguments['project_id']
+                reply = {'choices': [{'message': {
+                    'role': 'assistant',
+                    'content': None,
+                    'tool_calls': [
+                        tool_call('call-task-outline', 'create_task', {
+                            'title': '番組テーマと対象を決める', 'project_id': project_id,
+                        }),
+                        tool_call('call-task-record', 'create_task', {
+                            'title': '最初の台本を作る', 'project_id': project_id,
+                        }),
+                        tool_call('call-task-publish', 'create_task', {
+                            'title': '収録して公開する', 'project_id': project_id,
+                        }),
+                    ],
+                }}]}
+            else:
+                reply = {'choices': [{'message': {
+                    'role': 'assistant', 'content': '最初の3つの作業に分けて登録したよ。',
+                }}]}
+            return SimpleNamespace(is_error=False, json=lambda: reply)
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={
+            'content': 'ポッドキャストを始めるプロジェクトを作って、最初の作業もいくつか登録して',
+        })
+        projects = client.get('/api/projects').json()
+        project = next(project for project in projects if project['title'] == '架空ポッドキャスト制作')
+        tasks = client.get('/api/tasks', params={'project_id': project['id']}).json()
+
+    assert response.status_code == 200
+    assert '最初の3つ' in response.json()['assistant_message']['content']
+    assert len(request_payloads) == 4
+    assert len(tasks) == 3
+    assert all(task['project_id'] == project['id'] for task in tasks)
+    assert all(task['due_at'] is None and task['estimated_minutes'] is None for task in tasks)
+
+
+def test_initialize_database_migrates_legacy_tasks(monkeypatch, tmp_path):
+    database_path = tmp_path / 'legacy.sqlite3'
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        '''
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            due_at TEXT,
+            estimated_minutes INTEGER,
+            priority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        '''
+    )
+    connection.execute(
+        '''
+        INSERT INTO tasks (id, title, priority, status, created_at, updated_at)
+        VALUES ('legacy-task', '既存タスク', 'normal', 'open', '2026-01-01', '2026-01-01')
+        '''
+    )
+    connection.commit()
+    connection.close()
+
+    monkeypatch.setattr(database_module, 'DB_PATH', database_path)
+    database_module.initialize_database()
+    with database_module.open_database() as migrated:
+        columns = {row['name'] for row in migrated.execute('PRAGMA table_info(tasks)').fetchall()}
+        task = migrated.execute('SELECT * FROM tasks WHERE id = ?', ('legacy-task',)).fetchone()
+
+    assert 'project_id' in columns
+    assert task['title'] == '既存タスク'
+    assert task['project_id'] is None
+
+
+def test_gemini_creates_goal_and_linked_project_without_approval(monkeypatch, tmp_path):
+    request_payloads = []
+
+    def tool_response(call_id, name, arguments):
+        return {'choices': [{'message': {
+            'role': 'assistant',
+            'content': None,
+            'tool_calls': [{
+                'id': call_id,
+                'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments)},
+            }],
+        }}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            request_payloads.append(json)
+            if len(request_payloads) == 1:
+                response = tool_response('call-create-goal', 'create_goal', {
+                    'title': '自作曲を完成させる',
+                    'target_date': '2027-12-31',
+                })
+            elif len(request_payloads) == 2:
+                prior = json_module.loads(next(
+                    message['content'] for message in reversed(json['messages'])
+                    if message.get('role') == 'tool'
+                ))
+                response = tool_response('call-create-project', 'create_project', {
+                    'title': 'アルバム制作',
+                    'goal_id': prior['goal']['id'],
+                    'next_action': '歌詞の下書きを作る',
+                })
+            else:
+                response = {'choices': [{'message': {
+                    'role': 'assistant', 'content': '目標に結びつけてプロジェクトを作成したよ。',
+                }}]}
+            return SimpleNamespace(is_error=False, json=lambda: response)
+
+    import json as json_module
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={
+            'content': '「自作曲を完成させる」を目標にして、「アルバム制作」をプロジェクトとして追加して',
+        })
+        goals = client.get('/api/goals').json()
+
+    assert response.status_code == 200
+    assert len(request_payloads) == 3
+    tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
+    assert {'create_goal', 'create_project', 'list_goals', 'list_projects'} <= tool_names
+    assert len(goals) == 1
+    assert goals[0]['projects'][0]['title'] == 'アルバム制作'
+    assert goals[0]['projects'][0]['goal_id'] == goals[0]['id']

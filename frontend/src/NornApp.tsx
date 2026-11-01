@@ -16,8 +16,10 @@ import {
   Send,
   Settings2,
   Sparkles,
+  Target,
   Trash2,
 } from 'lucide-react'
+import GoalsView from './GoalsView'
 import TasksView from './TasksView'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
@@ -27,7 +29,7 @@ type ApiStatus = {
   llm: { configured: boolean; model: string }
 }
 type VoiceState = 'idle' | 'recording' | 'transcribing'
-type AppView = 'chat' | 'schedule' | 'tasks'
+type AppView = 'chat' | 'schedule' | 'tasks' | 'goals'
 type CalendarMode = 'day' | 'week'
 type EventItem = {
   id: string
@@ -212,6 +214,47 @@ export default function NornApp() {
   async function refreshConversations() {
     const response = await fetch('/api/conversations')
     if (response.ok) setConversations((await response.json()) as Conversation[])
+  }
+
+  async function planProjectTasks(project: {
+    id: string
+    title: string
+    description: string
+    next_action: string
+    goal_title: string | null
+  }) {
+    if (!status?.llm.configured) throw new Error('LLMが未設定です。設定後に会話からタスクを依頼してください。')
+    if (isSending) throw new Error('別の会話処理が進行中です。')
+    setError('')
+    setIsSending(true)
+    const content = [
+      `新しく作成したプロジェクト「${project.title}」の初期タスクを考えて登録してください。`,
+      `project_id: ${project.id}`,
+      project.goal_title ? `関連する目標: ${project.goal_title}` : '',
+      project.description ? `説明: ${project.description}` : '',
+      project.next_action ? `次のアクション: ${project.next_action}` : '',
+      'このproject_idで既存タスクを確認し、重複しない具体的な初期作業を3〜5件作成してください。期限・見積時間・優先度は指定されていないので設定しないでください。',
+    ].filter(Boolean).join('\n')
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: activeId, content }),
+      })
+      if (!response.ok) throw new Error(await responseError(response))
+      const result = await response.json() as {
+        conversation_id: string
+        user_message: Message
+        assistant_message: Message
+      }
+      localStorage.setItem('norn.activeConversation', result.conversation_id)
+      setActiveId(result.conversation_id)
+      setMessages((current) => [...current, result.user_message, result.assistant_message])
+      await refreshConversations()
+      return result.assistant_message.content
+    } finally {
+      setIsSending(false)
+    }
   }
 
   async function transcribeAudio(blob: Blob) {
@@ -459,12 +502,13 @@ export default function NornApp() {
 
       <main className="main-panel">
         <header className="topbar">
-          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : view === 'schedule' ? '予定' : 'タスク'}</h1></div>
+          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : view === 'schedule' ? '予定' : view === 'tasks' ? 'タスク' : '目標'}</h1></div>
           <div className="topbar-actions">
             <nav className="main-view-switch" aria-label="表示切替">
               <button className={view === 'chat' ? 'is-active' : ''} type="button" onClick={() => setView('chat')}><AudioLines size={15} />会話</button>
               <button className={view === 'schedule' ? 'is-active' : ''} type="button" onClick={() => setView('schedule')}><CalendarDays size={15} />予定</button>
               <button className={view === 'tasks' ? 'is-active' : ''} type="button" onClick={() => setView('tasks')}><ClipboardList size={15} />タスク</button>
+              <button className={view === 'goals' ? 'is-active' : ''} type="button" onClick={() => setView('goals')}><Target size={15} />目標</button>
             </nav>
             <div className="topbar-state"><span className={`llm-dot ${status?.llm.configured ? 'is-ready' : ''}`} />
               <span>{status?.llm.configured ? 'AI接続済み' : 'AI未設定'}</span>
@@ -554,7 +598,9 @@ export default function NornApp() {
             })}
           </div>
           {events.length === 0 && taskAllocations.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
-        </section> : <TasksView onRequestSchedule={requestTaskSchedule} />}
+        </section> : view === 'tasks' ? <TasksView onRequestSchedule={requestTaskSchedule} /> : (
+          <GoalsView onPlanProject={planProjectTasks} />
+        )}
 
         <section className="composer-wrap" aria-label="音声入力">
           {error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{error}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setError('')}>×</button></div>}

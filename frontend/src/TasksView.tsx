@@ -5,6 +5,8 @@ type TaskStatus = 'open' | 'in_progress' | 'done' | 'cancelled'
 type TaskPriority = 'low' | 'normal' | 'high'
 type TaskItem = {
   id: string
+  project_id: string | null
+  project_title: string | null
   title: string
   description: string
   due_at: string | null
@@ -19,18 +21,20 @@ type TaskItem = {
 }
 type TaskDraft = {
   title: string
+  projectId: string
   description: string
   dueAt: string
   estimatedMinutes: string
   priority: TaskPriority
 }
 type TaskFilter = 'active' | 'done' | 'all'
+type ProjectOption = { id: string; title: string }
 type TasksViewProps = {
   onRequestSchedule: (task: Pick<TaskItem, 'title' | 'estimated_minutes' | 'due_at'>) => void
 }
 
 function emptyDraft(): TaskDraft {
-  return { title: '', description: '', dueAt: '', estimatedMinutes: '', priority: 'normal' }
+  return { title: '', projectId: '', description: '', dueAt: '', estimatedMinutes: '', priority: 'normal' }
 }
 
 function toLocalDateTime(value: string | null) {
@@ -63,6 +67,7 @@ async function errorMessage(response: Response) {
 
 export default function TasksView({ onRequestSchedule }: TasksViewProps) {
   const [tasks, setTasks] = useState<TaskItem[]>([])
+  const [projects, setProjects] = useState<ProjectOption[]>([])
   const [filter, setFilter] = useState<TaskFilter>('active')
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(true)
@@ -72,19 +77,36 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
   const [draft, setDraft] = useState<TaskDraft>(emptyDraft)
 
   async function refreshTasks() {
-    const response = await fetch('/api/tasks')
-    if (!response.ok) throw new Error(await errorMessage(response))
-    setTasks((await response.json()) as TaskItem[])
+    const [taskResponse, projectResponse] = await Promise.all([
+      fetch('/api/tasks'),
+      fetch('/api/projects'),
+    ])
+    if (!taskResponse.ok) throw new Error(await errorMessage(taskResponse))
+    if (!projectResponse.ok) throw new Error(await errorMessage(projectResponse))
+    const [taskItems, projectItems] = await Promise.all([
+      taskResponse.json() as Promise<TaskItem[]>,
+      projectResponse.json() as Promise<ProjectOption[]>,
+    ])
+    setTasks(taskItems)
+    setProjects(projectItems)
   }
 
   useEffect(() => {
     let active = true
-    fetch('/api/tasks')
-      .then(async (response) => {
-        if (!response.ok) throw new Error(await errorMessage(response))
-        return (await response.json()) as TaskItem[]
+    Promise.all([fetch('/api/tasks'), fetch('/api/projects')])
+      .then(async ([taskResponse, projectResponse]) => {
+        if (!taskResponse.ok) throw new Error(await errorMessage(taskResponse))
+        if (!projectResponse.ok) throw new Error(await errorMessage(projectResponse))
+        return Promise.all([
+          taskResponse.json() as Promise<TaskItem[]>,
+          projectResponse.json() as Promise<ProjectOption[]>,
+        ])
       })
-      .then((value) => { if (active) setTasks(value) })
+      .then(([taskItems, projectItems]) => {
+        if (!active) return
+        setTasks(taskItems)
+        setProjects(projectItems)
+      })
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : 'タスクを取得できませんでした。') })
       .finally(() => { if (active) setIsLoading(false) })
     return () => { active = false }
@@ -101,6 +123,7 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
     setEditingId(task.id)
     setDraft({
       title: task.title,
+      projectId: task.project_id ?? '',
       description: task.description,
       dueAt: toLocalDateTime(task.due_at),
       estimatedMinutes: task.estimated_minutes?.toString() ?? '',
@@ -116,6 +139,7 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
     setError('')
     const payload = {
       title: draft.title,
+      project_id: draft.projectId || null,
       description: draft.description,
       due_at: draft.dueAt ? new Date(draft.dueAt).toISOString() : null,
       estimated_minutes: draft.estimatedMinutes ? Number(draft.estimatedMinutes) : null,
@@ -213,6 +237,7 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
             <div className="task-title-line"><h3>{task.title}</h3><span className={`task-status ${task.status}`}>{statusLabel[task.status]}</span></div>
             {task.description && <p className="task-description">{task.description}</p>}
             <div className="task-meta">
+              {task.project_title && <span className="task-project">{task.project_title}</span>}
               <span className={`task-priority ${task.priority}`}>優先度 {priorityLabel[task.priority]}</span>
               <span className={task.due_at ? 'task-due' : 'task-no-due'}>期限 {formatDue(task.due_at)}</span>
               {task.estimated_minutes && <span className="task-estimate"><Clock3 size={12} />{task.estimated_minutes}分</span>}
@@ -237,6 +262,10 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
           </div>
           {error && <div className="error-banner" role="alert"><CircleAlert size={15} /><span>{error}</span></div>}
           <label className="task-field">タスク名<input autoFocus required maxLength={160} value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="例: 会議資料を準備する" /></label>
+          <label className="task-field">プロジェクト<select value={draft.projectId} onChange={(event) => setDraft({ ...draft, projectId: event.target.value })}>
+            <option value="">未分類</option>
+            {projects.map((project) => <option key={project.id} value={project.id}>{project.title}</option>)}
+          </select></label>
           <label className="task-field">説明<textarea rows={3} maxLength={4000} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} placeholder="作業内容や補足" /></label>
           <div className="task-form-grid">
             <label className="task-field">期限<input type="datetime-local" value={draft.dueAt} onChange={(event) => setDraft({ ...draft, dueAt: event.target.value })} /></label>
