@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+import pytest
 
 import app as norn_app
 import chat as chat_module
@@ -20,6 +21,134 @@ import planning as planning_module
 import settings as settings_module
 import tasks as tasks_module
 import voice as voice_module
+import tts as tts_module
+
+
+@pytest.fixture(autouse=True)
+def disable_real_speech_worker(monkeypatch, tmp_path):
+    monkeypatch.setenv('NORN_TTS_ENABLED', '0')
+    monkeypatch.setattr(chat_module, 'CHARACTER_PATH', tmp_path / 'character.json')
+
+
+def test_missing_character_profile_uses_default_persona():
+    prompt = chat_module.build_system_prompt()
+    assert chat_module.DEFAULT_PERSONA in prompt
+    assert chat_module.SYSTEM_PROMPT in prompt
+
+
+@pytest.mark.parametrize('contents', ['{', '[]', '{}', '{"name":22}', 'あ' * 32769])
+def test_invalid_character_profile_is_not_silently_ignored(contents):
+    chat_module.CHARACTER_PATH.write_text(contents, encoding='utf-8')
+    with pytest.raises(chat_module.HTTPException) as error:
+        chat_module.build_system_prompt()
+    assert error.value.status_code == 503
+
+
+def test_character_profile_reloads_between_chat_requests(monkeypatch, tmp_path):
+    payloads = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            payloads.append(json)
+            return SimpleNamespace(is_error=False, json=lambda: {
+                'choices': [{'message': {'content': 'こんにちは。'}}],
+            })
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    with TestClient(norn_app.app) as client:
+        for name in ['設定テスト一号', '設定テスト二号']:
+            chat_module.CHARACTER_PATH.write_text(
+                json.dumps({'名前': name, '話し方': '自然な口調'}, ensure_ascii=False), encoding='utf-8',
+            )
+            response = client.post('/api/chat', json={'content': 'こんにちは'})
+            assert response.status_code == 200
+    assert '設定テスト一号' in payloads[0]['messages'][0]['content']
+    assert '設定テスト二号' in payloads[1]['messages'][0]['content']
+    assert '設定テスト一号' not in payloads[1]['messages'][0]['content']
+    for payload in payloads:
+        assert chat_module.SYSTEM_PROMPT in payload['messages'][0]['content']
+        assert chat_module.DEFAULT_PERSONA not in payload['messages'][0]['content']
+        assert payload['tools']
+
+
+def test_speech_returns_wav_without_saving_reply_audio(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        calls = []
+
+        def fake_synthesize(text):
+            calls.append(text)
+            return b'RIFFtest-wave', 0.56
+
+        monkeypatch.setattr(tts_module.speech, 'synthesize', fake_synthesize)
+        response = client.post('/api/speech', json={'text': 'こんにちは。'})
+    assert response.status_code == 200
+    assert response.content == b'RIFFtest-wave'
+    assert response.headers['content-type'] == 'audio/wav'
+    assert response.headers['cache-control'] == 'no-store'
+    assert response.headers['x-synthesis-seconds'] == '0.56'
+    assert calls == ['こんにちは。']
+
+
+def test_speech_status_loading_and_unavailable_do_not_block_chat(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        tts_module.speech.state = {'state': 'loading', 'device': 'cuda'}
+        assert client.get('/api/speech/status').json()['state'] == 'loading'
+        assert client.post('/api/speech', json={'text': 'テスト'}).status_code == 503
+        assert client.get('/api/status').status_code == 200
+        assert client.post('/api/speech', json={'text': '   '}).status_code == 422
+        assert client.post('/api/speech', json={'text': 'あ' * 4001}).status_code == 422
+
+
+def test_speech_worker_reuses_process_and_rejects_concurrent_requests():
+    from unittest.mock import MagicMock
+    import base64
+
+    service = tts_module.SpeechService()
+    service.state = {'state': 'ready'}
+    service.process = MagicMock()
+    service.process.poll.return_value = None
+    for _ in range(2):
+        service.responses.put(json.dumps({'audio': base64.b64encode(b'RIFF').decode(), 'seconds': 0.5}))
+        assert service.synthesize('テスト') == (b'RIFF', 0.5)
+    assert service.process.stdin.write.call_count == 2
+    service.lock.acquire()
+    try:
+        with pytest.raises(tts_module.HTTPException) as error:
+            service.synthesize('テスト')
+        assert error.value.status_code == 429
+    finally:
+        service.lock.release()
+
+
+def test_speech_worker_failure_keeps_text_api_available(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        service = tts_module.speech
+        service.state = {'state': 'ready'}
+        service.process = MagicMock()
+        service.process.poll.return_value = None
+        service.responses.put(json.dumps({'error': 'synthetic failure'}))
+        assert client.post('/api/speech', json={'text': 'テスト'}).status_code == 502
+        assert client.get('/api/status').status_code == 200
+        service.responses.put(None)
+        assert client.post('/api/speech', json={'text': 'テスト'}).status_code == 503
+        assert service.state['state'] == 'failed'
 
 
 async def no_op_memory_extraction(*args, **kwargs):

@@ -14,16 +14,21 @@ from memory import router as memory_router
 from planning import router as planning_router
 from tasks import router as tasks_router
 import settings
+from tts import SpeechService, router as tts_router
+import tts
 from voice import is_model_loaded, router as voice_router
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
+    tts.speech = SpeechService()
+    tts.speech.start()
     sync_task = asyncio.create_task(sync_worker())
     try:
         yield
     finally:
+        tts.speech.close()
         sync_task.cancel()
         try:
             await sync_task
@@ -45,6 +50,7 @@ app.include_router(memory_router)
 app.include_router(planning_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
+app.include_router(tts_router)
 
 
 @app.get('/api/status')

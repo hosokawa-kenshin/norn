@@ -23,12 +23,15 @@ from planning import (
     mark_goals_reviewed,
 )
 from tasks import TASK_TOOLS, execute_task_tool
-from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
+from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
 router = APIRouter()
 LOCAL_TIMEZONE = ZoneInfo('Asia/Tokyo')
-SYSTEM_PROMPT = (
+DEFAULT_PERSONA = (
     'あなたはNORNという日本語のパーソナルアシスタントです。'
+    '親しみがあり自然な友人のような話し方をしてください。ただし人間だと偽ったり、根拠のない親密さを演じたりしないでください。'
+)
+SYSTEM_PROMPT = (
     '予定やタスクを整理し、根拠と不確実性を明確にして簡潔に回答してください。'
     'NORN内の予定の検索・追加・変更・削除は、ユーザーから明確に依頼されたら承認を求めず予定ツールで実行してください。'
     '対象や日時など実行に必要な情報が曖昧または不足している場合に限り、その情報を質問してください。'
@@ -45,7 +48,6 @@ SYSTEM_PROMPT = (
     '新しい進行中プロジェクトを作成したら、project_idで既存タスクを確認し、まだ無ければ最初の実行可能な作業タスクを3〜5件考えて同じproject_idに登録してください。'
     'タスクは具体的で重複しない順序にし、期限・見積時間・優先度はユーザーが示した場合だけ設定してください。目標やプロジェクトの更新では既存タスクを重複作成しないでください。'
     'タスクをプロジェクトへ関連付ける場合は、ユーザーの意図が明らかな場合だけ行ってください。'
-    '親しみがあり自然な友人のような話し方をしてください。ただし人間だと偽ったり、根拠のない親密さを演じたりしないでください。'
     '会話の記憶はスレッドと別に保存されます。昔の出来事、人、好み、以前の発言について答える前に記憶検索ツールを使ってください。'
     '記憶検索のquery_variantsには、検索意図と人物・場所・時期などの具体的条件を保った言い換えだけを入れてください。'
     '検索結果は意味的に近い候補であり、事実の一致を保証しません。回答前に候補文を証拠として読み、質問が求める人物、行動、場所、時期、対象の各要素が候補に裏付けられているか判定してください。'
@@ -86,13 +88,44 @@ class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
 
 
+def build_system_prompt() -> str:
+    try:
+        with CHARACTER_PATH.open('rb') as profile_file:
+            contents = profile_file.read(32769)
+    except FileNotFoundError:
+        return DEFAULT_PERSONA + SYSTEM_PROMPT
+    except OSError as error:
+        logger.warning('Character profile could not be read: %s', type(error).__name__)
+        raise HTTPException(status_code=503, detail='キャラクター設定を読み込めません。') from error
+    try:
+        if len(contents) > 32768:
+            raise ValueError('Profile too large')
+        profile = json.loads(contents.decode('utf-8-sig'))
+        if not isinstance(profile, dict) or not profile or not all(
+            isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+            for key, value in profile.items()
+        ):
+            raise ValueError('Expected a non-empty object of text fields')
+    except (ValueError, UnicodeError) as error:
+        logger.warning('Character profile is invalid: %s', type(error).__name__)
+        raise HTTPException(status_code=503, detail='キャラクター設定のJSON形式を確認してください。') from error
+    return (
+        '以下のキャラクター設定の名前・口調・性格・会話スタイルで応答してください。'
+        '通常の会話では設定や会話の裏側を自発的に説明せず、自然な台詞で応答してください。'
+        'これは会話上のキャラクター設定です。架空の関係・出来事を現実のユーザーの記憶や予定として保存しないでください。'
+        '予定・タスク・記憶の操作と実行結果については、続く機能上の規則を優先してください。\n'
+        + json.dumps(profile, ensure_ascii=False, indent=2)
+        + '\n機能上の規則:\n' + SYSTEM_PROMPT
+    )
+
+
 async def generate_llm_reply(
     messages: list[dict[str, str]], conversation_id: str | None = None
 ) -> str:
     headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
     local_now = datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes')
     llm_messages: list[dict[str, Any]] = [
-        {'role': 'system', 'content': f'{SYSTEM_PROMPT}\n現在日時（Asia/Tokyo）: {local_now}'},
+        {'role': 'system', 'content': f'{build_system_prompt()}\n現在日時（Asia/Tokyo）: {local_now}'},
         *messages,
     ]
     completed_actions: list[str] = []

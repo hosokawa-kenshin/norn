@@ -9,6 +9,9 @@ load_dotenv(PROJECT_ROOT / '.env')
 
 DATA_DIR = Path(os.getenv('NORN_DATA_DIR', PROJECT_ROOT / 'data'))
 DB_PATH = Path(os.getenv('NORN_DB_PATH', DATA_DIR / 'norn.sqlite3'))
+CHARACTER_PATH = Path(os.getenv('NORN_CHARACTER_PATH', 'characters/active.json'))
+if not CHARACTER_PATH.is_absolute():
+	CHARACTER_PATH = PROJECT_ROOT / CHARACTER_PATH
 NORN_API_URL = os.getenv('NORN_API_URL', 'http://127.0.0.1:8000').rstrip('/')
 NORN_FRONTEND_URL = os.getenv('NORN_FRONTEND_URL', 'http://127.0.0.1:5173').rstrip('/')
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')

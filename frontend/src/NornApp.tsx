@@ -18,9 +18,12 @@ import {
   Sparkles,
   Target,
   Trash2,
+  Play,
+  Square,
 } from 'lucide-react'
 import GoalsView from './GoalsView'
 import TasksView from './TasksView'
+import useSpeech from './useSpeech'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
 type Conversation = { id: string; title: string; updated_at: string }
@@ -157,6 +160,7 @@ async function responseError(response: Response) {
 }
 
 export default function NornApp() {
+  const speech = useSpeech()
   const [status, setStatus] = useState<ApiStatus | null>(null)
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<string | null>(() => localStorage.getItem('norn.activeConversation'))
@@ -319,6 +323,7 @@ export default function NornApp() {
   }) {
     if (!status?.llm.configured) throw new Error('LLMが未設定です。設定後に会話からタスクを依頼してください。')
     if (isSending) throw new Error('別の会話処理が進行中です。')
+    speech.stop()
     setError('')
     setIsSending(true)
     const content = [
@@ -344,6 +349,7 @@ export default function NornApp() {
       localStorage.setItem('norn.activeConversation', result.conversation_id)
       setActiveId(result.conversation_id)
       setMessages((current) => [...current, result.user_message, result.assistant_message])
+      void speech.speak(result.assistant_message.content)
       await refreshConversations()
       return result.assistant_message.content
     } finally {
@@ -370,6 +376,7 @@ export default function NornApp() {
   }
 
   async function startRecording() {
+    speech.stop()
     setError('')
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       setError('このブラウザーでは録音できません。最新のChromeまたはEdgeをお試しください。')
@@ -416,6 +423,7 @@ export default function NornApp() {
     event.preventDefault()
     const content = draft.trim()
     if (!content || isSending || voiceState !== 'idle') return
+    speech.stop()
     setError('')
     setIsSending(true)
     try {
@@ -434,6 +442,7 @@ export default function NornApp() {
       setActiveId(result.conversation_id)
       setMessages((current) => [...current, result.user_message, result.assistant_message])
       setDraft('')
+      void speech.speak(result.assistant_message.content)
       await refreshConversations()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '応答を取得できませんでした。')
@@ -443,6 +452,7 @@ export default function NornApp() {
   }
 
   function startNewConversation() {
+    speech.stop()
     localStorage.removeItem('norn.activeConversation')
     setActiveId(null)
     setMessages([])
@@ -649,7 +659,7 @@ export default function NornApp() {
               className={`conversation-link ${activeId === conversation.id ? 'is-active' : ''}`}
               key={conversation.id}
               type="button"
-              onClick={() => setActiveId(conversation.id)}
+              onClick={() => { speech.stop(); setActiveId(conversation.id) }}
               title={conversation.title}
             >
               <span className="conversation-title">{conversation.title}</span>
@@ -781,6 +791,13 @@ export default function NornApp() {
         )}
 
         <section className="composer-wrap" aria-label="音声入力">
+          <div className="speech-controls" aria-label="応答音声">
+            <label><input type="checkbox" checked={speech.enabled} onChange={speech.toggle} />応答を読み上げる</label>
+            <span role="status">{speech.state === 'loading' ? '音声モデル準備中' : speech.state === 'generating' ? '音声生成中' : speech.state === 'playing' ? '再生中' : ''}</span>
+            <button className="icon-button" type="button" title="音声を再生" aria-label="音声を再生" disabled={!speech.hasAudio || speech.state === 'playing'} onClick={() => void speech.play()}><Play size={16} /></button>
+            <button className="icon-button" type="button" title="音声を停止" aria-label="音声を停止" disabled={!['loading', 'generating', 'playing'].includes(speech.state)} onClick={speech.stop}><Square size={16} /></button>
+          </div>
+          {speech.error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{speech.error}</span></div>}
           {error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{error}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setError('')}>×</button></div>}
           {status && !status.llm.configured && <div className="setup-notice"><span>LLM接続が未設定です。設定から接続先を確認してください。</span><button type="button" onClick={() => setShowSettings(true)}>設定を見る</button></div>}
           <form className="composer" onSubmit={sendMessage}>

@@ -5,6 +5,7 @@ __pycache__/
 data/
 models/
 references/
+characters/
 logs/
 backend/.venv/
 frontend/node_modules/

@@ -68,6 +68,11 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .settings-link span { flex: 1; font-size: 11px; }
 .settings-link:hover { color: white; background: #2d3831; }
 .main-panel { display: flex; flex-direction: column; min-width: 0; min-height: 100vh; }
+.speech-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+.speech-controls label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.speech-controls input { accent-color: var(--moss); }
+.speech-controls > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.speech-controls .icon-button { flex: 0 0 34px; width: 34px; height: 34px; }
 .topbar { display: flex; align-items: center; justify-content: space-between; min-height: 94px; padding: 18px clamp(22px, 5vw, 72px); border-bottom: 1px solid var(--line); background: rgba(248, 248, 242, .82); }
 .eyebrow { color: var(--moss); font: 700 9px var(--mono); }
 .topbar h1 { margin: 5px 0 0; color: var(--ink); font-size: 20px; font-weight: 700; }
