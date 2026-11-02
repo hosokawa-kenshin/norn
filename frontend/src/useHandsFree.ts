@@ -210,5 +210,7 @@ export default function useHandsFree(options: Options) {
 
 	const cleanup = useEffectEvent(() => { void disable() })
 	useEffect(() => () => { cleanup() }, [])
+	useEffect(() => window.nornDesktop?.onCommand(() => cleanup()), [])
+	useEffect(() => { window.nornDesktop?.reportVoiceState(phase) }, [phase])
 	return { phase, error, phrase, enable, disable, endSession }
 }

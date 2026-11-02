@@ -22,5 +22,5 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/main.tsx", "src/NornApp.tsx"]
+  "include": ["src/main.tsx", "src/NornApp.tsx", "src/desktop.d.ts"]
 }
