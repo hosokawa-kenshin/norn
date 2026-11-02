@@ -25,6 +25,7 @@ import GoalsView from './GoalsView'
 import TasksView from './TasksView'
 import useSpeech from './useSpeech'
 import useHandsFree from './useHandsFree'
+import WakeCalibrationDialog from './WakeCalibrationDialog'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
 type Conversation = { id: string; title: string; updated_at: string }
@@ -171,6 +172,7 @@ export default function NornApp() {
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState('')
+  const [calibrationRequired, setCalibrationRequired] = useState(false)
   const [showSettings, setShowSettings] = useState(
     () => new URLSearchParams(window.location.search).get('googleCalendar') === 'connected',
   )
@@ -212,6 +214,12 @@ export default function NornApp() {
     fetch('/api/conversations')
       .then((response) => (response.ok ? response.json() : []))
       .then((value: Conversation[]) => { if (active) setConversations(value) })
+      .catch(() => undefined)
+    fetch('/api/wake/status')
+      .then((response) => response.ok ? response.json() : null)
+      .then((value: { calibration_required?: boolean } | null) => {
+        if (active) setCalibrationRequired(value?.calibration_required === true)
+      })
       .catch(() => undefined)
     return () => { active = false }
   }, [])
@@ -856,6 +864,11 @@ export default function NornApp() {
           <div className="composer-footnote">{handsFree.phase === 'off' ? '送信前に文字起こし内容を確認できます' : '連続会話 / ローカル音声認識'}</div>
         </section>
       </main>
+
+      {calibrationRequired && !showSettings && voiceState === 'idle' && handsFree.phase === 'off' && !isSending && <WakeCalibrationDialog
+        onComplete={() => setCalibrationRequired(false)}
+        onDismiss={() => setCalibrationRequired(false)}
+      />}
 
       {showSettings && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
         if (event.target === event.currentTarget) setShowSettings(false)

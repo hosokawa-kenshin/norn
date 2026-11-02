@@ -29,6 +29,7 @@ from starlette.websockets import WebSocketDisconnect
 @pytest.fixture(autouse=True)
 def disable_real_speech_worker(monkeypatch, tmp_path):
     monkeypatch.setenv('NORN_TTS_ENABLED', '0')
+    monkeypatch.setattr(wake_module, 'PROFILE_PATH', tmp_path / 'wake-profile.npz')
     monkeypatch.setattr(chat_module, 'CHARACTER_PATH', tmp_path / 'character.json')
     original = chat_module.prepare_automatic_tasks
     monkeypatch.setattr(chat_module, 'prepare_automatic_tasks', no_op_automatic_tasks)
@@ -281,6 +282,93 @@ def test_wake_status_uses_japanese_norn(monkeypatch, tmp_path):
     assert status['processing'] == 'local'
 
 
+def calibration_audio():
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(bytes(32000))
+    return buffer.getvalue()
+
+
+def test_initial_calibration_persists_and_skips_future_startups(monkeypatch, tmp_path):
+    import numpy as np
+
+    calls = []
+
+    def fake_enroll(recording, destination):
+        assert recording.is_file()
+        calls.append(recording)
+        np.savez(destination, threshold=np.array(0.04),
+                 **{f'template_{index}': np.eye(13, 20) for index in range(3)})
+        return {'examples': 3}
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(wake_module, 'enroll', fake_enroll)
+    with TestClient(norn_app.app) as client:
+        assert client.get('/api/wake/status').json()['calibration_required'] is True
+        response = client.post('/api/wake/calibration', data={'consent': 'true'},
+                               files={'audio': ('sample.wav', calibration_audio(), 'audio/wav')})
+        assert response.status_code == 200 and response.json()['calibrated'] is True
+        assert client.get('/api/wake/status').json()['calibration_required'] is False
+    with TestClient(norn_app.app) as client:
+        assert client.get('/api/wake/status').json()['calibration_required'] is False
+        assert client.post('/api/wake/calibration', data={'consent': 'true'},
+                           files={'audio': ('sample.wav', calibration_audio(), 'audio/wav')}).status_code == 409
+    assert len(calls) == 1
+    assert not calls[0].exists()
+
+
+def test_initial_calibration_failure_remains_required(monkeypatch, tmp_path):
+    def failed_enroll(*args, **kwargs):
+        raise ValueError('Not enough examples')
+
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setattr(wake_module, 'enroll', failed_enroll)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/wake/calibration', data={'consent': 'true'},
+                               files={'audio': ('sample.wav', calibration_audio(), 'audio/wav')})
+        assert response.status_code == 422
+        assert client.get('/api/wake/status').json()['calibration_required'] is True
+    assert not list((tmp_path / 'wake-calibration').glob('*.wav'))
+
+
+@pytest.mark.parametrize(('consent', 'mime', 'origin', 'expected'), [
+    ('false', 'audio/wav', None, 400),
+    ('true', 'text/plain', None, 415),
+    ('true', 'audio/wav', 'https://example.invalid', 403),
+])
+def test_initial_calibration_requires_consent_and_local_audio(monkeypatch, tmp_path, consent, mime, origin, expected):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/wake/calibration', data={'consent': consent},
+                               headers={'origin': origin} if origin else {},
+                               files={'audio': ('sample.wav', calibration_audio(), mime)})
+    assert response.status_code == expected
+    assert not wake_module.PROFILE_PATH.exists()
+
+
+def test_invalid_profile_does_not_skip_initial_calibration(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    wake_module.PROFILE_PATH.write_bytes(b'broken profile')
+    with TestClient(norn_app.app) as client:
+        assert client.get('/api/wake/status').json()['calibration_required'] is True
+
+
+@pytest.mark.parametrize(('contents', 'expected'), [(b'not encoded audio', 422), (bytes(6 * 1024 * 1024 + 1), 413)])
+def test_initial_calibration_rejects_bad_recording(monkeypatch, tmp_path, contents, expected):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/wake/calibration', data={'consent': 'true'},
+                               files={'audio': ('sample.webm', contents, 'audio/webm')})
+        assert response.status_code == expected
+        assert client.get('/api/wake/status').json()['calibration_required'] is True
+
+
 def test_wake_waiting_audio_does_not_transcribe_or_chat(monkeypatch, tmp_path):
     calls = []
 
@@ -353,6 +441,42 @@ def test_wake_requires_confident_norn_token(monkeypatch, words, expected):
     )
     monkeypatch.setattr(detector, 'reset', lambda: None)
     assert detector.predict(struct.pack('<f', 0.1)) is expected
+
+
+@pytest.mark.parametrize('matched', [True, False])
+def test_personal_wake_result_combines_with_standard_detector(monkeypatch, matched):
+    detector = object.__new__(wake_module.KeywordDetector)
+    detector.personal = SimpleNamespace(predict=lambda frame: matched)
+    detector.recognizer = SimpleNamespace(AcceptWaveform=lambda frame: True,
+                                         Result=lambda: json.dumps({'result': []}))
+    resets = []
+    monkeypatch.setattr(detector, 'reset', lambda: resets.append(True))
+    assert detector.predict(struct.pack('<f', 0.1)) is matched
+    assert len(resets) == int(matched)
+
+
+@pytest.mark.parametrize(('threshold', 'rows', 'count'), [(0.5, 13, 3), (0.05, 12, 3), (0.05, 13, 2)])
+def test_personal_wake_rejects_invalid_profile(tmp_path, threshold, rows, count):
+    import numpy as np
+    from personal_wake import PersonalWakeDetector
+
+    path = tmp_path / 'profile.npz'
+    np.savez(path, threshold=np.array(threshold),
+             **{f'template_{index}': np.zeros((rows, 20)) for index in range(count)})
+    with pytest.raises(ValueError):
+        PersonalWakeDetector(path)
+
+
+def test_personal_wake_enrollment_rejects_insufficient_examples(tmp_path):
+    import numpy as np
+    import soundfile as sf
+    from personal_wake import enroll
+
+    recording = tmp_path / 'empty.wav'
+    sf.write(recording, np.zeros(16000), 16000)
+    with pytest.raises(ValueError):
+        enroll(recording, tmp_path / 'profile.npz')
+    assert not (tmp_path / 'profile.npz').exists()
 
 
 @pytest.mark.parametrize('contents', ['{', '[]', '{}', '{"name":22}', 'あ' * 32769])
