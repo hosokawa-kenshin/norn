@@ -74,6 +74,7 @@ FRONTEND_PORT="$(select_port NORN_FRONTEND_PORT 5173)"
 API_URL="http://127.0.0.1:$API_PORT"
 
 export PATH="$(dirname -- "$NODE_EXECUTABLE"):$PATH"
+"$NODE_EXECUTABLE" "$ROOT_DIR/frontend/scripts/prepare-voice-assets.mjs"
 
 NORN_API_URL="$API_URL" NORN_FRONTEND_URL="http://127.0.0.1:$FRONTEND_PORT" \
   NORN_GOOGLE_REDIRECT_URI="$API_URL/" \

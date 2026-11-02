@@ -17,6 +17,7 @@ import settings
 from tts import SpeechService, router as tts_router
 import tts
 from voice import is_model_loaded, router as voice_router
+from wake import router as wake_router
 
 
 @asynccontextmanager
@@ -51,6 +52,7 @@ app.include_router(planning_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
 app.include_router(tts_router)
+app.include_router(wake_router)
 
 
 @app.get('/api/status')

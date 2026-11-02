@@ -10,4 +10,5 @@ logs/
 backend/.venv/
 frontend/node_modules/
 frontend/dist/
+frontend/public/voice/
 *.log

@@ -24,6 +24,7 @@ import {
 import GoalsView from './GoalsView'
 import TasksView from './TasksView'
 import useSpeech from './useSpeech'
+import useHandsFree from './useHandsFree'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
 type Conversation = { id: string; title: string; updated_at: string }
@@ -192,6 +193,12 @@ export default function NornApp() {
   const chunksRef = useRef<Blob[]>([])
   const recordingStartedAt = useRef(0)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const handsFree = useHandsFree({
+    processing: isSending || ['loading', 'generating'].includes(speech.state),
+    playing: speech.state === 'playing',
+    onText: (text, signal) => sendChatContent(text, signal),
+    onInterrupt: speech.stop,
+  })
 
   useEffect(() => {
     let active = true
@@ -376,6 +383,7 @@ export default function NornApp() {
   }
 
   async function startRecording() {
+    await handsFree.disable()
     speech.stop()
     setError('')
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
@@ -423,6 +431,11 @@ export default function NornApp() {
     event.preventDefault()
     const content = draft.trim()
     if (!content || isSending || voiceState !== 'idle') return
+    await sendChatContent(content)
+  }
+
+  async function sendChatContent(content: string, signal?: AbortSignal) {
+    if (!content.trim() || isSending || signal?.aborted) return
     speech.stop()
     setError('')
     setIsSending(true)
@@ -431,6 +444,7 @@ export default function NornApp() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ conversation_id: activeId, content }),
+        signal,
       })
       if (!response.ok) throw new Error(await responseError(response))
       const result = (await response.json()) as {
@@ -445,6 +459,7 @@ export default function NornApp() {
       void speech.speak(result.assistant_message.content)
       await refreshConversations()
     } catch (reason) {
+      if (signal?.aborted) return
       setError(reason instanceof Error ? reason.message : '応答を取得できませんでした。')
     } finally {
       setIsSending(false)
@@ -452,6 +467,7 @@ export default function NornApp() {
   }
 
   function startNewConversation() {
+    handsFree.endSession()
     speech.stop()
     localStorage.removeItem('norn.activeConversation')
     setActiveId(null)
@@ -659,7 +675,7 @@ export default function NornApp() {
               className={`conversation-link ${activeId === conversation.id ? 'is-active' : ''}`}
               key={conversation.id}
               type="button"
-              onClick={() => { speech.stop(); setActiveId(conversation.id) }}
+              onClick={() => { handsFree.endSession(); speech.stop(); setActiveId(conversation.id) }}
               title={conversation.title}
             >
               <span className="conversation-title">{conversation.title}</span>
@@ -791,6 +807,13 @@ export default function NornApp() {
         )}
 
         <section className="composer-wrap" aria-label="音声入力">
+          <div className="speech-controls handsfree-controls" aria-label="ハンズフリー音声会話">
+            <label><input type="checkbox" checked={handsFree.phase !== 'off'} disabled={voiceState !== 'idle'} onChange={(event) => { if (event.target.checked) void handsFree.enable(); else void handsFree.disable() }} />ハンズフリー</label>
+            <span role="status" aria-label="音声会話の状態">{{ off: 'マイク停止中', starting: '準備中', standby: `待機中 / ${handsFree.phrase}`, listening: '聞き取り中', processing: '処理中', playing: '再生中' }[handsFree.phase]}</span>
+            <button className="icon-button" type="button" title="会話を終了して待機" aria-label="会話を終了して待機" disabled={!['listening', 'processing', 'playing'].includes(handsFree.phase)} onClick={handsFree.endSession}><Square size={16} /></button>
+            <button className="icon-button" type="button" title="マイクを停止" aria-label="マイクを停止" disabled={handsFree.phase === 'off'} onClick={() => void handsFree.disable()}><MicOff size={16} /></button>
+          </div>
+          {handsFree.error && <div className="error-banner" role="alert"><CircleAlert size={16} /><span>{handsFree.error}</span></div>}
           <div className="speech-controls" aria-label="応答音声">
             <label><input type="checkbox" checked={speech.enabled} onChange={speech.toggle} />応答を読み上げる</label>
             <span role="status">{speech.state === 'loading' ? '音声モデル準備中' : speech.state === 'generating' ? '音声生成中' : speech.state === 'playing' ? '再生中' : ''}</span>
@@ -830,7 +853,7 @@ export default function NornApp() {
               </button>
             </div>
           </form>
-          <div className="composer-footnote">送信前に文字起こし内容を確認できます</div>
+          <div className="composer-footnote">{handsFree.phase === 'off' ? '送信前に文字起こし内容を確認できます' : '連続会話 / ローカル音声認識'}</div>
         </section>
       </main>
 

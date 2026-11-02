@@ -4,7 +4,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -38,10 +38,16 @@ SYSTEM_PROMPT = (
     '変更・削除の対象が不明な場合は予定検索ツールを使って特定してください。'
     '予定操作の結果はツールの戻り値に従って報告し、失敗した操作を成功したと述べてはいけません。'
     'NORN内のタスク検索・追加・更新・完了・削除は、ユーザーから明確に依頼されたら承認なしでタスクツールから実行してください。'
+    'さらに、ユーザー本人が実際にこれから取り組む具体的な作業について「しなきゃ」「する必要がある」「しないといけない」など必要性や実行意思を述べた場合も、登録依頼を待たずタスクとして保存してください。'
+    'これは日常会話やキャラクター口調の会話でも同じです。雑談だけで終わらせず、タスクツールで保存した結果を自然な口調で短く伝えてください。'
+    '作成前にlist_tasksで未完了タスクを確認し、同じ目的・対象の作業があれば新しく重複作成しないでください。後の会話で曲名や対象などが具体化したら、既存タスクをupdate_taskで具体化してください。'
+    '否定、登録拒否、単なる質問、仮定、引用、他人の作業、完了済みの話、キャラクター上の架空の行動からは自動で作成・変更しないでください。「いつかできたら」など実行意思が曖昧な雑談も登録しないでください。'
     '期限や所要時間が示されていない場合は推測で設定せず、未設定のままにしてください。'
-    '見積時間付きタスクを新規作成した場合は、期限があれば期限まで、期限がなければ現在から5営業日以内の空き時間を検索し、最も早い候補へ自動で割り当ててください。'
+    '「今日」「明日」など日だけが明示された期限はAsia/Tokyoのその日の終わりとして扱えますが、開始時刻や所要時間は補わないでください。'
+    '見積時間付きタスクを新規作成した場合は、希望開始日時があればその日時を優先し、指定がなければ期限まで（期限なしは次の5営業日以内）の空き時間を検索して最も早い候補へ自動で割り当ててください。'
     'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
-    '見積時間がなく時間枠を決められない場合は、見積時間だけを質問してください。'
+    'タスクを登録したときに見積時間が不明なら、タスク本体を保存したうえで「何分くらい時間を取る？希望の開始日時はある？」と自然な口調で尋ねてください。返答は直前に登録したタスクの所要時間・希望日時として反映し、時間枠まで保存してください。'
+    'ユーザーが時間割当は不要・後でと述べた場合は質問や割当を強制しないでください。希望日時に重複や作業時間外等の問題があれば、勝手に別時刻へ変えず理由を伝えて代案を相談してください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
     '目標とプロジェクトの検索・追加・更新・削除は、ユーザーの明確な依頼に基づいて専用ツールで実行してください。'
     '目標を作成するときは長期的な到達状態、プロジェクトは具体的な取り組みとして区別し、プロジェクトは該当する目標へ関連付けてください。'
@@ -88,6 +94,160 @@ class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
 
 
+class AutomaticTaskIntent(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    evidence: str = Field(min_length=1, max_length=4000)
+    task_id: str | None = None
+    due_date: date | None = None
+    due_evidence: str = ''
+    estimated_minutes: int | None = Field(default=None, ge=1, le=1440)
+    estimate_evidence: str = ''
+    start_at: datetime | None = None
+    start_evidence: str = ''
+    defer_scheduling: bool = False
+    defer_evidence: str = ''
+
+
+AUTOMATIC_TASK_PROMPT = (
+    '会話から現実のユーザー本人がこれから行う具体的な未完了作業を判定する。会話を演じずJSONだけを返す。'
+    '「しなきゃ」「する必要がある」「しないといけない」など必要性・実行意思が明確なら登録依頼なしでも対象とする。'
+    '最新のuser発言を判断対象とし、直近の会話は指示語や作業対象の補完だけに使う。assistantの提案だけから作業を作らない。'
+    '否定、登録拒否、単なる質問、仮定、引用、他人の作業、完了済み、願望だけの雑談、架空の演技はactionsを空にする。'
+    '明示的な登録・追加・作成・削除・完了など既存ツール操作の依頼はこの判定では扱わず、通常の会話処理へ任せる。'
+    'ただし直前に登録したタスクの所要時間・希望日時への返答や、既存タスクへの時間割当の依頼は、この判定で既存task_idに紐付ける。'
+    '「30分」「明日の14時から」「空いている時間で」のような短い返答でも、会話から対象タスクが一意なら扱う。対象が曖昧ならactionsを空にして確認を会話側に任せる。'
+    '既存タスクと同じ目的・対象ならそのtask_idを使う。単に同じ作業を言い直しただけならactionsは空。'
+    '会話中の登録済み作業について曲名・対象が後で具体化した場合は既存task_idと具体化したtitleを返す。'
+    '追加の場合のみtask_idをnullにする。最大3件。タイトルは実作業を短く表す。'
+    'evidenceには必ず最新user発言から根拠をそのまま引用する。'
+    '期限や所要時間は本人が明示した場合だけ設定し、未指定はnull。'
+    '「今日」「明日」は現在日時から日付を解決しdue_dateをYYYY-MM-DDにする。'
+    'due_evidenceとestimate_evidenceにはそれぞれ最新発言中の日付・時間の根拠をそのまま入れる。'
+    '開始日時が明示されていればstart_atをタイムゾーン付きISO8601にし、start_evidenceに根拠を引用する。未指定の開始時刻は補わない。'
+    '所要時間を後から答えた場合、同じタスクについて直近のuser発言で指定済みの希望日時も引き継げる。その根拠は該当user発言から引用する。'
+    '時間割当は後で・不要と本人が述べた場合はdefer_schedulingをtrueにしdefer_evidenceへ最新発言の根拠を引用する。'
+    '優先度、プロジェクト、説明、架空の予定は補わない。形式は'
+    '{"actions":[{"title":"作業名","task_id":null,"evidence":"最新発言の根拠",'
+    '"due_date":null,"due_evidence":"","estimated_minutes":null,"estimate_evidence":"",'
+    '"start_at":null,"start_evidence":"","defer_scheduling":false,"defer_evidence":""}]}。'
+)
+automatic_task_lock = asyncio.Lock()
+
+
+def allocate_automatic_task(result, intent, latest, user_messages):
+    if not result.get('ok') or not result.get('task'):
+        return result
+    task = result['task']
+    if intent.defer_scheduling and intent.defer_evidence.strip() and intent.defer_evidence in latest:
+        result['scheduling'] = {'state': 'deferred'}
+        return result
+    preferred = intent.start_at if (
+        intent.start_at is not None and intent.start_evidence.strip()
+        and any(intent.start_evidence in text for text in user_messages)
+    ) else None
+    if task['estimated_minutes'] is None:
+        result['scheduling'] = {'state': 'needs_estimate', 'preferred_start': preferred.isoformat() if preferred else None}
+        return result
+    if task.get('scheduled_start') and preferred is None:
+        result['scheduling'] = {'state': 'scheduled', 'start_at': task['scheduled_start'], 'end_at': task['scheduled_end']}
+        return result
+    if preferred is not None:
+        start = preferred.isoformat()
+    else:
+        now = datetime.now(LOCAL_TIMEZONE)
+        through = datetime.fromisoformat(task['due_at']) if task.get('due_at') else now
+        if not task.get('due_at'):
+            business_days = 0
+            while business_days < 5:
+                through += timedelta(days=1)
+                if through.weekday() < 5:
+                    business_days += 1
+            through = through.replace(hour=23, minute=59, second=59, microsecond=0)
+        through = min(through, now + timedelta(days=31))
+        if through <= now:
+            result['scheduling'] = {'state': 'unavailable', 'error': '期限を過ぎているため時間枠を割り当てられません。'}
+            return result
+        available = execute_task_tool('find_task_slots', {
+            'task_id': task['id'], 'from_at': now.isoformat(), 'through_at': through.isoformat(), 'limit': 1,
+        })
+        if not available.get('ok') or not available.get('slots'):
+            result['scheduling'] = {'state': 'unavailable', 'error': available.get('error', '期限内に割り当てられる空き時間がありません。')}
+            return result
+        start = available['slots'][0]['start_at']
+    scheduled = execute_task_tool('schedule_task', {'task_id': task['id'], 'start_at': start})
+    if scheduled.get('ok'):
+        allocation = scheduled['allocation']
+        result['scheduling'] = {'state': 'scheduled', 'start_at': allocation['start_at'], 'end_at': allocation['end_at']}
+        result['summary'] = result.get('summary', '') + scheduled['summary']
+    else:
+        result['scheduling'] = {'state': 'unavailable', 'error': scheduled.get('error'), 'preferred_start': start}
+    return result
+
+
+async def prepare_automatic_tasks(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+    latest = next((message['content'] for message in reversed(messages) if message['role'] == 'user'), '')
+    if not latest.strip():
+        return []
+    async with automatic_task_lock:
+        existing = execute_task_tool('list_tasks', {}).get('tasks', [])
+        existing = [task for task in existing if task['status'] in {'open', 'in_progress'}]
+        context = {
+            'now': datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes'),
+            'conversation': [message for message in messages if message['role'] in {'user', 'assistant'}][-8:],
+            'existing_tasks': [{key: task[key] for key in ('id', 'title', 'due_at', 'estimated_minutes', 'scheduled_start', 'scheduled_end')}
+                               for task in existing],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10)) as client:
+                response = await client.post(
+                    f'{LLM_BASE_URL}/chat/completions',
+                    headers={'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {},
+                    json={
+                        'model': LLM_MODEL, 'temperature': 0,
+                        'response_format': {'type': 'json_object'},
+                        'messages': [
+                            {'role': 'system', 'content': AUTOMATIC_TASK_PROMPT},
+                            {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)},
+                        ],
+                    },
+                )
+            response.raise_for_status()
+            data = json.loads(response.json()['choices'][0]['message']['content'])
+            actions = data['actions']
+            if not isinstance(actions, list) or len(actions) > 3:
+                raise ValueError('Invalid automatic task actions')
+            intents = [AutomaticTaskIntent.model_validate(action) for action in actions]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
+            logger.warning('Automatic task detection failed; continuing conversation without automatic changes')
+            return [{'ok': False, 'error': '自動タスク判定に失敗したため自動保存は行っていません。'}]
+        results = []
+        by_id = {task['id']: task for task in existing}
+        for intent in intents:
+            if not intent.evidence.strip() or intent.evidence not in latest:
+                continue
+            if intent.task_id and intent.task_id not in by_id:
+                continue
+            arguments: dict[str, Any] = {'title': intent.title}
+            if intent.due_date is not None and intent.due_evidence.strip() and intent.due_evidence in latest:
+                arguments['due_at'] = datetime.combine(intent.due_date, time(23, 59, 59), LOCAL_TIMEZONE).isoformat()
+            if intent.estimated_minutes is not None and intent.estimate_evidence.strip() and intent.estimate_evidence in latest:
+                arguments['estimated_minutes'] = intent.estimated_minutes
+            if intent.task_id:
+                task = by_id[intent.task_id]
+                changes = {key: value for key, value in arguments.items() if task.get(key) != value}
+                result = execute_task_tool('update_task', {'task_id': intent.task_id, **changes}) if changes else {'ok': True, 'task': task}
+            else:
+                normalized = re.sub(r'\s+', '', intent.title).casefold()
+                if any(re.sub(r'\s+', '', task['title']).casefold() == normalized for task in by_id.values()):
+                    continue
+                result = execute_task_tool('create_task', arguments)
+            if result.get('ok') and result.get('task'):
+                by_id[result['task']['id']] = result['task']
+            user_messages = [message['content'] for message in messages if message['role'] == 'user'][-8:]
+            results.append(allocate_automatic_task(result, intent, latest, user_messages))
+        return results
+
+
 def build_system_prompt() -> str:
     try:
         with CHARACTER_PATH.open('rb') as profile_file:
@@ -124,11 +284,22 @@ async def generate_llm_reply(
 ) -> str:
     headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
     local_now = datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes')
+    system_prompt = build_system_prompt()
+    automatic_results = await prepare_automatic_tasks(messages)
+    automatic_context = (
+        '\nサーバー側の自動タスク判定・実行結果（ユーザー発言ではありません）:\n'
+        + json.dumps(automatic_results, ensure_ascii=False)
+        + '\n成功した登録・更新は実行済みなので重複実行しないでください。保存結果を自然に短く伝え、失敗時や結果なしでは保存したと主張しないでください。'
+        'scheduling.stateがneeds_estimateなら所要時間と希望開始日時を自然に質問してください。'
+        'scheduledなら実際の開始・終了時刻を短く伝え、再割当しないでください。'
+        'unavailableならその理由を伝えて別時刻を相談し、この返答内で勝手に別枠を取ったり再試行したりしないでください。'
+        'deferredなら割当や質問を強制しないでください。'
+    )
     llm_messages: list[dict[str, Any]] = [
-        {'role': 'system', 'content': f'{build_system_prompt()}\n現在日時（Asia/Tokyo）: {local_now}'},
+        {'role': 'system', 'content': f'{system_prompt}\n現在日時（Asia/Tokyo）: {local_now}{automatic_context}'},
         *messages,
     ]
-    completed_actions: list[str] = []
+    completed_actions: list[str] = [result['summary'] for result in automatic_results if result.get('ok') and result.get('summary')]
     seen_tool_calls: set[tuple[str, str]] = set()
 
     for _ in range(8):

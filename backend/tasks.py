@@ -123,7 +123,7 @@ TASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'create_task',
-            'description': 'ユーザーが依頼した作業タスクをNORNに追加する。期限、見積時間、優先度は分かる場合に指定する。',
+            'description': 'ユーザーの明確な依頼、または本人の「しなきゃ」「する必要がある」など具体的な未完了作業の実行意思からタスクを追加する。作成前にlist_tasksで重複を確認する。期限、見積時間、優先度は明示された場合だけ指定し、時間未定でも登録する。',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -143,7 +143,7 @@ TASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'update_task',
-            'description': '特定済みのNORNタスクをユーザー依頼に従って更新する。task_idは検索結果のidを使う。',
+            'description': '特定済みのNORNタスクをユーザー依頼に従って更新する。自動登録済みの作業が後の会話で具体化した場合も、重複作成せず更新する。task_idは検索結果のidを使う。',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -253,6 +253,8 @@ def configured_time(value: str) -> time:
 
 
 def ceil_to_quarter_hour(value: datetime) -> datetime:
+    if value.second or value.microsecond:
+        value += timedelta(minutes=1)
     rounded_minute = ((value.minute + 14) // 15) * 15
     if rounded_minute == 60:
         return (value + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
@@ -368,7 +370,7 @@ def schedule_task_record(task_id: str, start_at: datetime) -> dict[str, Any]:
         end = start + timedelta(minutes=task['estimated_minutes'])
         work_start = configured_time(PLANNING_DAY_START)
         work_end = configured_time(PLANNING_DAY_END)
-        if start.minute % 15 != 0:
+        if start.minute % 15 != 0 or start.second or start.microsecond:
             raise HTTPException(status_code=409, detail='時間枠の開始時刻は15分刻みにしてください。')
         if start < datetime.now(LOCAL_TIMEZONE):
             raise HTTPException(status_code=409, detail='過去の時間にはタスクを割り当てられません。')
