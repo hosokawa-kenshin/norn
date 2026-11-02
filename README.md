@@ -108,11 +108,26 @@ Voskの日本語音響モデルを使う限定語彙検出であり、待機中�
 
 ## 応答音声
 
-`start.sh`で起動すると、兄弟ディレクトリの`style-bert-vits2/.venv/bin/python`を使う専用GPUワーカーが起動します。既定では`model_assets/norn_voice/norn_voice_e100_s*.safetensors`からステップ数が最大のモデルと、同じ場所の`config.json`、`style_vectors.npy`を使用します。BERT関連データも事前に配置してください。NORN本体へPyTorchを追加する必要はありません。
+音声合成は任意機能で、初期状態では無効です。特定のモデル名や兄弟ディレクトリは探索しません。テキスト会話は音声モデルなしでも利用できます。モデルの重み・日本語BERTはリポジトリに同梱していないため、利用・再配布条件を確認して別途入手してください。
 
-BERTはオフラインでGPUへ直接読み込み、起動時にウォームアップして以後は常駐します。旧形式のBERT重みには`data/tts-bert-cache/`へSafetensorsキャッシュを作成します。元重みは変更せず、元ファイルのパス・サイズ・更新日時が変わればキャッシュを作り直します。準備中もチャットは利用でき、返答の音声は準備完了まで待ちます。過去の履歴を開き直しても自動再生しません。「応答を読み上げる」で無効化でき、再生・停止ボタンも利用できます。ブラウザーが自動再生を拒否した場合は再生ボタンを押してください。音声失敗時もテキスト表示は継続します。生成音声はDBやファイルに保存しません。
+1. Style-Bert-VITS2を任意の場所へ配置し、エンジン側の手順に従って専用Python環境・PyTorch等の依存関係・日本語BERTとトークナイザーを準備します。NORN本体の環境へPyTorchを追加する必要はありません。
+2. 互換性のある日本語モデルの`.safetensors`または`.pth`と、そのモデルに対応する`config.json`、`style_vectors.npy`を配置します。ONNXモデルはこのワーカーでは利用できません。
+3. Git管理外の`.env`に以下を設定し、NORNを再起動します。パスはバックエンドを動かすOSから見えるものを指定してください。WSLバックエンドならLinuxパスです。
 
-`.env`の`NORN_TTS_ROOT`でエンジンの配置先、`NORN_TTS_MODEL`でモデルの絶対パスを指定できます。`NORN_TTS_ENABLED=0`ならワーカーを起動しません。状態は`/api/speech/status`、診断ログはGit除外の`data/tts-worker.log`で確認できます。各NORN APIプロセスが専用ワーカーを持つため、通常は一つだけ起動してください。
+```dotenv
+NORN_TTS_ENABLED=1
+NORN_TTS_ROOT=/path/to/Style-Bert-VITS2
+NORN_TTS_MODEL=/path/to/voice/model.safetensors
+NORN_TTS_DEVICE=auto
+```
+
+すべての設定パスは絶対パス、またはNORNリポジトリ直下を基準とする相対パスを使えます。Pythonはエンジン直下の`.venv/bin/python`（Windowsは`.venv/Scripts/python.exe`）を既定とし、別環境は`NORN_TTS_PYTHON`で指定します。モデルと別の場所の設定・スタイルは`NORN_TTS_CONFIG`、`NORN_TTS_STYLE_VECTORS`で指定できます。日本語BERTはエンジンの標準配置を使い、別配置ならトークナイザーを含むディレクトリを`NORN_TTS_BERT_MODEL`で指定します。`NORN_TTS_SPEAKER_ID`と`NORN_TTS_STYLE`はモデル内に存在する話者・スタイルを指定してください（既定は`0`、`Neutral`）。全項目は`.env.example`を参照してください。
+
+`auto`はCUDAを利用可能ならGPU、それ以外はCPUを選びます。`cpu`、`cuda`、`cuda:0`等の固定指定も可能です。明示CUDAが利用できない場合はエラーとなり、テキスト会話は継続します。Windows/macOSのネイティブ音声環境は未実機検証です。現在のWindowsトレイ版のバックエンド起動は引き続きWSL方式です。
+
+BERTはオフラインで読み込み、起動時にウォームアップして以後は常駐します。必要なデータがなければ自動ダウンロードせず失敗状態になります。旧形式のBERT重みには`data/tts-bert-cache/`へSafetensorsキャッシュを作成します。元重みは変更せず、元ファイルのパス・サイズ・更新日時が変わればキャッシュを作り直します。準備中もチャットは利用でき、返答の音声は準備完了まで待ちます。過去の履歴を開き直しても自動再生しません。「応答を読み上げる」で無効化でき、再生・停止ボタンも利用できます。ブラウザーが自動再生を拒否した場合は再生ボタンを押してください。音声失敗時もテキスト表示は継続します。生成音声はDBやファイルに保存しません。
+
+`NORN_TTS_ENABLED=0`または指定なしならワーカーを起動しません。有効でも必須のルート・モデルが未設定なら`unconfigured`、必要ファイルの不足は`unavailable`、起動失敗は`failed`としてチャットを継続します。状態は`/api/speech/status`、起動・推論の診断ログはGit除外の`data/tts-worker.log`で確認できます。各NORN APIプロセスが専用ワーカーを持つため、通常は一つだけ起動してください。
 
 ## データとプライバシー
 

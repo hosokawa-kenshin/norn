@@ -2,8 +2,11 @@ import base64
 import json
 import os
 import queue
+import re
 import subprocess
+import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -20,29 +23,83 @@ class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
 
 
+@dataclass(frozen=True)
+class SpeechConfiguration:
+    root: Path
+    python: Path
+    model: Path
+    config: Path
+    style_vectors: Path
+    device: str
+    bert_model: Path | None
+    speaker_id: int
+    style: str
+
+
+def speech_configuration(environ=None, base=None, platform=None):
+    env = os.environ if environ is None else environ
+    project = settings.PROJECT_ROOT if base is None else Path(base)
+
+    def resolve(value):
+        candidate = Path(value).expanduser()
+        return Path(os.path.abspath(candidate if candidate.is_absolute() else project / candidate))
+
+    missing = [key for key in ('NORN_TTS_ROOT', 'NORN_TTS_MODEL') if not env.get(key, '').strip()]
+    if missing:
+        raise ValueError('音声合成は未設定です。' + '、'.join(missing) + 'を設定してください。')
+    root = resolve(env['NORN_TTS_ROOT'])
+    model = resolve(env['NORN_TTS_MODEL'])
+    windows = (sys.platform if platform is None else platform) == 'win32'
+    default_python = root / '.venv' / ('Scripts/python.exe' if windows else 'bin/python')
+    python = resolve(env['NORN_TTS_PYTHON']) if env.get('NORN_TTS_PYTHON', '').strip() else default_python
+    config = resolve(env['NORN_TTS_CONFIG']) if env.get('NORN_TTS_CONFIG', '').strip() else model.parent / 'config.json'
+    vectors = resolve(env['NORN_TTS_STYLE_VECTORS']) if env.get('NORN_TTS_STYLE_VECTORS', '').strip() else model.parent / 'style_vectors.npy'
+    device = env.get('NORN_TTS_DEVICE', 'auto').strip().lower()
+    if not re.fullmatch(r'auto|cpu|cuda(?::\d+)?', device):
+        raise ValueError('NORN_TTS_DEVICEはauto、cpu、cuda、cuda:番号のいずれかにしてください。')
+    if not root.is_dir():
+        raise ValueError('NORN_TTS_ROOTのディレクトリが見つかりません。')
+    for key, candidate in [('NORN_TTS_PYTHON', python), ('NORN_TTS_MODEL', model),
+                           ('NORN_TTS_CONFIG', config), ('NORN_TTS_STYLE_VECTORS', vectors)]:
+        if not candidate.is_file():
+            raise ValueError(key + 'のファイルが見つかりません。')
+    if model.suffix.lower() not in {'.safetensors', '.pth'}:
+        raise ValueError('NORN_TTS_MODELはPyTorch用のsafetensorsまたはpthを指定してください。')
+    bert = resolve(env['NORN_TTS_BERT_MODEL']) if env.get('NORN_TTS_BERT_MODEL', '').strip() else None
+    if bert is not None and not bert.is_dir():
+        raise ValueError('NORN_TTS_BERT_MODELのディレクトリが見つかりません。')
+    try:
+        speaker_id = int(env.get('NORN_TTS_SPEAKER_ID', '0'))
+    except ValueError as error:
+        raise ValueError('NORN_TTS_SPEAKER_IDは0以上の整数にしてください。') from error
+    if speaker_id < 0:
+        raise ValueError('NORN_TTS_SPEAKER_IDは0以上の整数にしてください。')
+    return SpeechConfiguration(root, python, model, config, vectors, device, bert, speaker_id,
+                               env.get('NORN_TTS_STYLE', 'Neutral').strip() or 'Neutral')
+
+
 class SpeechService:
     def __init__(self):
         self.process = None
         self.responses = queue.Queue()
         self.lock = threading.Lock()
         self.stopped = threading.Event()
-        self.state = {'state': 'disabled', 'device': 'cuda'}
+        self.device = 'auto'
+        self.state = {'state': 'disabled', 'device': self.device}
 
     def start(self):
-        if os.getenv('NORN_TTS_ENABLED', '1') != '1':
+        if os.getenv('NORN_TTS_ENABLED', '0') != '1':
             return
-        root = Path(os.getenv('NORN_TTS_ROOT', settings.PROJECT_ROOT.parent / 'style-bert-vits2'))
-        configured = os.getenv('NORN_TTS_MODEL', '')
-        candidates = list((root / 'model_assets/norn_voice').glob('norn_voice_e100_s*.safetensors'))
-        model = Path(configured) if configured else max(
-            candidates, key=lambda path: int(path.stem.rsplit('_s', 1)[1]), default=None,
-        )
-        python = root / '.venv/bin/python'
-        if model is None or not model.is_file() or not python.is_file():
-            self.state = {'state': 'unavailable', 'device': 'cuda', 'error': '音声モデルまたは専用Pythonが見つかりません。'}
+        try:
+            config = speech_configuration()
+        except ValueError as error:
+            unconfigured = any(not os.getenv(key, '').strip() for key in ('NORN_TTS_ROOT', 'NORN_TTS_MODEL'))
+            self.state = {'state': 'unconfigured' if unconfigured else 'unavailable',
+                          'device': self.device, 'error': str(error)}
             return
-        self.state = {'state': 'loading', 'device': 'cuda', 'model': model.name}
-        threading.Thread(target=self._boot, args=(root, python, model), daemon=True).start()
+        self.device = config.device
+        self.state = {'state': 'loading', 'device': self.device, 'model': config.model.name}
+        threading.Thread(target=self._boot, args=(config,), daemon=True).start()
 
     def _read_responses(self, process):
         try:
@@ -51,7 +108,7 @@ class SpeechService:
         finally:
             self.responses.put(None)
             if not self.stopped.is_set() and self.state['state'] == 'ready':
-                self.state = {'state': 'failed', 'device': 'cuda', 'error': '音声ワーカーが停止しました。'}
+                self.state = {'state': 'failed', 'device': self.device, 'error': '音声ワーカーが停止しました。'}
 
     def _receive(self, timeout):
         line = self.responses.get(timeout=timeout)
@@ -59,16 +116,21 @@ class SpeechService:
             raise RuntimeError('Speech worker exited')
         return json.loads(line)
 
-    def _boot(self, root, python, model):
+    def _boot(self, config):
         try:
             settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
             with self.lock, (settings.DATA_DIR / 'tts-worker.log').open('a', encoding='utf-8') as log:
                 if self.stopped.is_set():
                     return
+                command = [str(config.python), '-u', str(Path(__file__).with_name('tts_worker.py')),
+                           str(config.root), str(config.model), str((settings.DATA_DIR / 'tts-bert-cache').resolve()),
+                           '--config', str(config.config), '--style-vectors', str(config.style_vectors),
+                           '--device', config.device, '--speaker-id', str(config.speaker_id), '--style', config.style]
+                if config.bert_model is not None:
+                    command.extend(['--bert-model', str(config.bert_model)])
                 self.process = subprocess.Popen(
-                    [str(python), '-u', str(Path(__file__).with_name('tts_worker.py')),
-                     str(root), str(model), str((settings.DATA_DIR / 'tts-bert-cache').resolve())],
-                    cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                    command,
+                    cwd=config.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                     text=True, bufsize=1,
                     env=dict(os.environ, OMP_NUM_THREADS='4', MKL_NUM_THREADS='4',
                              HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1'),
@@ -80,7 +142,7 @@ class SpeechService:
                 self.state = {'state': 'ready', **result}
         except Exception:
             settings.logger.exception('Speech worker initialization failed')
-            self.state = {'state': 'failed', 'device': 'cuda', 'error': '音声モデルを読み込めません。tts-worker.logを確認してください。'}
+            self.state = {'state': 'failed', 'device': self.device, 'error': '音声モデルを読み込めません。tts-worker.logを確認してください。'}
             self.close()
 
     def synthesize(self, text):
@@ -103,7 +165,7 @@ class SpeechService:
             raise
         except Exception:
             settings.logger.exception('Speech worker communication failed')
-            self.state = {'state': 'failed', 'device': 'cuda', 'error': '音声ワーカーとの通信に失敗しました。'}
+            self.state = {'state': 'failed', 'device': self.device, 'error': '音声ワーカーとの通信に失敗しました。'}
             self.close()
             raise HTTPException(status_code=503, detail='音声生成を利用できません。テキストをご確認ください。')
         finally:

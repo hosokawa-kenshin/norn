@@ -526,6 +526,98 @@ def test_character_profile_reloads_between_chat_requests(monkeypatch, tmp_path):
         assert payload['tools']
 
 
+@pytest.fixture
+def speech_configuration_files(tmp_path):
+    root = tmp_path / 'engine'
+    model = tmp_path / 'voice-assets/custom-voice.safetensors'
+    files = [root / '.venv/bin/python', root / '.venv/Scripts/python.exe', model,
+             model.parent / 'config.json', model.parent / 'style_vectors.npy']
+    for file in files:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(b'test asset')
+    return {'NORN_TTS_ROOT': 'engine', 'NORN_TTS_MODEL': 'voice-assets/custom-voice.safetensors'}
+
+
+@pytest.mark.parametrize(('platform', 'python_path'), [('linux', '.venv/bin/python'), ('darwin', '.venv/bin/python'), ('win32', '.venv/Scripts/python.exe')])
+def test_speech_configuration_is_not_tied_to_private_model(speech_configuration_files, tmp_path, platform, python_path):
+    config = tts_module.speech_configuration(speech_configuration_files, base=tmp_path, platform=platform)
+    assert config.root == tmp_path / 'engine'
+    assert config.model == tmp_path / 'voice-assets/custom-voice.safetensors'
+    assert config.python == config.root / python_path
+    assert config.device == 'auto'
+
+
+def test_speech_configuration_preserves_virtual_environment_python_symlink(speech_configuration_files, tmp_path, monkeypatch):
+    runtime = tmp_path / 'runtime with spaces'
+    runtime.mkdir()
+    executable = runtime / 'python'
+    executable.symlink_to(tmp_path / 'engine/.venv/bin/python')
+    speech_configuration_files['NORN_TTS_PYTHON'] = 'runtime with spaces/python'
+    monkeypatch.chdir(tmp_path.parent)
+    config = tts_module.speech_configuration(speech_configuration_files, base=tmp_path)
+    assert config.python == executable
+    assert config.python != executable.resolve()
+
+
+def test_speech_configuration_accepts_explicit_asset_paths(speech_configuration_files, tmp_path):
+    env = speech_configuration_files
+    for key, name in [('NORN_TTS_PYTHON', 'python-custom'), ('NORN_TTS_CONFIG', 'voice-settings.json'), ('NORN_TTS_STYLE_VECTORS', 'styles.npy')]:
+        (tmp_path / name).write_bytes(b'test')
+        env[key] = name
+    env['NORN_TTS_DEVICE'] = 'cpu'
+    env['NORN_TTS_SPEAKER_ID'] = '2'
+    env['NORN_TTS_STYLE'] = 'Happy'
+    config = tts_module.speech_configuration(env, base=tmp_path)
+    assert config.python == tmp_path / 'python-custom'
+    assert config.config == tmp_path / 'voice-settings.json'
+    assert config.style_vectors == tmp_path / 'styles.npy'
+    assert (config.device, config.speaker_id, config.style) == ('cpu', 2, 'Happy')
+
+
+@pytest.mark.parametrize(('key', 'value'), [('NORN_TTS_DEVICE', 'invalid'), ('NORN_TTS_SPEAKER_ID', '-1'), ('NORN_TTS_CONFIG', 'missing.json'), ('NORN_TTS_MODEL', 'missing.safetensors')])
+def test_speech_configuration_rejects_bad_settings(speech_configuration_files, tmp_path, key, value):
+    speech_configuration_files[key] = value
+    with pytest.raises(ValueError):
+        tts_module.speech_configuration(speech_configuration_files, base=tmp_path)
+
+
+def test_speech_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv('NORN_TTS_ENABLED', raising=False)
+    service = tts_module.SpeechService()
+    service.start()
+    assert service.state['state'] == 'disabled'
+    assert service.process is None
+
+
+def test_speech_enabled_without_configuration_keeps_text_api_available(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
+    monkeypatch.setenv('NORN_TTS_ENABLED', '1')
+    monkeypatch.delenv('NORN_TTS_ROOT', raising=False)
+    monkeypatch.delenv('NORN_TTS_MODEL', raising=False)
+    with TestClient(norn_app.app) as client:
+        assert client.get('/api/speech/status').json()['state'] == 'unconfigured'
+        assert client.get('/api/status').status_code == 200
+        assert client.post('/api/speech', json={'text': 'テスト'}).status_code == 503
+        assert tts_module.speech.process is None
+
+
+@pytest.mark.parametrize(('requested', 'available', 'expected'), [('auto', False, 'cpu'), ('auto', True, 'cuda'), ('cpu', True, 'cpu'), ('cuda:0', True, 'cuda:0')])
+def test_speech_worker_device_selection(requested, available, expected):
+    from tts_worker import select_device
+
+    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: available, device_count=lambda: 1))
+    assert select_device(requested, torch) == expected
+
+
+@pytest.mark.parametrize('requested', ['cuda', 'cuda:0'])
+def test_speech_worker_rejects_explicit_cuda_without_gpu(requested):
+    from tts_worker import select_device
+
+    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    with pytest.raises(RuntimeError):
+        select_device(requested, torch)
+
+
 def test_speech_returns_wav_without_saving_reply_audio(monkeypatch, tmp_path):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'norn.sqlite3')
     with TestClient(norn_app.app) as client:
