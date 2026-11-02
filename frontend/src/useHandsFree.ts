@@ -31,6 +31,15 @@ export default function useHandsFree(options: Options) {
 
 	function publish() { setPhase(session.current.phase) }
 
+	function beginReply() {
+		if (session.current.phase !== 'standby') return
+		if (!session.current.wake(Date.now())) return
+		utterance.current.reset()
+		capture.current = false
+		firstUtterance.current = false
+		publish()
+	}
+
 	function endSession() {
 		request.current?.abort()
 		capture.current = false
@@ -68,8 +77,9 @@ export default function useHandsFree(options: Options) {
 	}
 
 	async function enable() {
+		const ticket = epoch.current + 1
 		await disable()
-		const ticket = epoch.current
+		if (epoch.current !== ticket) return
 		setError('')
 		session.current.phase = 'starting'
 		publish()
@@ -212,5 +222,5 @@ export default function useHandsFree(options: Options) {
 	useEffect(() => () => { cleanup() }, [])
 	useEffect(() => window.nornDesktop?.onCommand(() => cleanup()), [])
 	useEffect(() => { window.nornDesktop?.reportVoiceState(phase) }, [phase])
-	return { phase, error, phrase, enable, disable, endSession }
+	return { phase, error, phrase, enable, disable, endSession, beginReply }
 }

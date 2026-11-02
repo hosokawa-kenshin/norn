@@ -1,3 +1,16 @@
+.schedule-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #d5dfdc;
+  background: #edf5f1;
+  color: #233e34;
+}
+
+.schedule-notice > svg,
+.schedule-notice > button { flex-shrink: 0; }
+.schedule-notice p { margin: 0; flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
 :root {
   --paper: #f4f5ee;
   --ink: #202b24;

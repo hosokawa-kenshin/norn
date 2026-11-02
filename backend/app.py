@@ -12,6 +12,7 @@ from events import router as events_router
 from google_calendar import router as google_calendar_router, sync_worker
 from memory import router as memory_router
 from planning import router as planning_router
+from reminders import router as reminders_router
 from tasks import router as tasks_router
 import settings
 from tts import SpeechService, router as tts_router
@@ -49,6 +50,7 @@ app.include_router(events_router)
 app.include_router(google_calendar_router)
 app.include_router(memory_router)
 app.include_router(planning_router)
+app.include_router(reminders_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
 app.include_router(tts_router)

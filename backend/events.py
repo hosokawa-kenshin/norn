@@ -147,7 +147,7 @@ def find_event_conflicts(
 ) -> list[sqlite3.Row]:
     query = '''
         SELECT id, title, start_at, end_at, is_all_day, recurrence_json, recurrence_timezone, google_event_id FROM events
-        WHERE deleted_at IS NULL AND (start_at < ? AND end_at > ? OR recurrence_json != '[]')
+        WHERE deleted_at IS NULL AND is_cancelled = 0 AND (start_at < ? AND end_at > ? OR recurrence_json != '[]')
     '''
     parameters: list[str] = [end_at, start_at]
     if exclude_id is not None:

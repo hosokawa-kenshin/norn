@@ -152,6 +152,14 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_task_allocations_start_end
                 ON task_allocations(start_at, end_at);
+            CREATE TABLE IF NOT EXISTS schedule_notices (
+                notice_key TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             '''
         )
         task_columns = {

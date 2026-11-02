@@ -113,5 +113,5 @@ if ($SmokeTest) {
     Get-Content -LiteralPath $ResultPath
 } else {
     Start-Process -FilePath $Executable -ArgumentList ('"' + $ApplicationDirectory + '"') -WorkingDirectory $ApplicationDirectory
-    Write-Output 'NORN launched. Autostart is enabled by the application; the microphone remains off until enabled.'
+    Write-Output 'NORN launched. Autostart is enabled; hands-free starts automatically after voice setup when the wake model and microphone permission are available.'
 }

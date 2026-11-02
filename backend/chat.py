@@ -23,6 +23,7 @@ from planning import (
     mark_goals_reviewed,
 )
 from tasks import TASK_TOOLS, execute_task_tool
+from reminders import REMINDER_TOOLS, execute_reminder_tool, is_notice_reply, reminder_context
 from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
 router = APIRouter()
@@ -35,6 +36,8 @@ SYSTEM_PROMPT = (
     '予定やタスクを整理し、根拠と不確実性を明確にして簡潔に回答してください。'
     'NORN内の予定の検索・追加・変更・削除は、ユーザーから明確に依頼されたら承認を求めず予定ツールで実行してください。'
     '対象や日時など実行に必要な情報が曖昧または不足している場合に限り、その情報を質問してください。'
+    '「14時29分に」のような日時だけの発言を、予定検索の質問だと決めつけないでください。直前の会話の日時指定なら引き継ぎ、対象がなければ「その時間に何をする？」と作業名だけを尋ねてください。'
+    '続く作業名や「追加して」は先に指定された日時と一つの依頼として扱い、未指定の日時・所要時間だけを質問してください。新しい日時が示されたら以前の希望日時より優先してください。'
     '変更・削除の対象が不明な場合は予定検索ツールを使って特定してください。'
     '予定操作の結果はツールの戻り値に従って報告し、失敗した操作を成功したと述べてはいけません。'
     'NORN内のタスク検索・追加・更新・完了・削除は、ユーザーから明確に依頼されたら承認なしでタスクツールから実行してください。'
@@ -46,8 +49,9 @@ SYSTEM_PROMPT = (
     '「今日」「明日」など日だけが明示された期限はAsia/Tokyoのその日の終わりとして扱えますが、開始時刻や所要時間は補わないでください。'
     '見積時間付きタスクを新規作成した場合は、希望開始日時があればその日時を優先し、指定がなければ期限まで（期限なしは次の5営業日以内）の空き時間を検索して最も早い候補へ自動で割り当ててください。'
     'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
-    'タスクを登録したときに見積時間が不明なら、タスク本体を保存したうえで「何分くらい時間を取る？希望の開始日時はある？」と自然な口調で尋ねてください。返答は直前に登録したタスクの所要時間・希望日時として反映し、時間枠まで保存してください。'
+    'タスクを登録したときに見積時間が不明なら、タスク本体を保存したうえで所要時間を自然に尋ねてください。開始日時を既に伝えている場合は聞き直さず、未指定の場合だけ希望を尋ねてください。返答は直前に登録したタスクの所要時間・希望日時として反映し、時間枠まで保存してください。'
     'ユーザーが時間割当は不要・後でと述べた場合は質問や割当を強制しないでください。希望日時に重複や作業時間外等の問題があれば、勝手に別時刻へ変えず理由を伝えて代案を相談してください。'
+    'タスクの開始は15分刻みです。14時31分等の指定を勝手に丸めず、所要時間と希望を保持し、登録できない理由と空き時間候補を短く伝えて了承を待ってください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
     '目標とプロジェクトの検索・追加・更新・削除は、ユーザーの明確な依頼に基づいて専用ツールで実行してください。'
     '目標を作成するときは長期的な到達状態、プロジェクトは具体的な取り組みとして区別し、プロジェクトは該当する目標へ関連付けてください。'
@@ -113,7 +117,8 @@ AUTOMATIC_TASK_PROMPT = (
     '「しなきゃ」「する必要がある」「しないといけない」など必要性・実行意思が明確なら登録依頼なしでも対象とする。'
     '最新のuser発言を判断対象とし、直近の会話は指示語や作業対象の補完だけに使う。assistantの提案だけから作業を作らない。'
     '否定、登録拒否、単なる質問、仮定、引用、他人の作業、完了済み、願望だけの雑談、架空の演技はactionsを空にする。'
-    '明示的な登録・追加・作成・削除・完了など既存ツール操作の依頼はこの判定では扱わず、通常の会話処理へ任せる。'
+    'タスクの登録依頼や、希望日時に続く「作業名を追加して」も対象とし、先に話した希望日時を引き継いで保存する。'
+    '予定・目標・プロジェクトの登録や、削除・完了などの操作はこの判定では扱わず、通常の会話処理へ任せる。'
     'ただし直前に登録したタスクの所要時間・希望日時への返答や、既存タスクへの時間割当の依頼は、この判定で既存task_idに紐付ける。'
     '「30分」「明日の14時から」「空いている時間で」のような短い返答でも、会話から対象タスクが一意なら扱う。対象が曖昧ならactionsを空にして確認を会話側に任せる。'
     '既存タスクと同じ目的・対象ならそのtask_idを使う。単に同じ作業を言い直しただけならactionsは空。'
@@ -124,7 +129,7 @@ AUTOMATIC_TASK_PROMPT = (
     '「今日」「明日」は現在日時から日付を解決しdue_dateをYYYY-MM-DDにする。'
     'due_evidenceとestimate_evidenceにはそれぞれ最新発言中の日付・時間の根拠をそのまま入れる。'
     '開始日時が明示されていればstart_atをタイムゾーン付きISO8601にし、start_evidenceに根拠を引用する。未指定の開始時刻は補わない。'
-    '所要時間を後から答えた場合、同じタスクについて直近のuser発言で指定済みの希望日時も引き継げる。その根拠は該当user発言から引用する。'
+    '作業名や所要時間を後から答えた場合、直前の日時だけの発言を含め、同じ依頼について直近のuser発言で指定済みの希望日時も引き継ぐ。その根拠は該当user発言から引用する。最新の日時指定を優先する。'
     '時間割当は後で・不要と本人が述べた場合はdefer_schedulingをtrueにしdefer_evidenceへ最新発言の根拠を引用する。'
     '優先度、プロジェクト、説明、架空の予定は補わない。形式は'
     '{"actions":[{"title":"作業名","task_id":null,"evidence":"最新発言の根拠",'
@@ -145,6 +150,8 @@ def allocate_automatic_task(result, intent, latest, user_messages):
         intent.start_at is not None and intent.start_evidence.strip()
         and any(intent.start_evidence in text for text in user_messages)
     ) else None
+    if preferred is not None and preferred.tzinfo is None:
+        preferred = preferred.replace(tzinfo=LOCAL_TIMEZONE)
     if task['estimated_minutes'] is None:
         result['scheduling'] = {'state': 'needs_estimate', 'preferred_start': preferred.isoformat() if preferred else None}
         return result
@@ -181,6 +188,16 @@ def allocate_automatic_task(result, intent, latest, user_messages):
         result['summary'] = result.get('summary', '') + scheduled['summary']
     else:
         result['scheduling'] = {'state': 'unavailable', 'error': scheduled.get('error'), 'preferred_start': start}
+        search_start = max(datetime.fromisoformat(start), datetime.now(LOCAL_TIMEZONE))
+        search_end = search_start + timedelta(days=7)
+        if task.get('due_at'):
+            search_end = min(search_end, datetime.fromisoformat(task['due_at']))
+        if search_end > search_start:
+            available = execute_task_tool('find_task_slots', {
+                'task_id': task['id'], 'from_at': search_start.isoformat(),
+                'through_at': search_end.isoformat(), 'limit': 3,
+            })
+            result['scheduling']['alternatives'] = available.get('slots', []) if available.get('ok') else []
     return result
 
 
@@ -279,34 +296,72 @@ def build_system_prompt() -> str:
     )
 
 
+async def generate_action_reply(system_prompt: str, messages: list[dict[str, Any]], results: list[dict[str, Any]]) -> str:
+    payload = {
+        'model': LLM_MODEL,
+        'temperature': 0.2,
+        'messages': [
+            {'role': 'system', 'content': system_prompt + (
+                '\n操作は終了しています。以下のサーバー実行結果だけを根拠に、利用者への最終返答を自然な日本語で生成してください。'
+                'ツールの再実行はできません。キャラクターの口調を保ち、結果の定型summaryを連結せず、短く一度だけ伝えてください。'
+                'タスク本体の保存と時間枠の確定を区別してください。割当が失敗した場合は、未割当であることと理由を必ず伝えてください。'
+                '既に示された日時・所要時間は聞き直さず、不足している情報だけを尋ねてください。'
+                '候補は未確定として提案し、ユーザーの了承なく別時刻へ移動したと述べないでください。'
+                '\nサーバー実行結果:\n'
+            ) + json.dumps(results, ensure_ascii=False)},
+            *[message for message in messages if message['role'] in {'user', 'assistant'} and isinstance(message.get('content'), str)],
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10)) as client:
+            response = await client.post(
+                f'{LLM_BASE_URL}/chat/completions', json=payload,
+                headers={'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {},
+            )
+        response.raise_for_status()
+        message = response.json()['choices'][0]['message']
+        content = message.get('content')
+        if message.get('tool_calls') or not isinstance(content, str) or not content.strip():
+            raise ValueError('Missing final reply')
+        return content.strip()
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError) as error:
+        logger.warning('Action reply generation failed: %s', type(error).__name__)
+        raise HTTPException(502, 'Geminiによる結果の説明を生成できませんでした。操作を再送せず、予定・タスクの現在の状態を確認してください。') from error
+
+
 async def generate_llm_reply(
     messages: list[dict[str, str]], conversation_id: str | None = None
 ) -> str:
     headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
     local_now = datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes')
     system_prompt = build_system_prompt()
-    automatic_results = await prepare_automatic_tasks(messages)
+    notice_context = reminder_context(conversation_id)
+    answering_extension = is_notice_reply(conversation_id)
+    automatic_results = [] if answering_extension else await prepare_automatic_tasks(messages)
     automatic_context = (
         '\nサーバー側の自動タスク判定・実行結果（ユーザー発言ではありません）:\n'
         + json.dumps(automatic_results, ensure_ascii=False)
         + '\n成功した登録・更新は実行済みなので重複実行しないでください。保存結果を自然に短く伝え、失敗時や結果なしでは保存したと主張しないでください。'
-        'scheduling.stateがneeds_estimateなら所要時間と希望開始日時を自然に質問してください。'
+        'scheduling.stateがneeds_estimateなら所要時間を自然に質問してください。preferred_startがあればその希望は把握済みなので開始日時は聞き直さないでください。'
         'scheduledなら実際の開始・終了時刻を短く伝え、再割当しないでください。'
-        'unavailableならその理由を伝えて別時刻を相談し、この返答内で勝手に別枠を取ったり再試行したりしないでください。'
+        'unavailableならタスクの保存と時間枠の未確定を区別して理由を伝え、alternativesがあれば候補を1〜2件提案して了承を待ってください。この返答内で勝手に別枠を取ったり再試行したりしないでください。'
         'deferredなら割当や質問を強制しないでください。'
     )
     llm_messages: list[dict[str, Any]] = [
-        {'role': 'system', 'content': f'{system_prompt}\n現在日時（Asia/Tokyo）: {local_now}{automatic_context}'},
+        {'role': 'system', 'content': f'{system_prompt}\n現在日時（Asia/Tokyo）: {local_now}{automatic_context}\n{notice_context}'},
         *messages,
     ]
-    completed_actions: list[str] = [result['summary'] for result in automatic_results if result.get('ok') and result.get('summary')]
+    completed_actions: list[dict[str, Any]] = [result for result in automatic_results if result.get('ok') and (result.get('task') or result.get('summary'))]
+    if completed_actions:
+        return await generate_action_reply(llm_messages[0]['content'], messages, automatic_results)
     seen_tool_calls: set[tuple[str, str]] = set()
+    tool_results: list[dict[str, Any]] = []
 
     for _ in range(8):
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
-            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS],
+            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS],
             'tool_choice': 'auto',
             'temperature': 0.2,
         }
@@ -320,18 +375,18 @@ async def generate_llm_reply(
         except httpx.TimeoutException as error:
             logger.warning('LLM request timed out')
             if completed_actions:
-                return '操作を実行しました。' + '。'.join(completed_actions)
+                return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
             raise HTTPException(status_code=504, detail='LLMの応答がタイムアウトしました。') from error
         except httpx.HTTPError as error:
             logger.warning('LLM connection failed: %s', type(error).__name__)
             if completed_actions:
-                return '操作を実行しました。' + '。'.join(completed_actions)
+                return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
             raise HTTPException(status_code=502, detail='LLM接続に失敗しました。接続設定を確認してください。') from error
 
         if response.is_error:
             logger.warning('LLM returned HTTP %s', response.status_code)
             if completed_actions:
-                return '操作を実行しました。' + '。'.join(completed_actions)
+                return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
             raise HTTPException(status_code=502, detail=f'LLMがエラーを返しました (HTTP {response.status_code})')
 
         try:
@@ -345,7 +400,7 @@ async def generate_llm_reply(
             if isinstance(content, str) and content.strip():
                 return content.strip()
             if completed_actions:
-                return '操作を実行しました。' + '。'.join(completed_actions)
+                return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
             raise HTTPException(status_code=502, detail='LLMから空の応答が返されました。')
 
         llm_messages.append({
@@ -367,6 +422,7 @@ async def generate_llm_reply(
                     'create_event', 'update_event', 'delete_event',
                     'create_task', 'update_task', 'complete_task', 'delete_task',
                     'schedule_task', 'unschedule_task',
+                    'extend_schedule',
                     'save_memory', 'update_memory', 'forget_memory',
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
@@ -388,6 +444,8 @@ async def generate_llm_reply(
                         )
                     elif name in goal_project_tools:
                         result = await asyncio.to_thread(execute_goal_project_tool, name, arguments)
+                    elif name == 'extend_schedule':
+                        result = execute_reminder_tool(arguments)
                     elif name in task_tools:
                         result = execute_task_tool(name, arguments)
                     else:
@@ -395,16 +453,19 @@ async def generate_llm_reply(
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 result = {'ok': False, 'error': f'ツール引数が不正です: {error}'}
 
+            tool_results.append({'tool': name, **result})
             if result.get('ok') and result.get('summary'):
-                completed_actions.append(result['summary'])
+                completed_actions.append(result)
             llm_messages.append({
                 'role': 'tool',
                 'tool_call_id': call_id,
                 'content': json.dumps(result, ensure_ascii=False),
             })
+        if any(not result.get('ok') and result.get('error') == '同じツール呼び出しを重複実行しませんでした。' for result in tool_results):
+            return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
 
-    if completed_actions:
-        return '操作を実行しました。' + '。'.join(completed_actions)
+    if tool_results:
+        return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
     raise HTTPException(status_code=502, detail='Geminiが予定操作を完了できませんでした。')
 
 

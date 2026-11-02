@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useEffectEvent, useRef, useState, type FormEvent } from 'react'
 import {
   Activity,
   AudioLines,
@@ -172,6 +172,8 @@ export default function NornApp() {
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState('')
+  const [scheduleNotice, setScheduleNotice] = useState<{ text: string; conversationId: string } | null>(null)
+  const noticeBusy = useRef(false)
   const [calibrationRequired, setCalibrationRequired] = useState(false)
   const [showSettings, setShowSettings] = useState(
     () => new URLSearchParams(window.location.search).get('googleCalendar') === 'connected',
@@ -201,6 +203,52 @@ export default function NornApp() {
     onText: (text, signal) => sendChatContent(text, signal),
     onInterrupt: speech.stop,
   })
+  const startHandsFreeOnLoad = useEffectEvent(() => {
+    if (handsFree.phase === 'off') void handsFree.enable()
+  })
+
+  const receiveNotices = useEffectEvent((result: { conversation_id: string | null; messages: Message[] }, requestedId: string | null) => {
+    if (!result.messages.length || !result.conversation_id) return
+    const text = result.messages.map((message) => message.content).join('\n')
+    setScheduleNotice({ text, conversationId: result.conversation_id })
+    if (activeId === requestedId) {
+      localStorage.setItem('norn.activeConversation', result.conversation_id)
+      setActiveId(result.conversation_id)
+      setMessages((current) => [...current, ...result.messages])
+      handsFree.beginReply()
+      void speech.speak(text)
+    }
+    void refreshConversations()
+  })
+
+  const pollSchedule = useEffectEvent(async () => {
+    if (noticeBusy.current || isSending || voiceState !== 'idle' || calibrationRequired
+      || ['loading', 'generating', 'playing'].includes(speech.state)
+      || ['starting', 'listening', 'processing', 'playing'].includes(handsFree.phase)) return
+    noticeBusy.current = true
+    const requestedId = activeId
+    try {
+      const response = await fetch('/api/schedule-notices', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: requestedId }),
+      })
+      if (response.status === 404) {
+        localStorage.removeItem('norn.activeConversation')
+        setActiveId(null)
+      } else if (response.ok) {
+        receiveNotices(await response.json() as { conversation_id: string | null; messages: Message[] }, requestedId)
+      }
+    } catch {
+      return
+    } finally {
+      noticeBusy.current = false
+    }
+  })
+
+  useEffect(() => {
+    const timer = window.setInterval(() => { void pollSchedule() }, 5000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -217,8 +265,10 @@ export default function NornApp() {
       .catch(() => undefined)
     fetch('/api/wake/status')
       .then((response) => response.ok ? response.json() : null)
-      .then((value: { calibration_required?: boolean } | null) => {
-        if (active) setCalibrationRequired(value?.calibration_required === true)
+      .then((value: { calibration_required?: boolean; available?: boolean } | null) => {
+        if (!active) return
+        setCalibrationRequired(value?.calibration_required === true)
+        if (value?.calibration_required === false && value.available === true) startHandsFreeOnLoad()
       })
       .catch(() => undefined)
     return () => { active = false }
@@ -464,6 +514,7 @@ export default function NornApp() {
       setActiveId(result.conversation_id)
       setMessages((current) => [...current, result.user_message, result.assistant_message])
       setDraft('')
+      setCalendarRefresh((current) => current + 1)
       void speech.speak(result.assistant_message.content)
       await refreshConversations()
     } catch (reason) {
@@ -723,6 +774,16 @@ export default function NornApp() {
           </div>
         </header>
 
+        {scheduleNotice && <div className="schedule-notice" role="status">
+          <Clock3 size={18} aria-hidden="true" />
+          <p>{scheduleNotice.text}</p>
+          <button className="icon-button" type="button" title="会話で返答" aria-label="会話で返答" onClick={() => {
+            if (activeId !== scheduleNotice.conversationId) { handsFree.endSession(); speech.stop(); setActiveId(scheduleNotice.conversationId) }
+            setView('chat')
+          }}><AudioLines size={18} /></button>
+          <button className="icon-button" type="button" title="通知を閉じる" aria-label="通知を閉じる" onClick={() => setScheduleNotice(null)}><Check size={18} /></button>
+        </div>}
+
         {view === 'chat' ? <section className="conversation-stage" aria-label="会話">
           {messages.length === 0 ? (
             <div className="welcome-state">
@@ -866,7 +927,7 @@ export default function NornApp() {
       </main>
 
       {calibrationRequired && !showSettings && voiceState === 'idle' && handsFree.phase === 'off' && !isSending && <WakeCalibrationDialog
-        onComplete={() => setCalibrationRequired(false)}
+        onComplete={() => { setCalibrationRequired(false); void handsFree.enable() }}
         onDismiss={() => setCalibrationRequired(false)}
       />}
 

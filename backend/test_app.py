@@ -3,12 +3,14 @@ import sqlite3
 import stat
 import struct
 import uuid
+from contextlib import closing
 from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 
 import app as norn_app
@@ -20,6 +22,7 @@ import memory as memory_module
 import planning as planning_module
 import settings as settings_module
 import tasks as tasks_module
+import reminders as reminders_module
 import voice as voice_module
 import tts as tts_module
 import wake as wake_module
@@ -34,6 +37,263 @@ def disable_real_speech_worker(monkeypatch, tmp_path):
     original = chat_module.prepare_automatic_tasks
     monkeypatch.setattr(chat_module, 'prepare_automatic_tasks', no_op_automatic_tasks)
     return original
+
+
+@pytest.fixture(autouse=True)
+def mock_notice_generation(monkeypatch):
+    original = reminders_module.generate_notice_text
+
+    def fake_notice(item, boundary, following):
+        return f'「{item["title"]}」の' + ('開始時刻です。' if boundary == 'start_at' else '終了時刻です。延長しますか？')
+
+    monkeypatch.setattr(reminders_module, 'generate_notice_text', fake_notice)
+    return original
+
+
+@pytest.mark.parametrize('boundary', ['start_at', 'end_at'])
+def test_schedule_notices_use_gemini_text(monkeypatch, tmp_path, future_task_start, mock_notice_generation, boundary):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'gemini-notice.sqlite3')
+    monkeypatch.setattr(reminders_module, 'generate_notice_text', mock_notice_generation)
+    monkeypatch.setattr(reminders_module, 'LLM_MODEL', 'test-model')
+    chat_module.CHARACTER_PATH.write_text(json.dumps({'口調': '落ち着いた架空のテスト口調'}), encoding='utf-8')
+    payloads = []
+    generated = 'Geminiが生成した開始の声かけ。' if boundary == 'start_at' else 'Geminiが生成した延長の問いかけ。'
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json, headers):
+            payloads.append(json)
+            with closing(database_module.open_database()) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                connection.rollback()
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'choices': [{'message': {'content': generated}}]})
+
+    monkeypatch.setattr(reminders_module.httpx, 'Client', FakeClient)
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        client.post('/api/events', json={'title': '架空の作業', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat(), 'description': '送信しない詳細'})
+        client.post('/api/events', json={'title': '次の架空予定', 'start_at': end.isoformat(), 'end_at': (end + timedelta(minutes=30)).isoformat()})
+        result = reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start if boundary == 'start_at' else end - timedelta(microseconds=1))
+        if boundary == 'end_at':
+            result = reminders_module.claim_notices(reminders_module.NoticeRequest(conversation_id=result['conversation_id']), end)
+        assert result['messages'][0]['content'] == generated
+        stored = client.get(f'/api/conversations/{result["conversation_id"]}/messages').json()
+        assert stored[-1]['content'] == generated
+        count = len(payloads)
+        assert reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start if boundary == 'start_at' else end)['messages'] == []
+        assert len(payloads) == count
+    facts = json.loads(payloads[0]['messages'][1]['content'])
+    assert facts['boundary'] == ('start' if boundary == 'start_at' else 'end')
+    assert facts['event']['title'] == '架空の作業'
+    assert facts['following_event']['title'] == '次の架空予定'
+    assert 'description' not in facts['event']
+    assert '落ち着いた架空のテスト口調' in payloads[0]['messages'][0]['content']
+    assert 'tools' not in payloads[0]
+
+
+@pytest.mark.parametrize('failure', ['empty', 'timeout', 'http_error'])
+def test_schedule_notice_generation_failure_can_retry(monkeypatch, tmp_path, future_task_start, mock_notice_generation, failure):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'notice-retry.sqlite3')
+    monkeypatch.setattr(reminders_module, 'generate_notice_text', mock_notice_generation)
+    monkeypatch.setattr(reminders_module, 'LLM_MODEL', 'test-model')
+    attempts = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json, headers):
+            attempts.append(json)
+            if len(attempts) == 1:
+                if failure == 'timeout':
+                    raise httpx.ReadTimeout('test timeout')
+                if failure == 'http_error':
+                    raise httpx.ConnectError('test connection failure')
+                return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'choices': [{'message': {'content': '  '}}]})
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'choices': [{'message': {'content': '再生成できた声かけ'}}]})
+
+    monkeypatch.setattr(reminders_module.httpx, 'Client', FakeClient)
+    with TestClient(norn_app.app) as client:
+        client.post('/api/events', json={'title': '架空の作業', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(minutes=30)).isoformat()})
+        with pytest.raises(reminders_module.HTTPException) as error:
+            reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start)
+        assert error.value.status_code == (504 if failure == 'timeout' else 502)
+        assert client.get('/api/conversations').json() == []
+        with closing(database_module.open_database()) as connection:
+            assert connection.execute('SELECT COUNT(*) FROM schedule_notices').fetchone()[0] == 0
+        result = reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start)
+        assert result['messages'][0]['content'] == '再生成できた声かけ'
+
+
+def test_schedule_notices_boundaries_deduplicated(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'notices.sqlite3')
+    with TestClient(norn_app.app) as client:
+        event = client.post('/api/events', json={
+            'title': '練習', 'start_at': future_task_start.isoformat(),
+            'end_at': (future_task_start + timedelta(minutes=30)).isoformat(),
+        }).json()
+        first = reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start)
+        assert len(first['messages']) == 1 and '開始時刻' in first['messages'][0]['content']
+        assert reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start)['messages'] == []
+        ending = reminders_module.claim_notices(reminders_module.NoticeRequest(conversation_id=first['conversation_id']), datetime.fromisoformat(event['end_at']))
+        assert '延長しますか' in ending['messages'][0]['content']
+        assert len(client.get(f'/api/conversations/{first["conversation_id"]}/messages').json()) == 2
+
+
+def test_extend_schedule_moves_task_and_rejects_stale_retry(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'extension.sqlite3')
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        event = client.post('/api/events', json={'title': '練習', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat()}).json()
+        task = client.post('/api/tasks', json={'title': '片付け', 'estimated_minutes': 30}).json()
+        assert client.put(f'/api/tasks/{task["id"]}/schedule', json={'start_at': end.isoformat()}).status_code == 200
+        arguments = {'kind': 'event', 'item_id': event['id'], 'expected_end': event['end_at'], 'minutes': 30}
+        result = reminders_module.execute_reminder_tool(arguments)
+        assert result['ok'] and result['moved_tasks'][0]['start_at'] == (end + timedelta(minutes=30)).isoformat()
+        assert not reminders_module.execute_reminder_tool(arguments)['ok']
+
+
+def test_extend_schedule_rolls_back_without_slot(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'rollback.sqlite3')
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        event = client.post('/api/events', json={'title': '練習', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat()}).json()
+        task = client.post('/api/tasks', json={'title': '期限付き', 'estimated_minutes': 30, 'due_at': (end + timedelta(minutes=30)).isoformat()}).json()
+        assert client.put(f'/api/tasks/{task["id"]}/schedule', json={'start_at': end.isoformat()}).status_code == 200
+        result = reminders_module.execute_reminder_tool({'kind': 'event', 'item_id': event['id'], 'expected_end': end.isoformat(), 'minutes': 30})
+        assert not result['ok']
+        assert client.get('/api/events').json()[0]['end_at'] == event['end_at']
+        assert client.get('/api/tasks').json()[0]['scheduled_start'] == end.isoformat()
+
+
+def test_extend_schedule_preserves_normal_event(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'fixed.sqlite3')
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        event = client.post('/api/events', json={'title': '練習', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat()}).json()
+        client.post('/api/events', json={'title': '面談', 'start_at': end.isoformat(), 'end_at': (end + timedelta(hours=1)).isoformat()})
+        result = reminders_module.execute_reminder_tool({'kind': 'event', 'item_id': event['id'], 'expected_end': end.isoformat(), 'minutes': 30})
+        assert not result['ok'] and '面談' in result['error'] and '確認' in result['error']
+        assert client.get('/api/events').json()[0]['end_at'] == end.isoformat()
+
+
+def test_extend_schedule_recurring_only_changes_one_occurrence(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'occurrence.sqlite3')
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        event = client.post('/api/events', json={'title': '定例', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat(), 'recurrence': ['RRULE:FREQ=DAILY']}).json()
+        arguments = {'kind': 'event', 'item_id': event['id'], 'expected_end': (end + timedelta(days=1)).isoformat(), 'minutes': 15}
+        assert reminders_module.execute_reminder_tool(arguments)['ok']
+        assert not reminders_module.execute_reminder_tool(arguments)['ok']
+        occurrences = events_module.query_events(future_task_start, future_task_start + timedelta(days=3))
+        assert len(occurrences) == 3
+        assert occurrences[1]['end_at'] == (end + timedelta(days=1, minutes=15)).isoformat()
+        assert occurrences[2]['end_at'] == (end + timedelta(days=2)).isoformat()
+
+
+def test_extend_schedule_recurring_cannot_overlap_next_occurrence(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'recurrence-conflict.sqlite3')
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        event = client.post('/api/events', json={'title': '定例', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat(), 'recurrence': ['RRULE:FREQ=DAILY']}).json()
+        result = reminders_module.execute_reminder_tool({'kind': 'event', 'item_id': event['id'], 'expected_end': end.isoformat(), 'minutes': 1440})
+        assert not result['ok'] and '定例' in result['error']
+        assert len(client.get('/api/events').json()) == 1
+
+
+def test_extend_schedule_task_keeps_estimate_and_moves_next_task(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'task-extension.sqlite3')
+    with TestClient(norn_app.app) as client:
+        first = client.post('/api/tasks', json={'title': '作業', 'estimated_minutes': 30}).json()
+        second = client.post('/api/tasks', json={'title': '次の作業', 'estimated_minutes': 30}).json()
+        end = future_task_start + timedelta(minutes=30)
+        client.put(f'/api/tasks/{first["id"]}/schedule', json={'start_at': future_task_start.isoformat()})
+        client.put(f'/api/tasks/{second["id"]}/schedule', json={'start_at': end.isoformat()})
+        result = reminders_module.execute_reminder_tool({'kind': 'task', 'item_id': first['id'], 'expected_end': end.isoformat(), 'minutes': 15})
+        assert result['ok'] and result['end_at'] == (end + timedelta(minutes=15)).isoformat()
+        tasks = {task['id']: task for task in client.get('/api/tasks').json()}
+        assert tasks[first['id']]['estimated_minutes'] == 30
+        assert tasks[second['id']]['scheduled_start'] == result['end_at']
+
+
+def test_schedule_notices_ignore_all_day_and_expired_boundaries(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'notice-window.sqlite3')
+    with TestClient(norn_app.app) as client:
+        day = future_task_start.replace(hour=0)
+        client.post('/api/events', json={'title': '終日', 'start_at': day.isoformat(), 'end_at': (day + timedelta(days=1)).isoformat(), 'is_all_day': True})
+        assert reminders_module.claim_notices(reminders_module.NoticeRequest(), day)['messages'] == []
+        client.post('/api/events', json={'title': '翌日の作業', 'start_at': (future_task_start + timedelta(days=1)).isoformat(), 'end_at': (future_task_start + timedelta(days=1, minutes=30)).isoformat()})
+        assert reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start + timedelta(days=1, minutes=36))['messages'] == []
+
+
+def test_schedule_notices_recurring_and_restart(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'repeat.sqlite3')
+    with TestClient(norn_app.app) as client:
+        client.post('/api/events', json={'title': '定例', 'start_at': future_task_start.isoformat(),
+                                       'end_at': (future_task_start + timedelta(minutes=30)).isoformat(), 'recurrence': ['RRULE:FREQ=DAILY']})
+        first = reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start + timedelta(days=1))
+        assert len(first['messages']) == 1
+    with TestClient(norn_app.app):
+        assert reminders_module.claim_notices(reminders_module.NoticeRequest(), future_task_start + timedelta(days=1))['messages'] == []
+
+
+def test_extend_schedule_chat_tool(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'chat-extension.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    monkeypatch.setattr(reminders_module, 'generate_notice_text', lambda *args: 'もう少し続ける？何分にする？')
+
+    async def unexpected_automatic_tasks(*args):
+        raise AssertionError('通知への返答を通常のタスク見積変更として判定してはいけません。')
+
+    monkeypatch.setattr(chat_module, 'prepare_automatic_tasks', unexpected_automatic_tasks)
+    payloads = []
+    tool_arguments = {}
+    encode_json = json.dumps
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            payloads.append(json)
+            message = {'content': '30分延長しました。'} if len(payloads) > 1 else {
+                'content': None, 'tool_calls': [{'id': 'extension-1', 'type': 'function', 'function': {
+                    'name': 'extend_schedule', 'arguments': encode_json(tool_arguments),
+                }}],
+            }
+            return SimpleNamespace(is_error=False, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        end = future_task_start + timedelta(minutes=30)
+        event = client.post('/api/events', json={'title': '練習', 'start_at': future_task_start.isoformat(), 'end_at': end.isoformat()}).json()
+        notice = reminders_module.claim_notices(reminders_module.NoticeRequest(), end)
+        tool_arguments.update(kind='event', item_id=event['id'], expected_end=end.isoformat(), minutes=30)
+        response = client.post('/api/chat', json={'conversation_id': notice['conversation_id'], 'content': '30分延長して'})
+        assert response.status_code == 200
+        assert client.get('/api/events').json()[0]['end_at'] == (end + timedelta(minutes=30)).isoformat()
+        assert event['id'] in payloads[0]['messages'][0]['content']
 
 
 def configure_automatic_task_test(monkeypatch, tmp_path, original, actions):
@@ -95,6 +355,95 @@ def future_task_start():
     while start.weekday() not in tasks_module.PLANNING_WORKDAYS:
         start += timedelta(days=1)
     return start.replace(hour=14, minute=0, second=0, microsecond=0)
+
+
+@pytest.mark.parametrize('failure', ['empty', 'timeout', 'duplicate', 'summary_failure'])
+def test_chat_generates_final_action_reply_without_tools(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'final-reply.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    payloads = []
+    encode_json = json.dumps
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            payloads.append(json)
+            if 'tools' not in json:
+                message = {'content': '' if failure == 'summary_failure' else '作業を追加したよ。何分くらいにする？'}
+            elif len(payloads) == 1 or failure == 'duplicate':
+                message = {'content': None, 'tool_calls': [{'id': f'call-{len(payloads)}', 'type': 'function', 'function': {
+                    'name': 'create_task', 'arguments': encode_json({'title': '架空の作業'}),
+                }}]}
+            elif failure == 'timeout':
+                raise httpx.ReadTimeout('test timeout')
+            else:
+                message = {'content': ''}
+            return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={'content': '架空の作業を追加して'})
+        assert response.status_code == (502 if failure == 'summary_failure' else 200)
+        if failure == 'summary_failure':
+            assert '操作を再送せず' in response.json()['detail']
+        else:
+            assert response.json()['assistant_message']['content'] == '作業を追加したよ。何分くらいにする？'
+        assert len(client.get('/api/tasks').json()) == 1
+    assert len(payloads) == 3 and 'tools' not in payloads[-1]
+    assert 'サーバー実行結果' in payloads[-1]['messages'][0]['content']
+
+
+@pytest.mark.parametrize('naive_start', [False, True])
+def test_automatic_task_preserves_time_before_task_name_and_explains_unaligned_start(monkeypatch, tmp_path, disable_real_speech_worker, future_task_start, naive_start):
+    preferred = future_task_start.replace(minute=29)
+    actions = [{'title': '架空の楽器練習', 'evidence': '楽器練習を追加して',
+                'start_at': preferred.isoformat(), 'start_evidence': '14時29分に'}]
+    payloads = configure_automatic_task_test(monkeypatch, tmp_path, disable_real_speech_worker, actions)
+    with TestClient(norn_app.app) as client:
+        conversation_id = str(uuid.uuid4())
+        with closing(database_module.open_database()) as connection:
+            timestamp = database_module.now_iso()
+            connection.execute('INSERT INTO conversations VALUES (?, ?, ?, ?)', (conversation_id, '架空の日時指定', timestamp, timestamp))
+            connection.executemany('INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)', [
+                (conversation_id, 'user', '14時29分に', timestamp),
+                (conversation_id, 'assistant', 'その時間に何をする？', timestamp),
+            ])
+            connection.commit()
+        initial = client.post('/api/chat', json={'conversation_id': conversation_id, 'content': '楽器練習を追加して'})
+        assert initial.status_code == 200
+        task = client.get('/api/tasks').json()[0]
+        assert preferred.isoformat() in payloads[1]['messages'][0]['content']
+        assert 'tools' not in payloads[1]
+        requested = preferred.replace(minute=31)
+        actions[:] = [{'title': task['title'], 'task_id': task['id'], 'evidence': '5分',
+                       'estimated_minutes': 5, 'estimate_evidence': '5分',
+                   'start_at': (requested.replace(tzinfo=None) if naive_start else requested).isoformat(), 'start_evidence': '14時31分'}]
+        response = client.post('/api/chat', json={'conversation_id': conversation_id, 'content': '14時31分に5分くらい時間取って'})
+        assert response.status_code == 200
+        tasks = client.get('/api/tasks').json()
+        assert len(tasks) == 1 and tasks[0]['id'] == task['id'] and tasks[0]['estimated_minutes'] == 5
+        assert tasks[0]['scheduled_start'] is None
+        result_prompt = payloads[-1]['messages'][0]['content']
+        assert '15分刻み' in result_prompt and 'alternatives' in result_prompt
+        assert preferred.replace(minute=45).isoformat() in result_prompt
+        assert 'tools' not in payloads[-1]
+        actions[:] = [{'title': task['title'], 'task_id': task['id'], 'evidence': '14時45分',
+                   'start_at': preferred.replace(minute=45).isoformat(), 'start_evidence': '14時45分'}]
+        confirmed = client.post('/api/chat', json={'conversation_id': conversation_id, 'content': '14時45分でお願い'})
+        assert confirmed.status_code == 200
+        tasks = client.get('/api/tasks').json()
+        assert len(tasks) == 1 and tasks[0]['estimated_minutes'] == 5
+        assert tasks[0]['scheduled_start'] == preferred.replace(minute=45).isoformat()
+        assert tasks[0]['scheduled_end'] == preferred.replace(minute=50).isoformat()
 
 
 def test_automatic_task_reply_assigns_preferred_time(monkeypatch, tmp_path, disable_real_speech_worker, future_task_start):
@@ -842,6 +1191,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
     tool_names = {tool['function']['name'] for tool in request_payloads[0]['tools']}
     assert tool_names == {
         'list_events', 'create_event', 'update_event', 'delete_event',
+        'extend_schedule',
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
         'find_task_slots', 'schedule_task', 'unschedule_task',
         'save_memory', 'search_memories', 'update_memory', 'forget_memory',
