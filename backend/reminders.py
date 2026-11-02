@@ -299,7 +299,7 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
                 'UPDATE task_allocations SET start_at = ?, end_at = ?, updated_at = ? WHERE id = ?',
                 (event_datetime_iso(cursor), event_datetime_iso(cursor + duration), now_iso(), allocation['id']),
             )
-            moved.append({'title': allocation['title'], 'start_at': event_datetime_iso(cursor), 'end_at': event_datetime_iso(cursor + duration)})
+            moved.append({'task_id': allocation['task_id'], 'title': allocation['title'], 'start_at': event_datetime_iso(cursor), 'end_at': event_datetime_iso(cursor + duration)})
     return {'ok': True, 'end_at': event_datetime_iso(new_end), 'moved_tasks': moved,
             'summary': f'{payload.minutes}分延長しました。終了は{new_end.strftime("%H:%M")}です。', 'kind': payload.kind, 'item_id': item_id}
 

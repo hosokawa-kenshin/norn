@@ -16,7 +16,7 @@ export default function useHandsFree(options: Options) {
 	const utterance = useRef(new UtteranceBuffer())
 	const [phase, setPhase] = useState<SessionPhase>('off')
 	const [error, setError] = useState('')
-	const [phrase, setPhrase] = useState('ノルン')
+	const [phrase, setPhrase] = useState('ねぇノルン')
 	const vad = useRef<MicVAD | null>(null)
 	const socket = useRef<WebSocket | null>(null)
 	const context = useRef<AudioContext | null>(null)

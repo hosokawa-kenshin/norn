@@ -73,5 +73,5 @@ export function isConversationEnd(text: string) {
 }
 
 export function stripWakePhrase(text: string) {
-	return text.replace(/^(?:ノルン|のるん|norn)[、,。\s]*/i, '').trim()
+	return text.replace(/^ね[ぇえー]+[、,。\s]*(?:ノルン|のるん|norn)[、,。\s]*/i, '').trim()
 }

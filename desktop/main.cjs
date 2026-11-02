@@ -18,7 +18,7 @@ let quitting = false
 let voicePhase = 'off'
 let preferences = null
 let logFile = null
-const labels = { off: 'マイク停止中', starting: 'マイク準備中', standby: 'ノルンを待機中', listening: '聞き取り中', processing: '処理中', playing: '再生中' }
+const labels = { off: 'マイク停止中', starting: 'マイク準備中', standby: 'ねぇノルンを待機中', listening: '聞き取り中', processing: '処理中', playing: '再生中' }
 
 function log(message) {
   if (logFile) fs.appendFileSync(logFile, `${new Date().toISOString()} ${message}`)

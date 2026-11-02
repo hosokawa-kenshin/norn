@@ -53,10 +53,12 @@ test('stop phrases match only a complete utterance', () => {
 	assert.equal(isConversationEnd('またねって言ってた'), false)
 })
 
-test('Japanese Norn is stripped without losing the following command', () => {
-	assert.equal(stripWakePhrase('ノルン、今日の予定は？'), '今日の予定は？')
-	assert.equal(stripWakePhrase('のるん。こんにちは'), 'こんにちは')
-	assert.equal(stripWakePhrase('Norn, こんにちは'), 'こんにちは')
-	assert.equal(stripWakePhrase('ノルン'), '')
+test('Nee Norn is stripped without losing the following command', () => {
+	assert.equal(stripWakePhrase('ねぇノルン、今日の予定は？'), '今日の予定は？')
+	assert.equal(stripWakePhrase('ねえ、のるん。こんにちは'), 'こんにちは')
+	assert.equal(stripWakePhrase('ねー Norn, こんにちは'), 'こんにちは')
+	assert.equal(stripWakePhrase('ねぇノルン'), '')
+	assert.equal(stripWakePhrase('ノルン、今日の予定は？'), 'ノルン、今日の予定は？')
+	assert.equal(stripWakePhrase('Norn, こんにちは'), 'Norn, こんにちは')
 	assert.equal(stripWakePhrase('Hey Emma, こんにちは'), 'Hey Emma, こんにちは')
 })

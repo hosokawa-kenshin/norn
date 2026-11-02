@@ -1,9 +1,46 @@
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
 from settings import DB_PATH, GOOGLE_CALENDAR_ID
+
+transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar('transaction_connection', default=None)
+
+
+class ConnectionLease:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def close(self):
+        pass
+
+    def commit(self):
+        pass
+
+
+@contextmanager
+def database_transaction(rollback: bool = False):
+    if transaction_connection.get() is not None:
+        raise RuntimeError('Nested database transaction')
+    with closing(open_database()) as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        token = transaction_connection.set(connection)
+        try:
+            yield connection
+            if rollback:
+                connection.rollback()
+            else:
+                connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            transaction_connection.reset(token)
 
 
 def now_iso() -> str:
@@ -11,6 +48,9 @@ def now_iso() -> str:
 
 
 def open_database() -> sqlite3.Connection:
+    existing = transaction_connection.get()
+    if existing is not None:
+        return ConnectionLease(existing)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DB_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
@@ -37,6 +77,16 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_messages_conversation
                 ON messages(conversation_id, id);
+            CREATE TABLE IF NOT EXISTS schedule_proposals (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL UNIQUE,
+                actions_json TEXT NOT NULL,
+                baseline_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending', 'applied', 'invalid')),
+                result_json TEXT,
+                response_message_id INTEGER,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
                 category TEXT NOT NULL CHECK(category IN ('fact', 'preference', 'episode')),

@@ -24,6 +24,7 @@ from planning import (
 )
 from tasks import TASK_TOOLS, execute_task_tool
 from reminders import REMINDER_TOOLS, execute_reminder_tool, is_notice_reply, reminder_context
+from schedule_proposals import PROPOSAL_TOOLS, apply_approved_proposal, is_approval, proposal_context, propose_schedule, reply_proposal_id, verify_schedule_reply
 from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
 router = APIRouter()
@@ -34,6 +35,13 @@ DEFAULT_PERSONA = (
 )
 SYSTEM_PROMPT = (
     '予定やタスクを整理し、根拠と不確実性を明確にして簡潔に回答してください。'
+    '予定・タスク・作業枠を区別してください。練習等のやることはタスク、その実行時間はschedule_taskで保存する作業枠、食事や会議等の時間を確保する出来事は通常の予定です。'
+    'タスク本体を作っただけでカレンダーへ入れたと述べないでください。「今日やりたい」を必ず今日締切と決めつけず、実施希望日と締切を区別してください。'
+    '所要時間・食事の終了時刻が不明なら尋ねてください。未指定の時間を事実として補って保存してはいけません。'
+    '日程を相談して案を提示する場合は必ずpropose_scheduleに具体的な操作を渡し、検証が成功した案だけを未反映の提案として説明し、了承を尋ねてください。'
+    '複数の予定や作業枠の再調整は、食事等の固定予定とタスク枠の移動を同じpropose_scheduleの案に含めてください。単独の明確な操作依頼は既存ツールで直接実行できます。'
+    '提案後の「お願いします」は保存済みの案への了承です。提案がない場合は何への了承か特定し、不明なら確認してください。'
+    '誤認識された名前の訂正は同じIDのタイトル変更です。日時・所要時間・割当はそのまま維持し、古い会話の時刻へ戻さないでください。'
     'NORN内の予定の検索・追加・変更・削除は、ユーザーから明確に依頼されたら承認を求めず予定ツールで実行してください。'
     '対象や日時など実行に必要な情報が曖昧または不足している場合に限り、その情報を質問してください。'
     '「14時29分に」のような日時だけの発言を、予定検索の質問だと決めつけないでください。直前の会話の日時指定なら引き継ぎ、対象がなければ「その時間に何をする？」と作業名だけを尋ねてください。'
@@ -104,12 +112,15 @@ class AutomaticTaskIntent(BaseModel):
     task_id: str | None = None
     due_date: date | None = None
     due_evidence: str = ''
+    preferred_date: date | None = None
+    preferred_date_evidence: str = ''
     estimated_minutes: int | None = Field(default=None, ge=1, le=1440)
     estimate_evidence: str = ''
     start_at: datetime | None = None
     start_evidence: str = ''
     defer_scheduling: bool = False
     defer_evidence: str = ''
+    continue_dialogue: bool = False
 
 
 AUTOMATIC_TASK_PROMPT = (
@@ -119,6 +130,7 @@ AUTOMATIC_TASK_PROMPT = (
     '否定、登録拒否、単なる質問、仮定、引用、他人の作業、完了済み、願望だけの雑談、架空の演技はactionsを空にする。'
     'タスクの登録依頼や、希望日時に続く「作業名を追加して」も対象とし、先に話した希望日時を引き継いで保存する。'
     '予定・目標・プロジェクトの登録や、削除・完了などの操作はこの判定では扱わず、通常の会話処理へ任せる。'
+    '食事・会議等の時間を確保する出来事は通常の予定であり、自動タスクとして登録しない。'
     'ただし直前に登録したタスクの所要時間・希望日時への返答や、既存タスクへの時間割当の依頼は、この判定で既存task_idに紐付ける。'
     '「30分」「明日の14時から」「空いている時間で」のような短い返答でも、会話から対象タスクが一意なら扱う。対象が曖昧ならactionsを空にして確認を会話側に任せる。'
     '既存タスクと同じ目的・対象ならそのtask_idを使う。単に同じ作業を言い直しただけならactionsは空。'
@@ -126,17 +138,30 @@ AUTOMATIC_TASK_PROMPT = (
     '追加の場合のみtask_idをnullにする。最大3件。タイトルは実作業を短く表す。'
     'evidenceには必ず最新user発言から根拠をそのまま引用する。'
     '期限や所要時間は本人が明示した場合だけ設定し、未指定はnull。'
-    '「今日」「明日」は現在日時から日付を解決しdue_dateをYYYY-MM-DDにする。'
+    '「今日やりたい」「今日がいい」は締切ではなく実施希望日。preferred_dateをYYYY-MM-DDにしpreferred_date_evidenceにuserの根拠を引用する。'
+    'due_dateは「今日中に終える」「明日まで」等、締切が明示された場合だけ設定する。実施希望日は同じ依頼の直近user発言から引き継げる。'
     'due_evidenceとestimate_evidenceにはそれぞれ最新発言中の日付・時間の根拠をそのまま入れる。'
     '開始日時が明示されていればstart_atをタイムゾーン付きISO8601にし、start_evidenceに根拠を引用する。未指定の開始時刻は補わない。'
     '作業名や所要時間を後から答えた場合、直前の日時だけの発言を含め、同じ依頼について直近のuser発言で指定済みの希望日時も引き継ぐ。その根拠は該当user発言から引用する。最新の日時指定を優先する。'
     '時間割当は後で・不要と本人が述べた場合はdefer_schedulingをtrueにしdefer_evidenceへ最新発言の根拠を引用する。'
     '優先度、プロジェクト、説明、架空の予定は補わない。形式は'
     '{"actions":[{"title":"作業名","task_id":null,"evidence":"最新発言の根拠",'
-    '"due_date":null,"due_evidence":"","estimated_minutes":null,"estimate_evidence":"",'
-    '"start_at":null,"start_evidence":"","defer_scheduling":false,"defer_evidence":""}]}。'
+    '"due_date":null,"due_evidence":"","preferred_date":null,"preferred_date_evidence":"","estimated_minutes":null,"estimate_evidence":"",'
+    '"start_at":null,"start_evidence":"","defer_scheduling":false,"defer_evidence":"","continue_dialogue":false}]}。'
+    '同じ最新発言に食事等の予定追加や複数対象の再調整など他の操作が含まれる場合はcontinue_dialogueをtrueにし、タスク保存だけで返答を終了させない。'
+    '複数予定の再調整への了承、assistant提案だけからの時間の補完はこの判定では扱わず、actionsを空にして通常のツール経路へ任せる。'
+    '名前の訂正だけなら過去の開始日時や所要時間を再設定しない。開始日時を変える明示的な依頼がある場合だけstart_atを設定する。'
 )
 automatic_task_lock = asyncio.Lock()
+ACTION_COMPLETION_PATTERN = re.compile(
+    r'(?:登録|追加|保存|変更|移動|更新|削除|解除|割り当て|割当|確保|延長|反映|設定|入れ|組み直|組みなお|組ん)'
+    r'[^。！？\n]{0,28}(?:しました|ました|したよ|したから|ておいた|ておきました|ておくね|ておくよ|できた|できました|完了|済み|たよ|でおいた|でおきました|めた)'
+)
+
+
+def has_action_completion(text: str) -> bool:
+    clauses = re.split(r'[。！？\n]|けど|ですが|ものの', text)
+    return any(ACTION_COMPLETION_PATTERN.search(clause) and not re.search(r'失敗|できな|できません|していません|未登録|未反映|未確定', clause) for clause in clauses)
 
 
 def allocate_automatic_task(result, intent, latest, user_messages):
@@ -152,18 +177,25 @@ def allocate_automatic_task(result, intent, latest, user_messages):
     ) else None
     if preferred is not None and preferred.tzinfo is None:
         preferred = preferred.replace(tzinfo=LOCAL_TIMEZONE)
+    preferred_day = intent.preferred_date if intent.preferred_date_evidence.strip() and any(intent.preferred_date_evidence in text for text in user_messages) else None
     if task['estimated_minutes'] is None:
-        result['scheduling'] = {'state': 'needs_estimate', 'preferred_start': preferred.isoformat() if preferred else None}
+        result['scheduling'] = {'state': 'needs_estimate', 'preferred_start': preferred.isoformat() if preferred else None,
+                                'preferred_date': preferred_day.isoformat() if preferred_day else None}
         return result
-    if task.get('scheduled_start') and preferred is None:
-        result['scheduling'] = {'state': 'scheduled', 'start_at': task['scheduled_start'], 'end_at': task['scheduled_end']}
+    if task.get('scheduled_start') and preferred is None and preferred_day is None:
+        result['scheduling'] = {'state': 'scheduled', 'start_at': task['scheduled_start'], 'end_at': task['scheduled_end'], 'unchanged': True}
         return result
     if preferred is not None:
         start = preferred.isoformat()
     else:
         now = datetime.now(LOCAL_TIMEZONE)
+        search_from = max(now, datetime.combine(preferred_day, time.min, LOCAL_TIMEZONE)) if preferred_day else now
         through = datetime.fromisoformat(task['due_at']) if task.get('due_at') else now
-        if not task.get('due_at'):
+        if preferred_day:
+            through = datetime.combine(preferred_day, time(23, 59, 59), LOCAL_TIMEZONE)
+            if task.get('due_at'):
+                through = min(through, datetime.fromisoformat(task['due_at']))
+        elif not task.get('due_at'):
             business_days = 0
             while business_days < 5:
                 through += timedelta(days=1)
@@ -171,11 +203,11 @@ def allocate_automatic_task(result, intent, latest, user_messages):
                     business_days += 1
             through = through.replace(hour=23, minute=59, second=59, microsecond=0)
         through = min(through, now + timedelta(days=31))
-        if through <= now:
+        if through <= search_from:
             result['scheduling'] = {'state': 'unavailable', 'error': '期限を過ぎているため時間枠を割り当てられません。'}
             return result
         available = execute_task_tool('find_task_slots', {
-            'task_id': task['id'], 'from_at': now.isoformat(), 'through_at': through.isoformat(), 'limit': 1,
+            'task_id': task['id'], 'from_at': search_from.isoformat(), 'through_at': through.isoformat(), 'limit': 1,
         })
         if not available.get('ok') or not available.get('slots'):
             result['scheduling'] = {'state': 'unavailable', 'error': available.get('error', '期限内に割り当てられる空き時間がありません。')}
@@ -204,6 +236,8 @@ def allocate_automatic_task(result, intent, latest, user_messages):
 async def prepare_automatic_tasks(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
     latest = next((message['content'] for message in reversed(messages) if message['role'] == 'user'), '')
     if not latest.strip():
+        return []
+    if re.search(r'提案|案(?:を|が|に)|組み直|組みなお|組み替|再調整|再計画|スケジュール|ずら|移動|その後|ご飯の後|食事の後|動か', latest):
         return []
     async with automatic_task_lock:
         existing = execute_task_tool('list_tasks', {}).get('tasks', [])
@@ -261,7 +295,13 @@ async def prepare_automatic_tasks(messages: list[dict[str, str]]) -> list[dict[s
             if result.get('ok') and result.get('task'):
                 by_id[result['task']['id']] = result['task']
             user_messages = [message['content'] for message in messages if message['role'] == 'user'][-8:]
-            results.append(allocate_automatic_task(result, intent, latest, user_messages))
+            if intent.task_id and set(changes) <= {'title'} and intent.start_at is None and intent.preferred_date is None and result.get('task', {}).get('scheduled_start'):
+                result['scheduling'] = {'state': 'scheduled', 'start_at': result['task']['scheduled_start'], 'end_at': result['task']['scheduled_end'], 'unchanged': True}
+                results.append(result)
+            else:
+                results.append(allocate_automatic_task(result, intent, latest, user_messages))
+            if intent.continue_dialogue:
+                results[-1]['continue_dialogue'] = True
         return results
 
 
@@ -296,17 +336,19 @@ def build_system_prompt() -> str:
     )
 
 
-async def generate_action_reply(system_prompt: str, messages: list[dict[str, Any]], results: list[dict[str, Any]]) -> str:
+async def generate_action_reply(system_prompt: str, messages: list[dict[str, Any]], results: list[dict[str, Any]], retry: bool = True) -> str:
+    system_prompt += proposal_context(None)
     payload = {
         'model': LLM_MODEL,
         'temperature': 0.2,
         'messages': [
             {'role': 'system', 'content': system_prompt + (
-                '\n操作は終了しています。以下のサーバー実行結果だけを根拠に、利用者への最終返答を自然な日本語で生成してください。'
+                '\n以下のサーバー実行結果だけを根拠に、利用者への最終返答を自然な日本語で生成してください。'
                 'ツールの再実行はできません。キャラクターの口調を保ち、結果の定型summaryを連結せず、短く一度だけ伝えてください。'
                 'タスク本体の保存と時間枠の確定を区別してください。割当が失敗した場合は、未割当であることと理由を必ず伝えてください。'
                 '既に示された日時・所要時間は聞き直さず、不足している情報だけを尋ねてください。'
                 '候補は未確定として提案し、ユーザーの了承なく別時刻へ移動したと述べないでください。'
+                'stateがproposedならまだ予定に反映していません。提案の各日時と対象を説明して了承を尋ね、登録済みと述べないでください。'
                 '\nサーバー実行結果:\n'
             ) + json.dumps(results, ensure_ascii=False)},
             *[message for message in messages if message['role'] in {'user', 'assistant'} and isinstance(message.get('content'), str)],
@@ -323,6 +365,14 @@ async def generate_action_reply(system_prompt: str, messages: list[dict[str, Any
         content = message.get('content')
         if message.get('tool_calls') or not isinstance(content, str) or not content.strip():
             raise ValueError('Missing final reply')
+        if has_action_completion(content) and not any(result.get('ok') and (result.get('summary') or result.get('task')) for result in results):
+            raise ValueError('Completion without a successful operation')
+        schedule_results = any(result.get('tool') in {tool['function']['name'] for tool in [*SCHEDULE_TOOLS, *TASK_TOOLS, *REMINDER_TOOLS, *PROPOSAL_TOOLS]}
+                               or result.get('task') or result.get('scheduling') or result.get('state') == 'proposed' for result in results)
+        if schedule_results and not await verify_schedule_reply(content, results, has_action_completion(content)):
+            if retry:
+                return await generate_action_reply(system_prompt + '\n前の返答は保存状態と一致しませんでした。現在のDBと実行結果を優先し、未保存・失敗・提案中を明確に説明してください。', messages, results, retry=False)
+            raise ValueError('Reply does not match persisted schedule')
         return content.strip()
     except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError) as error:
         logger.warning('Action reply generation failed: %s', type(error).__name__)
@@ -335,7 +385,13 @@ async def generate_llm_reply(
     headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
     local_now = datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes')
     system_prompt = build_system_prompt()
+    system_prompt += proposal_context(conversation_id)
     notice_context = reminder_context(conversation_id)
+    latest = next((message['content'] for message in reversed(messages) if message['role'] == 'user'), '')
+    approved_results = apply_approved_proposal(conversation_id, latest)
+    if approved_results is not None:
+        return await generate_action_reply(build_system_prompt() + proposal_context(conversation_id), messages, approved_results)
+    proposal_only = bool(re.search(r'提案|案(?:を|が|に)|組み直|組みなお|組み替|再調整|再計画|スケジュール.*(?:組|立|調整)', latest)) or is_approval(latest)
     answering_extension = is_notice_reply(conversation_id)
     automatic_results = [] if answering_extension else await prepare_automatic_tasks(messages)
     automatic_context = (
@@ -352,17 +408,22 @@ async def generate_llm_reply(
         *messages,
     ]
     completed_actions: list[dict[str, Any]] = [result for result in automatic_results if result.get('ok') and (result.get('task') or result.get('summary'))]
-    if completed_actions:
+    if completed_actions and not any(result.get('continue_dialogue') for result in automatic_results):
         return await generate_action_reply(llm_messages[0]['content'], messages, automatic_results)
     seen_tool_calls: set[tuple[str, str]] = set()
-    tool_results: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = list(automatic_results)
+    ungrounded_replies = 0
+    schedule_turn = any(re.search(r'予定|スケジュール|タスク|作業枠|練習|食事|ご飯|割当|移動', message['content']) for message in messages[-8:] if message['role'] == 'user')
 
     for _ in range(8):
+        available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *PROPOSAL_TOOLS]
+        if proposal_only:
+            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'propose_schedule'}]
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
-            'tools': [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS],
-            'tool_choice': 'auto',
+            'tools': available_tools,
+            'tool_choice': 'required' if ungrounded_replies else 'auto',
             'temperature': 0.2,
         }
         try:
@@ -398,6 +459,15 @@ async def generate_llm_reply(
         if not tool_calls:
             content = assistant_message.get('content')
             if isinstance(content, str) and content.strip():
+                unsupported = has_action_completion(content) and not completed_actions
+                if not unsupported and schedule_turn:
+                    unsupported = not await verify_schedule_reply(content, tool_results, has_action_completion(content))
+                if unsupported:
+                    if ungrounded_replies:
+                        return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
+                    ungrounded_replies += 1
+                    llm_messages.append({'role': 'system', 'content': 'まだ成功した保存操作がありません。登録・変更済みと述べてはいけません。必要なツールを実行し、不足情報があれば未実行であることを説明してください。'})
+                    continue
                 return content.strip()
             if completed_actions:
                 return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
@@ -414,6 +484,7 @@ async def generate_llm_reply(
             raw_arguments = function.get('arguments') or '{}'
             call_id = tool_call.get('id') or str(uuid.uuid4())
             call_key = (name, raw_arguments)
+            arguments: dict[str, Any] = {}
             try:
                 arguments = json.loads(raw_arguments)
                 if not isinstance(arguments, dict):
@@ -423,11 +494,14 @@ async def generate_llm_reply(
                     'create_task', 'update_task', 'complete_task', 'delete_task',
                     'schedule_task', 'unschedule_task',
                     'extend_schedule',
+                    'propose_schedule',
                     'save_memory', 'update_memory', 'forget_memory',
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
                 }
-                if name in mutating_tools and call_key in seen_tool_calls:
+                if proposal_only and name in mutating_tools and name != 'propose_schedule':
+                    result = {'ok': False, 'error': '今回は提案の相談です。直接変更せずpropose_scheduleで未反映の案を作成してください。'}
+                elif name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
                 else:
                     if name in mutating_tools:
@@ -446,6 +520,8 @@ async def generate_llm_reply(
                         result = await asyncio.to_thread(execute_goal_project_tool, name, arguments)
                     elif name == 'extend_schedule':
                         result = execute_reminder_tool(arguments)
+                    elif name == 'propose_schedule':
+                        result = propose_schedule(conversation_id, arguments)
                     elif name in task_tools:
                         result = execute_task_tool(name, arguments)
                     else:
@@ -453,14 +529,19 @@ async def generate_llm_reply(
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 result = {'ok': False, 'error': f'ツール引数が不正です: {error}'}
 
-            tool_results.append({'tool': name, **result})
+            tool_results.append({'tool': name, 'arguments': arguments, **result})
             if result.get('ok') and result.get('summary'):
                 completed_actions.append(result)
+                ungrounded_replies = 0
             llm_messages.append({
                 'role': 'tool',
                 'tool_call_id': call_id,
                 'content': json.dumps(result, ensure_ascii=False),
             })
+        if any(result.get('state') == 'proposed' for result in tool_results):
+            latest_proposal = next(result for result in reversed(tool_results) if result.get('state') == 'proposed')
+            committed = [result for result in tool_results if result.get('ok') and result.get('state') != 'proposed' and (result.get('summary') or result.get('task'))]
+            return await generate_action_reply(build_system_prompt() + proposal_context(conversation_id), messages, [*committed, latest_proposal])
         if any(not result.get('ok') and result.get('error') == '同じツール呼び出しを重複実行しませんでした。' for result in tool_results):
             return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
 
@@ -664,7 +745,12 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
     review_context = format_goal_review_context(due_goal_reviews)
     if review_context:
         history.insert(0, {'role': 'system', 'content': review_context})
-    reply = await generate_llm_reply(history, conversation_id)
+    proposal_token = reply_proposal_id.set(None)
+    try:
+        reply = await generate_llm_reply(history, conversation_id)
+        delivered_proposal_id = reply_proposal_id.get()
+    finally:
+        reply_proposal_id.reset(proposal_token)
     timestamp = now_iso()
 
     with closing(open_database()) as connection:
@@ -682,6 +768,12 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
                 (conversation_id, 'user', content, timestamp),
                 (conversation_id, 'assistant', reply, timestamp),
             ],
+        )
+        connection.execute(
+            '''UPDATE schedule_proposals SET response_message_id =
+               (SELECT MAX(id) FROM messages WHERE conversation_id = ?)
+                    WHERE conversation_id = ? AND id = ?''',
+                (conversation_id, conversation_id, delivered_proposal_id),
         )
         connection.commit()
 

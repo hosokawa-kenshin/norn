@@ -14,7 +14,8 @@ from wake_calibration import MAX_BYTES, store_clip
 
 
 router = APIRouter()
-PHRASE = 'ノルン'
+PHRASE = 'ねぇノルン'
+DETECTION_WORDS = ('ねえ', 'ノルン')
 connections = asyncio.Semaphore(2)
 calibration_lock = threading.Lock()
 
@@ -39,7 +40,7 @@ def register_initial_calibration(contents):
             load_profile(PROFILE_PATH)
             return {'calibrated': True, 'examples': registered['examples']}
         except ValueError as error:
-            raise HTTPException(status_code=422, detail='録音を登録できませんでした。1秒ずつあけて「ノルン」を4回録音してください。') from error
+            raise HTTPException(status_code=422, detail=f'録音を登録できませんでした。1秒ずつあけて「{PHRASE}」を4回録音してください。') from error
         except OSError as error:
             settings.logger.warning('Initial wake calibration storage failed: %s', type(error).__name__)
             raise HTTPException(status_code=503, detail='キャリブレーションを保存できません。') from error
@@ -58,7 +59,7 @@ def get_keyword_model():
 
     SetLogLevel(-1)
     model = Model(str(MODEL_DIR))
-    if model.vosk_model_find_word(PHRASE) < 0:
+    if any(model.vosk_model_find_word(word) < 0 for word in DETECTION_WORDS):
         raise RuntimeError('The Japanese model does not contain the wake word')
     return model
 
@@ -79,7 +80,7 @@ class KeywordDetector:
     def reset(self):
         from vosk import KaldiRecognizer
 
-        self.recognizer = KaldiRecognizer(self.model, 16000, json.dumps([PHRASE, '[unk]'], ensure_ascii=False))
+        self.recognizer = KaldiRecognizer(self.model, 16000, json.dumps([' '.join(DETECTION_WORDS), '[unk]'], ensure_ascii=False))
         self.recognizer.SetWords(True)
         if getattr(self, 'personal', None) is not None:
             self.personal.reset()
@@ -100,10 +101,14 @@ class KeywordDetector:
             result = json.loads(self.recognizer.Result())
             words = result.get('result', [])
             detected = any(
-                word.get('word') == PHRASE
-                and word.get('conf', 0) >= 0.9
-                and word.get('end', 0) - word.get('start', 0) >= 0.15
-                for word in words
+                prefix.get('word') == DETECTION_WORDS[0]
+                and name.get('word') == DETECTION_WORDS[1]
+                and prefix.get('conf', 0) >= 0.9
+                and name.get('conf', 0) >= 0.9
+                and prefix.get('end', 0) - prefix.get('start', 0) >= 0.08
+                and name.get('end', 0) - name.get('start', 0) >= 0.15
+                and 0 <= name.get('start', 0) - prefix.get('end', 0) <= 0.8
+                for prefix, name in zip(words, words[1:])
             )
             if detected:
                 self.reset()

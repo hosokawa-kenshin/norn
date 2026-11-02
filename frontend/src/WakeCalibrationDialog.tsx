@@ -137,7 +137,7 @@ export default function WakeCalibrationDialog({ onComplete, onDismiss }: Props) 
           <div><div className="eyebrow">VOICE SETUP</div><h2 id="wake-setup-title">初回音声セットアップ</h2></div>
           <button className="icon-button" type="button" title="後で設定する" aria-label="後で設定する" disabled={phase === 'saving'} onClick={onDismiss}><X size={17} /></button>
         </div>
-        <p>いつもの声で「ノルン」を4回、1秒程度ずつあけて話してください。</p>
+        <p>いつもの声で「ねぇノルン」を4回、1秒程度ずつあけて話してください。</p>
         <p className="settings-help">このPC内だけで調整し、音声は外部へ送信しません。登録後は音響特徴のみを保存し、原音は削除します。</p>
         <label className="wake-calibration-consent"><input type="checkbox" checked={consent} disabled={busy || phase === 'recording'} onChange={(event) => setConsent(event.target.checked)} />音声特徴をこのPCに登録することに同意する</label>
         <div className="wake-calibration-recorder">

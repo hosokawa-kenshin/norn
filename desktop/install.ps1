@@ -96,7 +96,7 @@ if ($SmokeTest) {
             $Synth.SelectVoice($JapaneseVoice.VoiceInfo.Name)
             $Format = [System.Speech.AudioFormat.SpeechAudioFormatInfo]::new(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
             $Synth.SetOutputToWaveFile((Join-Path $ApplicationDirectory 'frontend\voice\desktop-smoke-norn.wav'), $Format)
-            $Synth.Speak('ノルン。')
+            $Synth.Speak('ねえ、ノルン。')
         }
         $Synth.Dispose()
     } catch { Write-Output 'Synthetic Japanese voice unavailable; skipping virtual-audio test.' }

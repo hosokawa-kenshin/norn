@@ -38,8 +38,14 @@ def enroll(recording: Path, destination=PROFILE_PATH):
     if rate != 16000 or audio.ndim != 1 or not np.isfinite(audio).all():
         raise ValueError('Enrollment requires finite 16kHz mono audio')
     intervals = librosa.effects.split(audio, top_db=25, frame_length=512, hop_length=160)
-    templates = []
+    examples = []
     for start, end in intervals:
+        if examples and start - examples[-1][1] <= int(rate * 0.6):
+            examples[-1][1] = end
+        else:
+            examples.append([start, end])
+    templates = []
+    for start, end in examples:
         value = features(audio[start:end])
         if value is not None:
             templates.append(value)

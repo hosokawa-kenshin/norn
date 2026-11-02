@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import stat
@@ -23,6 +24,7 @@ import planning as planning_module
 import settings as settings_module
 import tasks as tasks_module
 import reminders as reminders_module
+import schedule_proposals as proposals_module
 import voice as voice_module
 import tts as tts_module
 import wake as wake_module
@@ -48,6 +50,80 @@ def mock_notice_generation(monkeypatch):
 
     monkeypatch.setattr(reminders_module, 'generate_notice_text', fake_notice)
     return original
+
+
+@pytest.fixture(autouse=True)
+def mock_schedule_grounding(monkeypatch):
+    original = proposals_module.verify_schedule_reply
+
+    async def accept_mock_reply(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(chat_module, 'verify_schedule_reply', accept_mock_reply)
+    return original
+
+
+@pytest.mark.parametrize('bad_claim', ['wrong_time', 'no_operation', 'missing_record', 'unsupported', 'wrong_entity', 'quota'])
+def test_schedule_reply_checks_claims_against_database(monkeypatch, tmp_path, future_task_start, bad_claim):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'grounding.sqlite3')
+    encode_json = json.dumps
+    verdict = {'supported': True, 'claims': []}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            if verdict.get('quota'):
+                response = httpx.Response(429, request=httpx.Request('POST', url))
+                response.raise_for_status()
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'choices': [{'message': {'content': encode_json(verdict)}}]})
+
+    monkeypatch.setattr(proposals_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '練習', 'estimated_minutes': 60}).json()
+        allocation = client.put(f'/api/tasks/{task["id"]}/schedule', json={'start_at': future_task_start.isoformat()}).json()
+        results = [{'tool': 'schedule_task', 'ok': True, 'allocation': allocation}]
+        verdict['claims'] = [{'kind': 'allocation', 'id': task['id'], 'fields': {'start_at': allocation['start_at']}, 'changed': True}]
+        assert asyncio.run(proposals_module.verify_schedule_reply('練習枠を保存したよ。', results, True))
+        verdict['claims'][0]['fields'] = {'scheduled_start': allocation['start_at']}
+        assert asyncio.run(proposals_module.verify_schedule_reply('練習枠を保存したよ。', results, True))
+        verdict['claims'][0]['fields'] = {'start_at': allocation['start_at']}
+        if bad_claim == 'wrong_time':
+            verdict['claims'][0]['fields']['start_at'] = (future_task_start + timedelta(hours=1)).isoformat()
+        elif bad_claim == 'no_operation':
+            results = []
+        elif bad_claim == 'missing_record':
+            verdict['claims'][0]['id'] = str(uuid.uuid4())
+        elif bad_claim == 'wrong_entity':
+            results = [{'tool': 'update_task', 'ok': True, 'task': task, 'summary': '名前を変更しました。'}]
+        elif bad_claim == 'quota':
+            verdict['quota'] = True
+        else:
+            verdict['supported'] = False
+        if bad_claim == 'quota':
+            with pytest.raises(proposals_module.HTTPException) as error:
+                asyncio.run(proposals_module.verify_schedule_reply('練習枠を保存したよ。', results, True))
+            assert error.value.status_code == 429
+        else:
+            assert not asyncio.run(proposals_module.verify_schedule_reply('練習枠を保存したよ。', results, True))
+
+
+@pytest.mark.parametrize(('text', 'expected'), [
+    ('予定に入れました。', True),
+    ('作業枠を移動しておいたよ。', True),
+    ('保存に失敗しました。', False),
+    ('予定はまだ未確定だよ。', False),
+    ('タスクは保存しましたけど、作業枠の登録には失敗しました。', True),
+])
+def test_schedule_completion_detection_distinguishes_failure(text, expected):
+    assert chat_module.has_action_completion(text) == expected
 
 
 @pytest.mark.parametrize('boundary', ['start_at', 'end_at'])
@@ -357,6 +433,269 @@ def future_task_start():
     return start.replace(hour=14, minute=0, second=0, microsecond=0)
 
 
+def test_chat_rejects_success_text_without_saved_operation(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'ungrounded.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    payloads = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            payloads.append(json)
+            return SimpleNamespace(is_error=False, raise_for_status=lambda: None,
+                                   json=lambda: {'choices': [{'message': {'content': '17時から19時に予定を入れました。'}}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={'content': '練習を17時から19時に移動して'})
+        assert response.status_code == 502
+        assert client.get('/api/tasks').json() == []
+        assert client.get('/api/events').json() == []
+    assert payloads[1]['tool_choice'] == 'required'
+    assert len(payloads) == 3
+
+
+def test_chat_invalid_tool_json_does_not_create_records(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'invalid-tool-json.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            calls.append(json)
+            message = {'content': '日時をもう一度教えて。'} if len(calls) > 1 else {
+                'content': None, 'tool_calls': [{'id': 'invalid', 'type': 'function', 'function': {'name': 'create_event', 'arguments': '{invalid'}}],
+            }
+            return SimpleNamespace(is_error=False, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={'content': '予定を追加して'})
+        assert response.status_code == 200
+        assert client.get('/api/events').json() == []
+
+
+def test_schedule_proposal_is_pending_then_applies_atomically(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'proposal.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '練習', 'estimated_minutes': 60}).json()
+        client.put(f'/api/tasks/{task["id"]}/schedule', json={'start_at': future_task_start.isoformat()})
+        conversation_id = str(uuid.uuid4())
+        proposal = proposals_module.propose_schedule(conversation_id, {'actions': [
+            {'name': 'schedule_task', 'arguments_json': json.dumps({'task_id': task['id'], 'start_at': (future_task_start + timedelta(hours=1)).isoformat()})},
+            {'name': 'create_event', 'arguments_json': json.dumps({'title': '食事', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(hours=1)).isoformat()})},
+        ]})
+        assert proposal['ok'] and proposal['state'] == 'proposed'
+        assert client.get('/api/events').json() == []
+        assert client.get('/api/tasks').json()[0]['scheduled_start'] == future_task_start.isoformat()
+        with closing(database_module.open_database()) as connection:
+            timestamp = database_module.now_iso()
+            connection.execute('INSERT INTO conversations VALUES (?, ?, ?, ?)', (conversation_id, '提案', timestamp, timestamp))
+            message_id = connection.execute('INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)', (conversation_id, 'assistant', '食事と練習をこの案にする？', timestamp)).lastrowid
+            connection.execute('UPDATE schedule_proposals SET response_message_id = ? WHERE conversation_id = ?', (message_id, conversation_id))
+            connection.commit()
+        result = proposals_module.apply_approved_proposal(conversation_id, 'お願いします')
+        assert all(item['ok'] for item in result)
+        assert len(client.get('/api/events').json()) == 1
+        assert client.get('/api/tasks').json()[0]['scheduled_start'] == (future_task_start + timedelta(hours=1)).isoformat()
+
+
+def test_schedule_proposal_invalid_work_hours_rolls_back(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'proposal-rollback.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '作曲', 'estimated_minutes': 120}).json()
+        result = proposals_module.propose_schedule(str(uuid.uuid4()), {'actions': [
+            {'name': 'create_event', 'arguments_json': json.dumps({'title': '食事', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(hours=1)).isoformat()})},
+            {'name': 'schedule_task', 'arguments_json': json.dumps({'task_id': task['id'], 'start_at': future_task_start.replace(hour=19).isoformat()})},
+        ]})
+        assert not result['ok'] and '作業時間' in result['error']
+        assert client.get('/api/events').json() == []
+        assert client.get('/api/tasks').json()[0]['scheduled_start'] is None
+
+
+@pytest.mark.parametrize('scenario', ['normal', 'changed', 'reply_lost'])
+def test_chat_approval_applies_saved_proposal_and_does_not_repeat(monkeypatch, tmp_path, future_task_start, scenario):
+    changed_schedule = scenario == 'changed'
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'proposal-chat.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    payloads = []
+    encode_json = json.dumps
+    actions = [{'name': 'create_event', 'arguments_json': encode_json({'title': '食事', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(hours=1)).isoformat()})}]
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            payloads.append(json)
+            if 'tools' in json:
+                message = {'content': None, 'tool_calls': [{'id': 'proposal', 'type': 'function', 'function': {'name': 'propose_schedule', 'arguments': encode_json({'actions': actions})}}]}
+            else:
+                message = {'content': '食事をこの時間にする？' if len(payloads) == 2 else '' if scenario == 'reply_lost' and len(payloads) == 3 else '予定が変わっているので案を作り直そう。' if changed_schedule else '食事の予定を保存したよ。'}
+            return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        initial = client.post('/api/chat', json={'content': '食事の予定案を出して'}).json()
+        assert client.get('/api/events').json() == []
+        if changed_schedule:
+            client.post('/api/events', json={'title': '別の予定', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(hours=1)).isoformat()})
+        approved = client.post('/api/chat', json={'conversation_id': initial['conversation_id'], 'content': 'お願いします'})
+        assert approved.status_code == (502 if scenario == 'reply_lost' else 200)
+        assert len(client.get('/api/events').json()) == 1
+        assert client.get('/api/events').json()[0]['title'] == ('別の予定' if changed_schedule else '食事')
+        repeated = client.post('/api/chat', json={'conversation_id': initial['conversation_id'], 'content': 'お願いします'})
+        assert repeated.status_code == 200 and len(client.get('/api/events').json()) == 1
+    assert 'tools' not in payloads[-1]
+
+
+def test_chat_does_not_bind_undelivered_proposal_to_unrelated_reply(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'undelivered-proposal.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+
+    async def greeting(*args):
+        return 'こんにちは。'
+
+    monkeypatch.setattr(chat_module, 'generate_llm_reply', greeting)
+    with TestClient(norn_app.app) as client:
+        conversation_id = str(uuid.uuid4())
+        with closing(database_module.open_database()) as connection:
+            timestamp = database_module.now_iso()
+            connection.execute('INSERT INTO conversations VALUES (?, ?, ?, ?)', (conversation_id, '会話', timestamp, timestamp))
+            connection.commit()
+        proposals_module.propose_schedule(conversation_id, {'actions': [
+            {'name': 'create_event', 'arguments_json': json.dumps({'title': 'まだ提示していない予定', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(hours=1)).isoformat()})},
+        ]})
+        response = client.post('/api/chat', json={'conversation_id': conversation_id, 'content': 'こんにちは'})
+        assert response.status_code == 200
+        with closing(database_module.open_database()) as connection:
+            row = connection.execute('SELECT response_message_id FROM schedule_proposals WHERE conversation_id = ?', (conversation_id,)).fetchone()
+        assert row['response_message_id'] is None
+        assert not proposals_module.apply_approved_proposal(conversation_id, 'お願いします')[0]['ok']
+        assert client.get('/api/events').json() == []
+
+
+def test_schedule_proposal_can_create_task_and_allocate_reference(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'proposal-reference.sqlite3')
+    with TestClient(norn_app.app) as client:
+        conversation_id = str(uuid.uuid4())
+        result = proposals_module.propose_schedule(conversation_id, {'actions': [
+            {'name': 'create_task', 'arguments_json': json.dumps({'title': '練習', 'estimated_minutes': 30})},
+            {'name': 'schedule_task', 'arguments_json': json.dumps({'task_id': '@0', 'start_at': future_task_start.isoformat()})},
+        ]})
+        assert result['ok'] and client.get('/api/tasks').json() == []
+        with closing(database_module.open_database()) as connection:
+            timestamp = database_module.now_iso()
+            connection.execute('INSERT INTO conversations VALUES (?, ?, ?, ?)', (conversation_id, '提案', timestamp, timestamp))
+            message_id = connection.execute('INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)', (conversation_id, 'assistant', '練習をこの枠にする？', timestamp)).lastrowid
+            connection.execute('UPDATE schedule_proposals SET response_message_id = ? WHERE conversation_id = ?', (message_id, conversation_id))
+            connection.commit()
+        applied = proposals_module.apply_approved_proposal(conversation_id, 'じゃあお願いします')
+        assert all(item['ok'] for item in applied)
+        saved = client.get('/api/tasks').json()
+        assert len(saved) == 1 and saved[0]['scheduled_start'] == future_task_start.isoformat()
+
+
+def test_automatic_task_preferred_date_is_not_deadline(monkeypatch, tmp_path, disable_real_speech_worker, future_task_start):
+    actions = [{'title': '練習', 'evidence': '練習を30分したい', 'estimated_minutes': 30, 'estimate_evidence': '30分',
+                'preferred_date': future_task_start.date().isoformat(), 'preferred_date_evidence': '明日'}]
+    configure_automatic_task_test(monkeypatch, tmp_path, disable_real_speech_worker, actions)
+    with TestClient(norn_app.app) as client:
+        response = client.post('/api/chat', json={'content': '明日、練習を30分したい'})
+        assert response.status_code == 200
+        saved = client.get('/api/tasks').json()[0]
+        assert saved['due_at'] is None
+        assert datetime.fromisoformat(saved['scheduled_start']).date() == future_task_start.date()
+
+
+def test_automatic_task_does_not_apply_a_requested_proposal(monkeypatch, tmp_path, disable_real_speech_worker, future_task_start):
+    actions = []
+    payloads = configure_automatic_task_test(monkeypatch, tmp_path, disable_real_speech_worker, actions)
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '練習', 'estimated_minutes': 60}).json()
+        client.put(f'/api/tasks/{task["id"]}/schedule', json={'start_at': future_task_start.isoformat()})
+        actions[:] = [{'title': '練習', 'task_id': task['id'], 'evidence': 'ずらす',
+                       'start_at': (future_task_start + timedelta(hours=1)).isoformat(), 'start_evidence': 'その後'}]
+        result = asyncio.run(disable_real_speech_worker([{'role': 'user', 'content': '食事のその後にずらす案を作って'}]))
+        assert result == [] and payloads == []
+        assert client.get('/api/tasks').json()[0]['scheduled_start'] == future_task_start.isoformat()
+
+
+def test_automatic_task_does_not_skip_other_event_operation(monkeypatch, tmp_path, disable_real_speech_worker, future_task_start):
+    actions = []
+    configure_automatic_task_test(monkeypatch, tmp_path, disable_real_speech_worker, actions)
+    encode_json = json.dumps
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            if 'response_format' in json:
+                message = {'content': encode_json({'actions': actions})}
+            elif 'tools' in json and not any(item['role'] == 'tool' for item in json['messages']):
+                message = {'content': None, 'tool_calls': [{'id': 'meal', 'type': 'function', 'function': {'name': 'create_event', 'arguments': encode_json({'title': '食事', 'start_at': future_task_start.replace(hour=12).isoformat(), 'end_at': future_task_start.replace(hour=13).isoformat()})}}]}
+            else:
+                message = {'content': '練習名と食事の予定を確認したよ。'}
+            return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '元の練習名', 'estimated_minutes': 30}).json()
+        actions[:] = [{'title': '正しい練習名', 'task_id': task['id'], 'evidence': '正しい練習名', 'continue_dialogue': True}]
+        response = client.post('/api/chat', json={'content': '正しい練習名に直して、明日12時から13時の食事も追加して'})
+        assert response.status_code == 200
+        assert client.get('/api/tasks').json()[0]['title'] == '正しい練習名'
+        assert client.get('/api/events').json()[0]['title'] == '食事'
+
+
+def test_automatic_task_rename_keeps_latest_allocation(monkeypatch, tmp_path, disable_real_speech_worker, future_task_start):
+    actions = []
+    configure_automatic_task_test(monkeypatch, tmp_path, disable_real_speech_worker, actions)
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '誤認識された練習名', 'estimated_minutes': 60}).json()
+        client.put(f'/api/tasks/{task["id"]}/schedule', json={'start_at': future_task_start.isoformat()})
+        actions[:] = [{'title': '正しい楽器の練習', 'task_id': task['id'], 'evidence': '正しい楽器の練習'}]
+        response = client.post('/api/chat', json={'content': '名前は正しい楽器の練習のことだよ'})
+        assert response.status_code == 200
+        saved = client.get('/api/tasks').json()
+        assert len(saved) == 1 and saved[0]['id'] == task['id']
+        assert saved[0]['scheduled_start'] == future_task_start.isoformat()
+        assert saved[0]['estimated_minutes'] == 60
+
+
 @pytest.mark.parametrize('failure', ['empty', 'timeout', 'duplicate', 'summary_failure'])
 def test_chat_generates_final_action_reply_without_tools(monkeypatch, tmp_path, failure):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'final-reply.sqlite3')
@@ -626,7 +965,7 @@ def test_wake_status_uses_japanese_norn(monkeypatch, tmp_path):
     monkeypatch.setattr(wake_module, 'model_available', lambda: True)
     with TestClient(norn_app.app) as client:
         status = client.get('/api/wake/status').json()
-    assert status['phrase'] == 'ノルン'
+    assert status['phrase'] == 'ねぇノルン'
     assert status['engine'] == 'vosk-ja-keyword-grammar'
     assert status['processing'] == 'local'
 
@@ -686,6 +1025,27 @@ def test_initial_calibration_failure_remains_required(monkeypatch, tmp_path):
     assert not list((tmp_path / 'wake-calibration').glob('*.wav'))
 
 
+def test_personal_wake_enrollment_keeps_prefix_and_name_together(monkeypatch, tmp_path):
+    import numpy as np
+    import personal_wake
+
+    intervals = np.array([[base, base + length] for offset in (0, 32000, 64000, 96000)
+                          for base, length in ((offset, 3200), (offset + 6400, 4800))])
+    monkeypatch.setattr(personal_wake.sf, 'read', lambda path: (np.ones(112000, dtype=np.float32), 16000))
+    monkeypatch.setattr(personal_wake.librosa.effects, 'split', lambda *args, **kwargs: intervals)
+    lengths = []
+
+    def fake_features(audio):
+        lengths.append(len(audio))
+        return np.eye(13, 30)
+
+    monkeypatch.setattr(personal_wake, 'features', fake_features)
+    monkeypatch.setattr(personal_wake, 'distance', lambda *args: 0.02)
+    result = personal_wake.enroll(tmp_path / 'synthetic.wav', destination=tmp_path / 'profile.npz')
+    assert result['examples'] == 4
+    assert lengths == [11200] * 4
+
+
 @pytest.mark.parametrize(('consent', 'mime', 'origin', 'expected'), [
     ('false', 'audio/wav', None, 400),
     ('true', 'text/plain', None, 415),
@@ -739,7 +1099,7 @@ def test_wake_waiting_audio_does_not_transcribe_or_chat(monkeypatch, tmp_path):
     monkeypatch.setattr(chat_module, 'generate_llm_reply', forbidden)
     with TestClient(norn_app.app) as client:
         with client.websocket_connect('/api/wake/listen', headers={'origin': settings_module.NORN_FRONTEND_URL}) as socket:
-            assert socket.receive_json()['phrase'] == 'ノルン'
+            assert socket.receive_json()['phrase'] == 'ねぇノルン'
             socket.send_bytes(b'silence')
             socket.send_text('reset')
             socket.send_bytes(b'norn-frame')
@@ -775,14 +1135,22 @@ def test_wake_rejects_invalid_frames(frame):
 
 
 @pytest.mark.parametrize(('words', 'expected'), [
-    ([{'word': 'ノルン', 'conf': 1.0, 'start': 0.1, 'end': 0.5}], True),
-    ([{'word': '[unk]', 'conf': 1.0, 'start': 0.0, 'end': 0.03}, {'word': 'ノルン', 'conf': 1.0, 'start': 0.1, 'end': 0.5}], True),
+    ([{'word': 'ねえ', 'conf': 1.0, 'start': 0.0, 'end': 0.2}, {'word': 'ノルン', 'conf': 1.0, 'start': 0.25, 'end': 0.6}], True),
+    ([{'word': '[unk]', 'conf': 1.0, 'start': 0.0, 'end': 0.03}, {'word': 'ねえ', 'conf': 1.0, 'start': 0.1, 'end': 0.3}, {'word': 'ノルン', 'conf': 1.0, 'start': 0.35, 'end': 0.7}], True),
+    ([{'word': 'ノルン', 'conf': 1.0, 'start': 0.1, 'end': 0.5}], False),
+    ([{'word': 'ねえ', 'conf': 1.0, 'start': 0.1, 'end': 0.5}], False),
+    ([{'word': 'ねえ', 'conf': 0.5, 'start': 0.0, 'end': 0.2}, {'word': 'ノルン', 'conf': 1.0, 'start': 0.25, 'end': 0.6}], False),
+    ([{'word': 'ねえ', 'conf': 1.0, 'start': 0.0, 'end': 0.2}, {'word': 'ノルン', 'conf': 0.5, 'start': 0.25, 'end': 0.6}], False),
+    ([{'word': 'ねえ', 'conf': 1.0, 'start': 0.0, 'end': 0.2}, {'word': 'ノルン', 'conf': 1.0, 'start': 0.25, 'end': 0.3}], False),
+    ([{'word': 'ねえ', 'conf': 1.0, 'start': 0.0, 'end': 0.2}, {'word': 'ノルン', 'conf': 1.0, 'start': 1.5, 'end': 1.9}], False),
+    ([{'word': 'ノルン', 'conf': 1.0, 'start': 0.0, 'end': 0.2}, {'word': 'ねえ', 'conf': 1.0, 'start': 0.25, 'end': 0.6}], False),
+    ([{'word': 'ねえ', 'conf': 1.0, 'start': 0.0, 'end': 0.2}, {'word': '[unk]', 'conf': 1.0, 'start': 0.2, 'end': 0.3}, {'word': 'ノルン', 'conf': 1.0, 'start': 0.35, 'end': 0.7}], False),
     ([{'word': '[unk]', 'conf': 1.0, 'start': 0.1, 'end': 0.5}], False),
     ([{'word': 'Hey Emma', 'conf': 1.0, 'start': 0.1, 'end': 0.5}], False),
     ([{'word': 'ノルン', 'conf': 0.5, 'start': 0.1, 'end': 0.5}], False),
     ([{'word': 'ノルン', 'conf': 1.0, 'start': 0.1, 'end': 0.12}], False),
 ])
-def test_wake_requires_confident_norn_token(monkeypatch, words, expected):
+def test_wake_requires_complete_confident_nee_norn_phrase(monkeypatch, words, expected):
     detector = object.__new__(wake_module.KeywordDetector)
     detector.recognizer = SimpleNamespace(
         AcceptWaveform=lambda frame: True,
@@ -1192,6 +1560,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
     assert tool_names == {
         'list_events', 'create_event', 'update_event', 'delete_event',
         'extend_schedule',
+        'propose_schedule',
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
         'find_task_slots', 'schedule_task', 'unschedule_task',
         'save_memory', 'search_memories', 'update_memory', 'forget_memory',
