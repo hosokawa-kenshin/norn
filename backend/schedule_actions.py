@@ -1,68 +1,39 @@
 import json
 import re
-import uuid
 from contextlib import closing
-from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from database import database_transaction, now_iso, open_database
+from database import database_transaction, open_database
 from events import execute_schedule_tool
 from tasks import LOCAL_TIMEZONE, PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS, execute_task_tool, plan_week_allocations
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, logger
 from llm_limits import check_llm_available, check_llm_response
 
-MAX_PROPOSE_SCHEDULE_ACTIONS = 8
+MAX_APPLY_SCHEDULE_ACTIONS = 8
 MAX_WEEK_PLAN_ACTIONS = 40
-reply_proposal_id: ContextVar[str | None] = ContextVar('reply_proposal_id', default=None)
 
 
-def invalidate_pending_proposal(conversation_id: str | None) -> None:
-    if not conversation_id:
-        return
-    with closing(open_database()) as connection:
-        connection.execute("UPDATE schedule_proposals SET state='invalid' WHERE conversation_id=? AND state='pending'", (conversation_id,))
-        connection.commit()
-    reply_proposal_id.set(None)
-
-
-def invites_approval_after_failed_proposal(text: str, results: list[dict[str, Any]]) -> bool:
-    failures = [result for result in results if result.get('tool') in {'propose_schedule', 'propose_routine'} and not result.get('ok')]
-    if not failures:
-        return False
-    for result in results:
-        if result.get('ok') and result.get('state') == 'proposed' and result.get('proposal_id'):
-            with closing(open_database()) as connection:
-                row = connection.execute("SELECT actions_json FROM schedule_proposals WHERE id=? AND state='pending'", (result['proposal_id'],)).fetchone()
-            if row and json.loads(row['actions_json']):
-                return False
-    return re.search(
-        r'(?:お願いします|承認|了承)[^。！？\n]{0,40}(?:言|返|もら|いただ|すれば|反映|保存|登録)|'
-        r'(?:この(?:案|内容|日程)|組んで)[^。！？\n]{0,30}(?:いい|よい|良い|大丈夫|進め)',
-        text,
-    ) is not None
-
-
-class ProposedAction(BaseModel):
+class ScheduleAction(BaseModel):
     model_config = ConfigDict(extra='forbid')
     name: Literal['create_event', 'update_event', 'create_task', 'update_task', 'schedule_task', 'create_task_allocation', 'unschedule_task', 'link_routine_occurrence']
     arguments_json: str = Field(min_length=2, max_length=8000)
 
 
-class ProposalPayload(BaseModel):
+class ScheduleBatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    actions: list[ProposedAction] = Field(min_length=1, max_length=MAX_WEEK_PLAN_ACTIONS)
+    actions: list[ScheduleAction] = Field(min_length=1, max_length=MAX_WEEK_PLAN_ACTIONS)
 
 
-PROPOSAL_TOOLS = [{
+BATCH_TOOLS = [{
     'type': 'function',
     'function': {
-        'name': 'propose_week_plan',
-        'description': '指定期間の未完了タスクを優先度・期限・依存関係・分割条件・1日85%の密度・適応型休憩に従って配置した週間案を、サーバーが作成して了承待ちとして保存する。まだ予定には反映しない。「今週のタスクを全部配置して」「1週間の予定を組んで」のような依頼で使い、操作の中身はサーバーが決める。返答はサーバーが生成する。',
+        'name': 'schedule_week_plan',
+        'description': '指定期間の未完了タスクを優先度・期限・依存関係・分割条件・1日85%の密度・適応型休憩に従ってサーバーが配置し、承認なしで作業枠として保存する。「今週のタスクを全部配置して」「1週間の予定を組んで」のような依頼で使い、操作の中身はサーバーが決める。全操作は一括で成功するか全て取り消される。返答はサーバーが生成する。',
         'parameters': {
             'type': 'object',
             'properties': {
@@ -75,12 +46,12 @@ PROPOSAL_TOOLS = [{
 }, {
     'type': 'function',
     'function': {
-        'name': 'propose_schedule',
-        'description': '予定と作業枠の変更案を検証し、了承待ちとして保存する。まだ予定には反映しない。食事等の固定予定とタスク枠の再配置を一つの案にする。schedule_taskはタスク全体を単一枠へ置き換える。複数枠へ分割する場合は各枠をcreate_task_allocation（task_id/start_at/end_at）で指定し、task_idは既存IDまたは@0等の先行操作番号を使う。create_eventはtitle/start_at/end_atが必須。update_taskはtask_idと変更項目を渡す。利用者が「お願いします」と了承したら保存済みの案をサーバーが実行する。',
+        'name': 'apply_schedule',
+        'description': '予定と作業枠の複数の変更を承認なしで一括保存する。全操作は検証を通れば全て保存され、一つでも失敗すれば全て取り消される。食事等の固定予定とタスク枠の再配置を一つにまとめるときに使う。schedule_taskはタスク全体を単一枠へ置き換える。複数枠へ分割する場合は各枠をcreate_task_allocation（task_id/start_at/end_at）で指定し、task_idは既存IDまたは@0等の先行操作番号を使う。create_eventはtitle/start_at/end_atが必須。update_taskはtask_idと変更項目を渡す。',
         'parameters': {
             'type': 'object',
             'properties': {'actions': {
-                'type': 'array', 'minItems': 1, 'maxItems': 8,
+                'type': 'array', 'minItems': 1, 'maxItems': MAX_APPLY_SCHEDULE_ACTIONS,
                 'items': {
                     'type': 'object',
                     'properties': {
@@ -159,10 +130,9 @@ async def verify_schedule_reply(text: str, results: list[dict[str, Any]], comple
                     'messages': [
                         {'role': 'system', 'content': (
                             '予定管理の返答を検証する。文章を演じずJSONだけ返す。replyと実行結果・現在DBの事実を照合する。'
-                            '未実行・失敗・提案段階なのに保存/変更済みと述べる、旧時刻や別の作業を確定として述べる、'
+                            '未実行・失敗なのに保存/変更済みと述べる、旧時刻や別の作業を確定として述べる、'
                             '一部の成功を全操作成功と述べる場合はsupported=false。'
-                            '質問・未確定の提案は保存済みの主張ではない。タスク作成と時間枠割当を区別する。'
-                            'ただし提案作成が失敗し有効なproposal_idがないのに、了承すれば反映できると案内する返答はsupported=false。'
+                            '質問・未確定の候補は保存済みの主張ではない。タスク作成と時間枠割当を区別する。'
                             'replyが主張する保存済みの全事実をclaimsに列挙する。時刻はDBと同じISO形式。'
                             'kind=task/event/allocation。allocationのidは作業枠ID。旧単一枠はtask_idも別名として使える。fieldsはDBの項目名と値。'
                             'allocationの開始/終了の項目名はstart_at/end_atを使う。'
@@ -190,7 +160,7 @@ async def verify_schedule_reply(text: str, results: list[dict[str, Any]], comple
                 records['allocation'].setdefault(task['id'], allocation)
         successful_ids = {'task': set(), 'event': set(), 'allocation': set()}
         for result in results:
-            if not result.get('ok') or result.get('state') == 'proposed':
+            if not result.get('ok'):
                 continue
             mutating = result.get('tool') in {'create_event', 'update_event', 'delete_event', 'create_task', 'update_task', 'complete_task', 'delete_task', 'schedule_task', 'create_task_allocation', 'unschedule_task', 'extend_schedule'}
             if not mutating and not result.get('task') and not result.get('scheduling'):
@@ -251,7 +221,7 @@ async def verify_schedule_reply(text: str, results: list[dict[str, Any]], comple
         return False
 
 
-def run_actions(actions: list[ProposedAction]) -> list[dict[str, Any]]:
+def run_actions(actions: list[ScheduleAction]) -> list[dict[str, Any]]:
     results = []
     for action in actions:
         arguments = json.loads(action.arguments_json)
@@ -289,39 +259,39 @@ def check_final_conflicts() -> None:
                 raise ValueError('予定案の通常予定とタスク作業枠が重複しています。')
 
 
-def propose_schedule(conversation_id: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+def apply_actions(actions: list[ScheduleAction]) -> list[dict[str, Any]]:
+    with database_transaction():
+        results = run_actions(actions)
+        check_final_conflicts()
+    return results
+
+
+def failed_batch(error: Exception) -> dict[str, Any]:
+    return {'ok': False, 'error': error.detail if isinstance(error, HTTPException) else str(error),
+            'instruction': '予定とタスクは変更していません（全操作を取り消しました）。具体的な失敗理由や不足情報を説明してください。'}
+
+
+def apply_schedule(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
-        if not conversation_id:
-            raise ValueError('提案先の会話がありません。')
-        uuid.UUID(conversation_id)
-        payload = ProposalPayload.model_validate(arguments)
-        if len(payload.actions) > MAX_PROPOSE_SCHEDULE_ACTIONS:
-            raise ValueError(f'一度に提案できる操作は{MAX_PROPOSE_SCHEDULE_ACTIONS}件までです。')
+        payload = ScheduleBatch.model_validate(arguments)
+        if len(payload.actions) > MAX_APPLY_SCHEDULE_ACTIONS:
+            raise ValueError(f'一度に保存できる操作は{MAX_APPLY_SCHEDULE_ACTIONS}件までです。')
         if any(action.name == 'link_routine_occurrence' for action in payload.actions):
-            raise ValueError('ルーティン関連付けは専用の提案ツールを使ってください。')
-        with database_transaction(rollback=True):
-            baseline = schedule_snapshot()
-            run_actions(payload.actions)
-            check_final_conflicts()
-        proposal_id = store_proposal(conversation_id, payload.actions, baseline)
-        return {'ok': True, 'state': 'proposed', 'proposal_id': proposal_id,
+            raise ValueError('ルーティン関連付けは専用のルーティンツールを使ってください。')
+        results = apply_actions(payload.actions)
+        return {'ok': True, 'state': 'applied', 'results': results,
                 'actions': [action.model_dump() for action in payload.actions],
-                'instruction': 'これは未反映の提案です。変更内容を具体的に伝え、了承を尋ねてください。'}
+                'instruction': '全ての操作を保存しました。変更内容を具体的に伝えてください。'}
     except (ValueError, TypeError, HTTPException) as error:
-        invalidate_pending_proposal(conversation_id)
-        return {'ok': False, 'error': error.detail if isinstance(error, HTTPException) else str(error),
-            'instruction': '予定は変更しておらず、有効な提案もありません。具体的な失敗理由や不足情報を説明し、了承すれば反映できると案内しないでください。'}
+        return failed_batch(error)
 
 
-def propose_week_plan(conversation_id: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+def schedule_week_plan(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
-        if not conversation_id:
-            raise ValueError('提案先の会話がありません。')
-        uuid.UUID(conversation_id)
         if set(arguments) != {'from_at', 'through_at'}:
             raise ValueError('計画期間を指定してください。')
         plan = plan_week_allocations(datetime.fromisoformat(arguments['from_at']), datetime.fromisoformat(arguments['through_at']))
-        actions: list[ProposedAction] = []
+        actions: list[ScheduleAction] = []
         notes: list[str] = []
         for item in plan['tasks']:
             slots = item['allocations']
@@ -329,9 +299,9 @@ def propose_week_plan(conversation_id: str | None, arguments: dict[str, Any]) ->
                 notes.append(f'「{item["title"]}」は期間内に配置できませんでした。')
                 continue
             if len(actions) + len(slots) > MAX_WEEK_PLAN_ACTIONS:
-                notes.append(f'「{item["title"]}」は一度に提案できる件数の上限のため含めていません。')
+                notes.append(f'「{item["title"]}」は一度に保存できる件数の上限のため配置していません。')
                 continue
-            actions.extend(ProposedAction(
+            actions.extend(ScheduleAction(
                 name='create_task_allocation',
                 arguments_json=json.dumps({'task_id': item['task_id'], 'start_at': slot['start_at'], 'end_at': slot['end_at']}),
             ) for slot in slots)
@@ -341,100 +311,18 @@ def propose_week_plan(conversation_id: str | None, arguments: dict[str, Any]) ->
         notes.extend(f'「{item["title"]}」は{reasons.get(item["reason"], item["reason"])}ため対象外です。' for item in plan['skipped'])
         if not actions:
             raise ValueError('期間内に配置できるタスクがありません。' + ''.join(notes))
-        payload = ProposalPayload(actions=actions)
-        with database_transaction(rollback=True):
-            baseline = schedule_snapshot()
-            run_actions(payload.actions)
-            check_final_conflicts()
-        proposal_id = store_proposal(conversation_id, payload.actions, baseline, {'kind': 'week_plan'})
-        return {'ok': True, 'state': 'proposed', 'proposal_id': proposal_id,
-                'actions': [action.model_dump() for action in payload.actions], 'plan_notes': notes,
-                'instruction': 'これは未反映の提案です。変更内容を具体的に伝え、了承を尋ねてください。'}
+        results = apply_actions(actions)
+        return {'ok': True, 'state': 'applied', 'results': results,
+                'actions': [action.model_dump() for action in actions], 'plan_notes': notes,
+                'instruction': '週間計画を保存しました。配置した内容と、配置できなかった理由を伝えてください。'}
     except (ValueError, TypeError, HTTPException) as error:
-        invalidate_pending_proposal(conversation_id)
-        return {'ok': False, 'error': error.detail if isinstance(error, HTTPException) else str(error),
-            'instruction': '予定は変更しておらず、有効な提案もありません。具体的な失敗理由や不足情報を説明し、了承すれば反映できると案内しないでください。'}
+        return failed_batch(error)
 
 
-def store_proposal(conversation_id: str, actions: list[ProposedAction], baseline: dict[str, Any], metadata: dict[str, Any] | None = None) -> str:
-    uuid.UUID(conversation_id)
-    proposal_id = str(uuid.uuid4())
-    with closing(open_database()) as connection:
-        connection.execute(
-            '''INSERT INTO schedule_proposals
-               (id, conversation_id, actions_json, baseline_json, metadata_json, state, created_at)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?)
-               ON CONFLICT(conversation_id) DO UPDATE SET
-                 id=excluded.id, actions_json=excluded.actions_json, baseline_json=excluded.baseline_json,
-                 metadata_json=excluded.metadata_json,
-                 state='pending', result_json=NULL, response_message_id=NULL, created_at=excluded.created_at''',
-            (proposal_id, conversation_id, json.dumps([action.model_dump() for action in actions]),
-             json.dumps(baseline, ensure_ascii=False), json.dumps(metadata or {}, ensure_ascii=False), now_iso()),
-        )
-        connection.commit()
-    reply_proposal_id.set(proposal_id)
-    return proposal_id
-
-
-def proposal_context(conversation_id: str | None) -> str:
+def schedule_context() -> str:
     snapshot = schedule_snapshot(event_window_days=35)
-    with closing(open_database()) as connection:
-        pending = connection.execute(
-            "SELECT id, actions_json, metadata_json, state FROM schedule_proposals WHERE conversation_id = ? AND state = 'pending'",
-            (conversation_id,),
-        ).fetchone()
-    if pending:
-        pending = dict(pending)
-        pending['metadata'] = json.loads(pending.pop('metadata_json'))
     return '\nDBに保存されている現在の予定・タスク・作業枠（会話中の古い説明より優先）:\n' + json.dumps(
-        {'current': snapshot, 'pending_proposal': dict(pending) if pending else None,
+        {'current': snapshot,
          'planning_rules': {'start': PLANNING_DAY_START, 'end': PLANNING_DAY_END,
                             'workdays': sorted(PLANNING_WORKDAYS), 'start_interval_minutes': 5}}, ensure_ascii=False,
     )
-
-
-def is_approval(content: str) -> bool:
-    normalized = re.sub(r'[\s。、！？!?,]', '', content)
-    return re.fullmatch(r'(?:じゃあ|では|それじゃあ)?(?:はい|うん|(?:はい|うん)?お願い(?:します)?|それで(?:お願い(?:します)?|いい(?:です|よ)?)?|その(?:内容|予定|案)で(?:お願い(?:します)?)?|了解(?:です)?|いいよ)', normalized) is not None
-
-
-def apply_approved_proposal(conversation_id: str | None, content: str) -> list[dict[str, Any]] | None:
-    if not conversation_id or not is_approval(content):
-        return None
-    try:
-        with database_transaction() as connection:
-            row = connection.execute('SELECT * FROM schedule_proposals WHERE conversation_id = ?', (conversation_id,)).fetchone()
-            if not row:
-                return None
-            last_message = connection.execute('SELECT MAX(id) AS id FROM messages WHERE conversation_id = ?', (conversation_id,)).fetchone()
-            if row['response_message_id'] != last_message['id']:
-                return [{'ok': False, 'error': '提案後に会話が進んでいます。どの案への了承か確認してください。'}]
-            if row['state'] == 'applied':
-                if schedule_snapshot() != json.loads(row['baseline_json']):
-                    return [{'ok': False, 'error': '実行後に予定が変更されています。最新の予定を確認してください。'}]
-                reply_proposal_id.set(row['id'])
-                return json.loads(row['result_json'])
-            if row['state'] != 'pending' or datetime.now(timezone.utc) - datetime.fromisoformat(row['created_at']) > timedelta(hours=24):
-                return [{'ok': False, 'error': 'この案は無効または期限切れです。最新の予定で組み直してください。'}]
-            if schedule_snapshot() != json.loads(row['baseline_json']):
-                connection.execute("UPDATE schedule_proposals SET state = 'invalid' WHERE id = ?", (row['id'],))
-                return [{'ok': False, 'error': '提案後に予定が変更されています。最新の予定で組み直してください。'}]
-            actions = [ProposedAction.model_validate(item) for item in json.loads(row['actions_json'])]
-            if not actions:
-                return [{'ok': False, 'error': 'まだ配置できる具体案がありません。不足する所要時間や日程を確認してください。',
-                         'routine': json.loads(row['metadata_json'])}]
-            results = run_actions(actions)
-            check_final_conflicts()
-            metadata = json.loads(row['metadata_json'])
-            if metadata:
-                results.append({'tool': 'propose_routine', 'ok': True, 'state': 'applied', 'routine': metadata,
-                                'instruction': '実際に配置した分だけ報告してください。missingの日は未割当のままで、全日完了とは述べないでください。'})
-            connection.execute(
-                "UPDATE schedule_proposals SET state = 'applied', result_json = ?, baseline_json = ? WHERE id = ?",
-                (json.dumps(results, ensure_ascii=False), json.dumps(schedule_snapshot(), ensure_ascii=False), row['id']),
-            )
-            reply_proposal_id.set(row['id'])
-            return results
-    except (ValueError, TypeError, HTTPException) as error:
-        return [{'ok': False, 'error': error.detail if isinstance(error, HTTPException) else str(error),
-                 'instruction': '変更全体を取り消しました。以前の予定と作業枠は維持されています。'}]

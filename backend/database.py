@@ -99,17 +99,6 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_messages_conversation
                 ON messages(conversation_id, id);
-            CREATE TABLE IF NOT EXISTS schedule_proposals (
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL UNIQUE,
-                actions_json TEXT NOT NULL,
-                baseline_json TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN ('pending', 'applied', 'invalid')),
-                result_json TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                response_message_id INTEGER,
-                created_at TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
                 category TEXT NOT NULL CHECK(category IN ('fact', 'preference', 'episode')),
@@ -338,9 +327,8 @@ def initialize_database() -> None:
             );
             '''
         )
-        proposal_columns = {row['name'] for row in connection.execute('PRAGMA table_info(schedule_proposals)').fetchall()}
-        if 'metadata_json' not in proposal_columns:
-            connection.execute("ALTER TABLE schedule_proposals ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+        # 承認待ちの提案は廃止したため、旧版の提案表を削除する
+        connection.execute('DROP TABLE IF EXISTS schedule_proposals')
         task_columns = {
             row['name'] for row in connection.execute('PRAGMA table_info(tasks)').fetchall()
         }

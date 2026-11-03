@@ -706,7 +706,7 @@ export default function NornApp() {
   }
 
   function requestWeekPlan() {
-    setDraft('今週の未完了タスクを優先度順に、休憩も入れて配置する案を作って。')
+    setDraft('今週の未完了タスクを優先度順に、休憩も入れて配置して。')
     setView('chat')
   }
 

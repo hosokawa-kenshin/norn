@@ -265,7 +265,7 @@ TASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'plan_task_allocations',
-            'description': '指定期間におけるタスクの複数作業枠案を読み取り専用で計算する。空き時間・作業時間・期限・分割条件を守る。保存は行わない。「N日に分けて」ならdistinct_daysにNを渡す。同名タスクが複数ある場合は期限切れでないものを選ぶ。複数枠を提案する場合は各枠をcreate_task_allocationの変更案としてpropose_scheduleへ渡し、了承前に保存しない。',
+            'description': '指定期間におけるタスクの複数作業枠案を読み取り専用で計算する。空き時間・作業時間・期限・分割条件を守る。保存は行わない。「N日に分けて」ならdistinct_daysにNを渡す。同名タスクが複数ある場合は期限切れでないものを選ぶ。複数枠を配置する場合は各枠をcreate_task_allocationの操作としてapply_scheduleへ渡す（承認なしで保存される）。',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -283,7 +283,7 @@ TASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'plan_week_allocations',
-            'description': '週間など指定期間で、未完了の複数タスクを優先度順（期限30%・目標貢献30%・緊急性20%・依存10%・停滞10%）に、1日の利用可能時間の85%以内・作業間の休憩10分込みで配置する案を読み取り専用で計算する。保存は行わない。週間の配置案を内容確認だけしたいときに使う。ユーザーが案の作成・配置を求めたら、操作を自分で組み立てずpropose_week_planを使う。',
+            'description': '週間など指定期間で、未完了の複数タスクを優先度順（期限30%・目標貢献30%・緊急性20%・依存10%・停滞10%）に、1日の利用可能時間の85%以内・作業間の休憩10分込みで配置する案を読み取り専用で計算する。保存は行わない。週間の配置案を内容確認だけしたいときに使う。ユーザーが配置を求めたら、操作を自分で組み立てずschedule_week_planを使う（承認なしで保存される）。',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -299,7 +299,7 @@ TASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'schedule_task',
-            'description': '空き時間検索結果から選んだ開始時刻にタスクを割り当てる。所要時間はタスクの見積時間を使う。',
+            'description': '空き時間検索結果から選んだ開始時刻にタスクを1枠だけ割り当てる。所要時間はタスクの見積時間を使う。「N日に分けて」「振り分けて」「複数日に」「次の三日」など複数枠への分割を頼まれたときは使わず、plan_task_allocations（distinct_days=N）の結果をapply_scheduleで保存する。',
             'parameters': {
                 'type': 'object',
                 'properties': {

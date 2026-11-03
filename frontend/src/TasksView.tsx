@@ -314,9 +314,9 @@ export default function TasksView({ onRequestSchedule, onRequestWeekPlan }: Task
 
       {plan && <section className="week-plan-panel" aria-label="今週の配置案">
         <div className="week-plan-heading">
-          <h3>今週の配置案（未保存）</h3>
+          <h3>今週の配置プレビュー（未保存）</h3>
           <div>
-            <button className="dialog-close" type="button" onClick={onRequestWeekPlan}>チャットで案を作ってもらう</button>
+            <button className="dialog-close" type="button" onClick={onRequestWeekPlan}>チャットで配置してもらう</button>
             <button className="icon-button" type="button" aria-label="閉じる" onClick={() => setPlan(null)}>×</button>
           </div>
         </div>

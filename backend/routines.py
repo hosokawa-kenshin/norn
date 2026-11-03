@@ -139,8 +139,8 @@ class OccurrenceLink(BaseModel):
 ROUTINE_TOOLS = [{
     'type': 'function',
     'function': {
-        'name': 'propose_routine',
-        'description': '既存タスクを毎日のルーティンとして最終日を含めて空き時間へ配置する未反映案を作る。31日以内・最大8項目。list_tasksか現在のDB情報で対象IDを特定する。時間未指定なら既存の所要時間を引き継ぐ。「全部1時間」等の明示的な変更は各itemsにestimated_minutesと最新user発言のestimate_evidenceを指定する。既存枠の時間変更も提案だけで、了承後に適用する。所要時間不明ならその項目だけ尋ねる。案に不足日があればその日だけ相談し、配置可能分は了承後にまとめて保存する。',
+        'name': 'schedule_routine',
+        'description': '既存タスクを毎日のルーティンとして最終日を含めて空き時間へ配置し、承認なしで保存する。31日以内・最大8項目。list_tasksか現在のDB情報で対象IDを特定する。時間未指定なら既存の所要時間を引き継ぐ。「全部1時間」等の明示的な変更は各itemsにestimated_minutesと最新user発言のestimate_evidenceを指定する。既存枠の時間変更もこのツールで保存する。所要時間不明ならその項目だけ尋ねる。配置できない日はmissingとして残り、配置できた分だけが一括で保存される。',
         'parameters': {
             'type': 'object',
             'properties': {
@@ -340,16 +340,6 @@ def list_routine_occurrences(
         return [dict(row) for row in connection.execute(query, parameters).fetchall()]
 
 
-def pending_routine_request(conversation_id: str | None) -> dict[str, Any] | None:
-    with closing(open_database()) as connection:
-        row = connection.execute(
-            "SELECT metadata_json FROM schedule_proposals WHERE conversation_id=? AND state='pending'",
-            (conversation_id,),
-        ).fetchone()
-    metadata = json.loads(row['metadata_json']) if row else {}
-    return metadata if metadata.get('items') and metadata.get('through_date') else None
-
-
 def link_occurrence(arguments: dict[str, Any]) -> dict[str, Any]:
     link = OccurrenceLink.model_validate(arguments)
     with closing(open_database()) as connection:
@@ -365,13 +355,10 @@ def link_occurrence(arguments: dict[str, Any]) -> dict[str, Any]:
             'occurrence_date': link.occurrence_date.isoformat()}
 
 
-def propose_routine(conversation_id: str | None, arguments: dict[str, Any], user_content: str = '') -> dict[str, Any]:
-    from schedule_proposals import ProposedAction, check_final_conflicts, invalidate_pending_proposal, schedule_snapshot, store_proposal
+def schedule_routine(arguments: dict[str, Any], user_content: str = '') -> dict[str, Any]:
+    from schedule_actions import ScheduleAction, apply_actions, check_final_conflicts
 
     try:
-        if not conversation_id:
-            raise ValueError('提案先の会話がありません。')
-        uuid.UUID(conversation_id)
         payload = RoutinePayload.model_validate(arguments)
         if payload.start_date < datetime.now(tasks.LOCAL_TIMEZONE).date():
             raise ValueError('開始日は今日以降にしてください。')
@@ -380,7 +367,6 @@ def propose_routine(conversation_id: str | None, arguments: dict[str, Any], user
         missing = []
         sources = []
         with database_transaction(rollback=True) as connection:
-            baseline = schedule_snapshot()
             for item in payload.items:
                 row = connection.execute(
                     '''SELECT t.* FROM tasks t WHERE t.id = COALESCE(
@@ -428,7 +414,7 @@ def propose_routine(conversation_id: str | None, arguments: dict[str, Any], user
                         if not linked:
                             args = {'source_task_id': source['id'], 'task_id': occurrence_id, 'occurrence_date': day.isoformat()}
                             link_occurrence(args)
-                            actions.append(ProposedAction(name='link_routine_occurrence', arguments_json=json.dumps(args)))
+                            actions.append(ScheduleAction(name='link_routine_occurrence', arguments_json=json.dumps(args)))
                         occurrences.append({**base, 'state': 'existing', 'task_id': occurrence_id,
                                             'start_at': existing['start_at'], 'end_at': existing['end_at']})
                         continue
@@ -471,18 +457,18 @@ def propose_routine(conversation_id: str | None, arguments: dict[str, Any], user
                     slot = slots[0]
                     tasks.schedule_task_record(occurrence_id, datetime.fromisoformat(slot['start_at']))
                     if update_args:
-                        actions.append(ProposedAction(name='update_task', arguments_json=json.dumps(update_args)))
+                        actions.append(ScheduleAction(name='update_task', arguments_json=json.dumps(update_args)))
                     reference = f'@{len(actions)}' if create_args else occurrence_id
                     if create_args:
-                        actions.append(ProposedAction(name='create_task', arguments_json=json.dumps(create_args, ensure_ascii=False)))
-                    actions.append(ProposedAction(name='schedule_task', arguments_json=json.dumps({'task_id': reference, 'start_at': slot['start_at']})))
+                        actions.append(ScheduleAction(name='create_task', arguments_json=json.dumps(create_args, ensure_ascii=False)))
+                    actions.append(ScheduleAction(name='schedule_task', arguments_json=json.dumps({'task_id': reference, 'start_at': slot['start_at']})))
                     if not linked:
                         args = {'source_task_id': source['id'], 'task_id': occurrence_id, 'occurrence_date': day.isoformat()}
                         link_occurrence(args)
                         args['task_id'] = reference
-                        actions.append(ProposedAction(name='link_routine_occurrence', arguments_json=json.dumps(args)))
+                        actions.append(ScheduleAction(name='link_routine_occurrence', arguments_json=json.dumps(args)))
                     connection.execute('RELEASE routine_occurrence')
-                    occurrences.append({**base, 'state': 'proposed', **slot})
+                    occurrences.append({**base, 'state': 'scheduled', **slot})
                 day += timedelta(days=1)
             check_final_conflicts()
         metadata = {'start_date': payload.start_date.isoformat(), 'through_date': payload.through_date.isoformat(),
@@ -491,12 +477,15 @@ def propose_routine(conversation_id: str | None, arguments: dict[str, Any], user
         if not actions and not missing:
             return {'ok': True, 'state': 'unchanged', 'occurrences': occurrences,
                     'missing': missing, 'instruction': '新しい変更はありません。不足する日・所要時間だけを尋ね、既存の実行分は重複作成しないでください。'}
-        proposal_id = store_proposal(conversation_id, actions, baseline, metadata)
-        return {'ok': True, 'state': 'proposed' if actions else 'needs_input', 'proposal_id': proposal_id,
+        if not actions:
+            return {'ok': True, 'state': 'needs_input', 'start_date': payload.start_date.isoformat(),
+                    'through_date': payload.through_date.isoformat(), 'occurrences': occurrences, 'missing': missing,
+                    'instruction': '保存できた日はありません。missingの日の理由と、必要な所要時間や日程だけを相談してください。'}
+        results = apply_actions(actions)
+        return {'ok': True, 'state': 'applied', 'results': results,
                 'start_date': payload.start_date.isoformat(), 'through_date': payload.through_date.isoformat(),
                 'occurrences': occurrences, 'missing': missing,
-                'instruction': '最終日を含むルーティンの未反映案です。既存枠と追加案を区別して日別に説明してください。missingの日は未割当です。その日だけ相談し、配置可能分の案への了承を尋ねてください。全日を保存済みとは述べないでください。'}
+                'instruction': '最終日を含むルーティンを保存しました。既存枠と新しく保存した枠を区別して日別に説明してください。missingの日は未割当です。その日だけ相談し、全日を保存済みとは述べないでください。'}
     except (ValueError, TypeError, HTTPException, sqlite3.IntegrityError) as error:
-        invalidate_pending_proposal(conversation_id)
         return {'ok': False, 'error': error.detail if isinstance(error, HTTPException) else str(error),
-            'instruction': '予定とタスクは変更しておらず、有効な提案もありません。具体的な失敗理由と対象・期間・不足情報を説明してください。「お願いします」で反映できるとは案内しないでください。'}
+            'instruction': '予定とタスクは変更していません。具体的な失敗理由と対象・期間・不足情報を説明してください。'}

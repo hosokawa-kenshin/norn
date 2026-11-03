@@ -24,8 +24,8 @@ from planning import (
 )
 from tasks import TASK_TOOLS, execute_task_tool
 from reminders import REMINDER_TOOLS, execute_reminder_tool, is_notice_reply, reminder_context
-from schedule_proposals import PROPOSAL_TOOLS, apply_approved_proposal, invites_approval_after_failed_proposal, is_approval, proposal_context, propose_schedule, propose_week_plan, reply_proposal_id, schedule_snapshot, verify_schedule_reply
-from routines import ROUTINE_TOOLS, pending_routine_request, propose_routine
+from schedule_actions import BATCH_TOOLS, apply_schedule, schedule_context, schedule_snapshot, schedule_week_plan, verify_schedule_reply
+from routines import ROUTINE_TOOLS, schedule_routine
 from llm_limits import check_llm_available, check_llm_response
 from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
@@ -37,16 +37,16 @@ DEFAULT_PERSONA = (
 )
 SYSTEM_PROMPT = (
     '予定やタスクを整理し、根拠と不確実性を明確にして簡潔に回答してください。'
-    '毎日・ルーティンを期間の最終日まで組む依頼はpropose_routineを使い、最終日も含めて日別に案を作ってください。'
-    '既存ルーティンの所要時間は引き継ぎ、不明な項目だけ尋ねてください。続く短い返答でも保存されたルーティン案のmetadataにある期間・項目を引き継いでpropose_routineを再実行してください。'
-    'ただし「全部1時間」等の明示的な時間変更は、その指定を各項目のestimated_minutesとestimate_evidenceへ反映した案にしてください。以前の見積時間を理由に拒否せず、了承後に変更します。期間が既に会話や案に出ていれば聞き直さないでください。'
+    '毎日・ルーティンを期間の最終日まで組む依頼はschedule_routineを使い、最終日も含めて承認なしで保存してください。'
+    '既存ルーティンの所要時間は引き継ぎ、不明な項目だけ尋ねてください。続く短い返答でも会話に出ている期間・項目を引き継いでschedule_routineを実行してください。'
+    'ただし「全部1時間」等の明示的な時間変更は、その指定を各項目のestimated_minutesとestimate_evidenceへ反映して保存してください。以前の見積時間を理由に拒否しません。期間が既に会話に出ていれば聞き直さないでください。'
     'ユーザーが日程を任せた場合は空き時間に配置し、根拠なくハードすぎる・倒れる等と反対したり、同じ意思確認を繰り返したりしないでください。具体的な競合・空き不足・時間外だけを相談してください。'
     '予定・タスク・作業枠を区別してください。練習等のやることはタスク、その実行時間はschedule_taskで保存する作業枠、食事や会議等の時間を確保する出来事は通常の予定です。'
     'タスク本体を作っただけでカレンダーへ入れたと述べないでください。「今日やりたい」を必ず今日締切と決めつけず、実施希望日と締切を区別してください。'
     '所要時間・食事の終了時刻が不明なら尋ねてください。未指定の時間を事実として補って保存してはいけません。'
-    '日程を相談して案を提示する場合は必ずpropose_scheduleに具体的な操作を渡し、検証が成功した案だけを未反映の提案として説明し、了承を尋ねてください。'
-    '複数の予定や作業枠の再調整は、食事等の固定予定とタスク枠の移動を同じpropose_scheduleの案に含めてください。単独の明確な操作依頼は既存ツールで直接実行できます。'
-    '提案後の「お願いします」は保存済みの案への了承です。提案がない場合は何への了承か特定し、不明なら確認してください。'
+    '日程の配置・再調整は承認を求めず、apply_scheduleに具体的な操作を渡して一括で保存してください。成功した内容だけを保存済みとして説明してください。'
+    '複数の予定や作業枠の再調整は、食事等の固定予定とタスク枠の移動を同じapply_scheduleにまとめてください。単独の明確な操作依頼は既存ツールで直接実行できます。'
+    'タスクを複数日・複数枠へ「分けて」「振り分けて」と頼まれたら、schedule_taskで1枠だけ置かず、plan_task_allocations（日数はdistinct_days）で枠を計算してapply_scheduleで保存してください。'
     '誤認識された名前の訂正は同じIDのタイトル変更です。日時・所要時間・割当はそのまま維持し、古い会話の時刻へ戻さないでください。'
     'NORN内の予定の検索・追加・変更・削除は、ユーザーから明確に依頼されたら承認を求めず予定ツールで実行してください。'
     '対象や日時など実行に必要な情報が曖昧または不足している場合に限り、その情報を質問してください。'
@@ -65,7 +65,7 @@ SYSTEM_PROMPT = (
     'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
     'タスクを登録したときに見積時間が不明なら、タスク本体を保存したうえで所要時間を自然に尋ねてください。開始日時を既に伝えている場合は聞き直さず、未指定の場合だけ希望を尋ねてください。返答は直前に登録したタスクの所要時間・希望日時として反映し、時間枠まで保存してください。'
     'ユーザーが時間割当は不要・後でと述べた場合は質問や割当を強制しないでください。希望日時に重複や作業時間外等の問題があれば、勝手に別時刻へ変えず理由を伝えて代案を相談してください。'
-    'タスクの開始は5分刻みです。14時32分等の指定を勝手に丸めず、所要時間と希望を保持し、登録できない理由と空き時間候補を短く伝えて了承を待ってください。'
+    'タスクの開始は5分刻みです。14時32分等の指定を勝手に丸めず、所要時間と希望を保持し、登録できない理由と空き時間候補を短く伝えて選択を待ってください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
     '目標とプロジェクトの検索・追加・更新・削除は、ユーザーの明確な依頼に基づいて専用ツールで実行してください。'
     '目標を作成するときは長期的な到達状態、プロジェクトは具体的な取り組みとして区別し、プロジェクトは該当する目標へ関連付けてください。'
@@ -170,8 +170,8 @@ def has_action_completion(text: str) -> bool:
     return any(ACTION_COMPLETION_PATTERN.search(clause) and not re.search(r'失敗|できな|できません|していません|未登録|未反映|未確定', clause) for clause in clauses)
 
 
-def split_allocation_proposal_reply(proposal: dict[str, Any]) -> str | None:
-    if proposal.get('state') != 'proposed' or not proposal.get('ok'):
+def split_allocation_applied_reply(proposal: dict[str, Any]) -> str | None:
+    if proposal.get('state') != 'applied' or not proposal.get('ok'):
         return None
     actions = proposal.get('actions') or []
     if not actions or any(action.get('name') != 'create_task_allocation' for action in actions):
@@ -181,7 +181,7 @@ def split_allocation_proposal_reply(proposal: dict[str, Any]) -> str | None:
         task_ids = {slot['task_id'] for slot in slots}
         if len(task_ids) == 1 and len(actions) < 2:
             return None
-        titles = {task['id']: task['title'] for task in schedule_snapshot()['tasks']}
+        titles = {task['id']: task['title'] for task in         schedule_snapshot(include_inactive=True)['tasks']}
         if not task_ids <= set(titles):
             return None
         weekdays = '月火水木金土日'
@@ -195,13 +195,13 @@ def split_allocation_proposal_reply(proposal: dict[str, Any]) -> str | None:
         if len(task_ids) == 1:
             title = titles[next(iter(task_ids))]
             lines = [f'・{describe(slot)}' for slot in sorted(slots, key=lambda item: item['start_at'])]
-            return f'「{title}」を{len(lines)}回に分ける案を作ったよ。まだ保存はしていません。\n' + '\n'.join(lines) + '\nこの内容でよければ「お願いします」と返してね。'
+            return f'「{title}」を{len(lines)}回に分けて配置したよ。\n' + '\n'.join(lines)
         sections = []
         for task_id in sorted(task_ids, key=lambda value: min(slot['start_at'] for slot in slots if slot['task_id'] == value)):
             lines = [f'  ・{describe(slot)}' for slot in sorted((slot for slot in slots if slot['task_id'] == task_id), key=lambda item: item['start_at'])]
             sections.append(f'「{titles[task_id]}」\n' + '\n'.join(lines))
         notes = ''.join(f'\n※{note}' for note in proposal.get('plan_notes') or [])
-        return f'{len(task_ids)}件のタスクを優先度順に配置する案を作ったよ。作業の合間に休憩も入れてあるよ。まだ保存はしていません。\n' + '\n'.join(sections) + notes + '\nこの内容でよければ「お願いします」と返してね。'
+        return f'{len(task_ids)}件のタスクを優先度順に配置したよ。作業の合間に休憩も入れてあるよ。\n' + '\n'.join(sections) + notes
     except (KeyError, ValueError, TypeError):
         return None
 
@@ -216,7 +216,7 @@ def deterministic_action_reply(results: list[dict[str, Any]]) -> str | None:
             if not result.get('ok'):
                 return None
             continue
-        if not result.get('ok') or result.get('continue_dialogue') or result.get('state') == 'proposed':
+        if not result.get('ok') or result.get('continue_dialogue') :
             return None
         if tool in supported_tools or tool is None and result.get('task'):
             actions.append(result)
@@ -492,7 +492,7 @@ async def generate_action_reply(
         if simple_reply is not None:
             return simple_reply
     check_llm_available()
-    system_prompt += proposal_context(None)
+    system_prompt += schedule_context()
     payload = {
         'model': LLM_MODEL,
         'temperature': 0.2,
@@ -502,8 +502,8 @@ async def generate_action_reply(
                 'ツールの再実行はできません。キャラクターの口調を保ち、結果の定型summaryを連結せず、短く一度だけ伝えてください。'
                 'タスク本体の保存と時間枠の確定を区別してください。割当が失敗した場合は、未割当であることと理由を必ず伝えてください。'
                 '既に示された日時・所要時間は聞き直さず、不足している情報だけを尋ねてください。'
-                '候補は未確定として提案し、ユーザーの了承なく別時刻へ移動したと述べないでください。'
-                'stateがproposedならまだ予定に反映していません。提案の各日時と対象を説明して了承を尋ね、登録済みと述べないでください。'
+                '候補は未確定として相談し、ユーザーの了承なく別時刻へ移動したと述べないでください。'
+                'state=appliedのresultsは承認なしで保存済みです。保存した日時と対象を説明してください。'
                 '\nサーバー実行結果:\n'
             ) + json.dumps(results, ensure_ascii=False)},
             *[message for message in messages if message['role'] in {'user', 'assistant'} and isinstance(message.get('content'), str)],
@@ -521,26 +521,22 @@ async def generate_action_reply(
         content = message.get('content')
         if message.get('tool_calls') or not isinstance(content, str) or not content.strip():
             raise ValueError('Missing final reply')
-        if invites_approval_after_failed_proposal(content, results):
-            if retry:
-                return await generate_action_reply(system_prompt + '\n有効な案の作成に失敗しています。了承を求めず、実行結果の具体的な理由と次に必要な情報だけを説明してください。', messages, results, retry=False)
-            raise ValueError('Approval requested without a valid proposal')
-        if has_action_completion(content) and not any(result.get('ok') and (result.get('summary') or result.get('task')) for result in results):
+        if has_action_completion(content) and not any(result.get('ok') and (result.get('summary') or result.get('task') or result.get('state') == 'applied') for result in results):
             raise ValueError('Completion without a successful operation')
-        schedule_results = any(result.get('tool') in {tool['function']['name'] for tool in [*SCHEDULE_TOOLS, *TASK_TOOLS, *REMINDER_TOOLS, *PROPOSAL_TOOLS, *ROUTINE_TOOLS]}
-                               or result.get('task') or result.get('scheduling') or result.get('state') == 'proposed' for result in results)
+        schedule_results = any(result.get('tool') in {tool['function']['name'] for tool in [*SCHEDULE_TOOLS, *TASK_TOOLS, *REMINDER_TOOLS, *BATCH_TOOLS, *ROUTINE_TOOLS]}
+                               or result.get('task') or result.get('scheduling') or result.get('state') == 'applied' for result in results)
         if schedule_results and not await verify_schedule_reply(content, results, has_action_completion(content)):
             if retry:
-                return await generate_action_reply(system_prompt + '\n前の返答は保存状態と一致しませんでした。現在のDBと実行結果を優先し、未保存・失敗・提案中を明確に説明してください。', messages, results, retry=False)
+                return await generate_action_reply(system_prompt + '\n前の返答は保存状態と一致しませんでした。現在のDBと実行結果を優先し、未保存・失敗を明確に説明してください。', messages, results, retry=False)
             raise ValueError('Reply does not match persisted schedule')
         return content.strip()
     except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError) as error:
         logger.warning('Action reply generation failed: %s', type(error).__name__)
-        failed_proposals = [result for result in results if result.get('tool') in {'propose_schedule', 'propose_routine'} and not result.get('ok')]
+        failed_batches = [result for result in results if result.get('tool') in {'apply_schedule', 'schedule_routine', 'schedule_week_plan'} and not result.get('ok')]
         saved_operations = any(result.get('ok') and (result.get('summary') or result.get('task') or result.get('event') or result.get('allocation')) for result in results)
-        if failed_proposals and not saved_operations:
-            reason = str(failed_proposals[-1].get('error', '対象や期間の情報を確認してください。'))[:400]
-            raise HTTPException(502, f'予定案は作成できていません。了承だけでは反映できません。理由: {reason}') from error
+        if failed_batches and not saved_operations:
+            reason = str(failed_batches[-1].get('error', '対象や期間の情報を確認してください。'))[:400]
+            raise HTTPException(502, f'予定を保存できませんでした。変更は反映していません。理由: {reason}') from error
         raise HTTPException(502, 'Geminiによる結果の説明を生成できませんでした。操作を再送せず、予定・タスクの現在の状態を確認してください。') from error
 
 
@@ -551,21 +547,13 @@ async def generate_llm_reply(
     headers = {'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {}
     local_now = datetime.now(LOCAL_TIMEZONE).isoformat(timespec='minutes')
     system_prompt = build_system_prompt()
-    system_prompt += proposal_context(conversation_id)
+    system_prompt += schedule_context()
     notice_context = reminder_context(conversation_id)
     latest = next((message['content'] for message in reversed(messages) if message['role'] == 'user'), '')
-    approved_results = apply_approved_proposal(conversation_id, latest)
-    if approved_results is not None:
-        return await generate_action_reply(
-            build_system_prompt() + proposal_context(conversation_id), messages, approved_results,
-            allow_deterministic=False,
-        )
-    proposal_only = bool(re.search(r'提案|案(?:を|が|に)|組み直|組みなお|組み替|再調整|再計画|スケジュール.*(?:組|立|調整)', latest)) or is_approval(latest)
-    routine_turn = bool(re.search(r'ルーティン|毎日|日課', latest)) or pending_routine_request(conversation_id) is not None
+    routine_turn = bool(re.search(r'ルーティン|毎日|日課', latest))
     previous_assistant = next((message['content'] for message in reversed(messages[:-1]) if message['role'] == 'assistant'), '')
     if re.search(r'ルーティン|毎日|日課', previous_assistant) and re.search(r'期間|何日|いつまで', previous_assistant):
         routine_turn = routine_turn or bool(re.search(r'週間|週ぐらい|日間|まで|月末|今日から|ここから', latest))
-    proposal_only = proposal_only or routine_turn
     answering_extension = is_notice_reply(conversation_id)
     automatic_results = [] if answering_extension or routine_turn else await prepare_automatic_tasks(messages)
     automatic_context = (
@@ -574,7 +562,7 @@ async def generate_llm_reply(
         + '\n成功した登録・更新は実行済みなので重複実行しないでください。保存結果を自然に短く伝え、失敗時や結果なしでは保存したと主張しないでください。'
         'scheduling.stateがneeds_estimateなら所要時間を自然に質問してください。preferred_startがあればその希望は把握済みなので開始日時は聞き直さないでください。'
         'scheduledなら実際の開始・終了時刻を短く伝え、再割当しないでください。'
-        'unavailableならタスクの保存と時間枠の未確定を区別して理由を伝え、alternativesがあれば候補を1〜2件提案して了承を待ってください。この返答内で勝手に別枠を取ったり再試行したりしないでください。'
+        'unavailableならタスクの保存と時間枠の未確定を区別して理由を伝え、alternativesがあれば候補を1〜2件提案してユーザーの選択を待ってください。この返答内で勝手に別枠を取ったり再試行したりしないでください。'
         'deferredなら割当や質問を強制しないでください。'
     )
     llm_messages: list[dict[str, Any]] = [
@@ -591,9 +579,9 @@ async def generate_llm_reply(
 
     for _ in range(8):
         check_llm_available()
-        available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *PROPOSAL_TOOLS, *ROUTINE_TOOLS]
-        if proposal_only:
-            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'propose_schedule', 'propose_week_plan', 'propose_routine'}]
+        available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *BATCH_TOOLS, *ROUTINE_TOOLS]
+        if routine_turn:
+            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'apply_schedule', 'schedule_week_plan', 'schedule_routine'}]
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
@@ -635,8 +623,6 @@ async def generate_llm_reply(
         if not tool_calls:
             content = assistant_message.get('content')
             if isinstance(content, str) and content.strip():
-                if invites_approval_after_failed_proposal(content, tool_results):
-                    return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
                 simple_reply = deterministic_action_reply(tool_results)
                 if simple_reply is not None:
                     return simple_reply
@@ -675,15 +661,13 @@ async def generate_llm_reply(
                     'create_task', 'update_task', 'complete_task', 'delete_task',
                     'schedule_task', 'unschedule_task',
                     'extend_schedule',
-                    'propose_schedule', 'propose_week_plan',
-                    'propose_routine',
+                    'apply_schedule', 'schedule_week_plan',
+                    'schedule_routine',
                     'save_memory', 'update_memory', 'forget_memory',
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
                 }
-                if proposal_only and name in mutating_tools and name not in {'propose_schedule', 'propose_week_plan', 'propose_routine'}:
-                    result = {'ok': False, 'error': '今回は提案の相談です。直接変更せずpropose_scheduleで未反映の案を作成してください。'}
-                elif name in mutating_tools and call_key in seen_tool_calls:
+                if name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
                 else:
                     if name in mutating_tools:
@@ -699,12 +683,12 @@ async def generate_llm_reply(
                         result = await asyncio.to_thread(execute_goal_project_tool, name, arguments)
                     elif name == 'extend_schedule':
                         result = execute_reminder_tool(arguments)
-                    elif name == 'propose_schedule':
-                        result = propose_schedule(conversation_id, arguments)
-                    elif name == 'propose_week_plan':
-                        result = propose_week_plan(conversation_id, arguments)
-                    elif name == 'propose_routine':
-                        result = propose_routine(conversation_id, arguments, latest)
+                    elif name == 'apply_schedule':
+                        result = await asyncio.to_thread(apply_schedule, arguments)
+                    elif name == 'schedule_week_plan':
+                        result = await asyncio.to_thread(schedule_week_plan, arguments)
+                    elif name == 'schedule_routine':
+                        result = await asyncio.to_thread(schedule_routine, arguments, latest)
                     elif name in task_tools:
                         result = execute_task_tool(name, arguments)
                     else:
@@ -713,6 +697,10 @@ async def generate_llm_reply(
                 result = {'ok': False, 'error': f'ツール引数が不正です: {error}'}
 
             tool_results.append({'tool': name, 'arguments': arguments, **result})
+            if result.get('state') == 'applied' and isinstance(result.get('results'), list):
+                tool_results.extend(result['results'])
+                completed_actions.append(result)
+                ungrounded_replies = 0
             if result.get('ok') and result.get('summary'):
                 completed_actions.append(result)
                 ungrounded_replies = 0
@@ -721,14 +709,20 @@ async def generate_llm_reply(
                 'tool_call_id': call_id,
                 'content': json.dumps(result, ensure_ascii=False),
             })
-        if any(result.get('state') in {'proposed', 'needs_input'} and result.get('proposal_id') for result in tool_results):
-            latest_proposal = next(result for result in reversed(tool_results) if result.get('proposal_id') and result.get('state') in {'proposed', 'needs_input'})
-            committed = [result for result in tool_results if result.get('ok') and result.get('state') != 'proposed' and (result.get('summary') or result.get('task'))]
-            if not committed:
-                split_reply = split_allocation_proposal_reply(latest_proposal)
+        batch_results = [result for result in tool_results if result.get('tool') in {'apply_schedule', 'schedule_week_plan', 'schedule_routine'}
+                         and result.get('ok') and result.get('state') in {'applied', 'needs_input', 'unchanged'}]
+        if batch_results:
+            latest_batch = batch_results[-1]
+            batch_children = {id(child) for batch in batch_results for child in batch.get('results') or []}
+            others = [result for result in tool_results if result.get('ok') and result.get('tool') not in {'apply_schedule', 'schedule_week_plan', 'schedule_routine'}
+                      and id(result) not in batch_children and (result.get('summary') or result.get('task'))]
+            removals = [result for result in others if result.get('tool') == 'unschedule_task']
+            others = [result for result in others if result not in removals]
+            if not others:
+                split_reply = split_allocation_applied_reply(latest_batch)
                 if split_reply is not None:
-                    return split_reply
-            return await generate_action_reply(build_system_prompt() + proposal_context(conversation_id), messages, [*committed, latest_proposal])
+                    return ('先に入っていた枠は解除して、' if removals else '') + split_reply
+            return await generate_action_reply(build_system_prompt() + schedule_context(), messages, [*removals, *others, latest_batch])
         if any(not result.get('ok') and result.get('error') == '同じツール呼び出しを重複実行しませんでした。' for result in tool_results):
             return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
 
@@ -942,12 +936,7 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
     review_context = format_goal_review_context(due_goal_reviews)
     if review_context:
         history.insert(0, {'role': 'system', 'content': review_context})
-    proposal_token = reply_proposal_id.set(None)
-    try:
-        reply = await generate_llm_reply(history, conversation_id)
-        delivered_proposal_id = reply_proposal_id.get()
-    finally:
-        reply_proposal_id.reset(proposal_token)
+    reply = await generate_llm_reply(history, conversation_id)
     timestamp = now_iso()
 
     with closing(open_database()) as connection:
@@ -965,12 +954,6 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
                 (conversation_id, 'user', content, timestamp),
                 (conversation_id, 'assistant', reply, timestamp),
             ],
-        )
-        connection.execute(
-            '''UPDATE schedule_proposals SET response_message_id =
-               (SELECT MAX(id) FROM messages WHERE conversation_id = ?)
-                    WHERE conversation_id = ? AND id = ?''',
-                (conversation_id, conversation_id, delivered_proposal_id),
         )
         connection.commit()
 
