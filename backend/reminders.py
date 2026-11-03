@@ -55,7 +55,7 @@ REMINDER_TOOLS = [{
 def schedule_items(start: datetime, end: datetime) -> list[dict[str, Any]]:
     events = [dict(event, kind='event', item_id=event.get('occurrence_id') if event.get('occurrence_id') and '@' not in event['occurrence_id'] else event['id']) for event in query_events(start, end)
               if not event['is_all_day'] and not event.get('is_cancelled')]
-    tasks = [dict(task, kind='task', item_id=task['task_id']) for task in list_task_allocations(start, end)
+    tasks = [dict(task, kind='task', item_id=task['id']) for task in list_task_allocations(start, end)
              if task['status'] in {'open', 'in_progress'}]
     return sorted([*events, *tasks], key=lambda item: item['start_at'])
 
@@ -210,7 +210,7 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
     with closing(open_database()) as connection, connection:
         connection.execute('BEGIN IMMEDIATE')
         table = 'events' if payload.kind == 'event' else 'task_allocations'
-        column = 'id' if payload.kind == 'event' else 'task_id'
+        column = 'id'
         row = connection.execute(f'SELECT * FROM {table} WHERE {column} = ?', (item_id,)).fetchone()
         if row is None:
             raise HTTPException(404, '延長対象が見つかりません。')
@@ -236,7 +236,8 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
         if new_end <= datetime.now(LOCAL_TIMEZONE):
             raise HTTPException(409, '延長後の終了時刻が過去になります。延長時間を確認してください。')
         if payload.kind == 'task':
-            task = connection.execute('SELECT * FROM tasks WHERE id = ?', (item_id,)).fetchone()
+            task_id = row['task_id']
+            task = connection.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
             if task['status'] not in {'open', 'in_progress'} or (task['due_at'] and new_end > datetime.fromisoformat(task['due_at'])):
                 raise HTTPException(409, '完了・中止済み、または延長すると期限を過ぎるタスクです。')
             if start.weekday() not in PLANNING_WORKDAYS or new_end.date() != start.date() or new_end.time() > configured_time(PLANNING_DAY_END):
@@ -252,7 +253,7 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
                WHERE a.start_at < ? AND a.end_at > ? ORDER BY a.start_at''',
             (event_datetime_iso(new_end), event_datetime_iso(end)),
         ).fetchall()
-        overlaps = [allocation for allocation in overlaps if not (payload.kind == 'task' and allocation['task_id'] == item_id)]
+        overlaps = [dict(allocation) for allocation in overlaps if allocation['id'] != item_id]
         if series:
             rules = json.loads(series['recurrence_json'])
             exclusion = start.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -273,12 +274,14 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
             )
         else:
             connection.execute(
-                f'UPDATE {table} SET end_at = ?, updated_at = ? WHERE {column} = ?',
+                f'UPDATE {table} SET end_at = ?, updated_at = ? WHERE id = ?',
                 (event_datetime_iso(new_end), now_iso(), item_id),
             )
         if payload.kind == 'event':
             connection.execute("UPDATE events SET sync_status = CASE WHEN google_event_id IS NULL THEN 'local' ELSE 'dirty' END WHERE id = ?", (item_id,))
         moved = []
+        for allocation in overlaps:
+            connection.execute('DELETE FROM task_allocations WHERE id = ?', (allocation['id'],))
         for allocation in overlaps:
             duration = datetime.fromisoformat(allocation['end_at']) - datetime.fromisoformat(allocation['start_at'])
             cursor = ceil_to_quarter_hour(max(new_end, datetime.now(LOCAL_TIMEZONE)))
@@ -290,8 +293,8 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
                 in_hours = (cursor.weekday() in PLANNING_WORKDAYS and cursor.time() >= configured_time(PLANNING_DAY_START)
                             and candidate_end.date() == cursor.date() and candidate_end.time() <= configured_time(PLANNING_DAY_END))
                 busy_task = connection.execute(
-                    'SELECT 1 FROM task_allocations WHERE task_id != ? AND start_at < ? AND end_at > ?',
-                    (allocation['task_id'], event_datetime_iso(candidate_end), event_datetime_iso(cursor)),
+                    'SELECT 1 FROM task_allocations WHERE start_at < ? AND end_at > ?',
+                    (event_datetime_iso(candidate_end), event_datetime_iso(cursor)),
                 ).fetchone()
                 if in_hours and not busy_task and not find_event_conflicts(connection, event_datetime_iso(cursor), event_datetime_iso(candidate_end)):
                     break
@@ -299,8 +302,10 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
             else:
                 raise HTTPException(409, f'「{allocation["title"]}」を期限・作業時間内に再配置できません。変更は取り消しました。')
             connection.execute(
-                'UPDATE task_allocations SET start_at = ?, end_at = ?, updated_at = ? WHERE id = ?',
-                (event_datetime_iso(cursor), event_datetime_iso(cursor + duration), now_iso(), allocation['id']),
+                '''INSERT INTO task_allocations (id, task_id, start_at, end_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (allocation['id'], allocation['task_id'], event_datetime_iso(cursor),
+                 event_datetime_iso(cursor + duration), allocation['created_at'], now_iso()),
             )
             moved.append({'task_id': allocation['task_id'], 'title': allocation['title'], 'start_at': event_datetime_iso(cursor), 'end_at': event_datetime_iso(cursor + duration)})
     return {'ok': True, 'end_at': event_datetime_iso(new_end), 'moved_tasks': moved,

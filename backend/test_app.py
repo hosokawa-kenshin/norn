@@ -312,13 +312,70 @@ def test_extend_schedule_task_keeps_estimate_and_moves_next_task(monkeypatch, tm
         first = client.post('/api/tasks', json={'title': '作業', 'estimated_minutes': 30}).json()
         second = client.post('/api/tasks', json={'title': '次の作業', 'estimated_minutes': 30}).json()
         end = future_task_start + timedelta(minutes=30)
-        client.put(f'/api/tasks/{first["id"]}/schedule', json={'start_at': future_task_start.isoformat()})
+        first_allocation = client.put(f'/api/tasks/{first["id"]}/schedule', json={'start_at': future_task_start.isoformat()}).json()
         client.put(f'/api/tasks/{second["id"]}/schedule', json={'start_at': end.isoformat()})
-        result = reminders_module.execute_reminder_tool({'kind': 'task', 'item_id': first['id'], 'expected_end': end.isoformat(), 'minutes': 15})
+        result = reminders_module.execute_reminder_tool({'kind': 'task', 'item_id': first_allocation['id'], 'expected_end': end.isoformat(), 'minutes': 15})
         assert result['ok'] and result['end_at'] == (end + timedelta(minutes=15)).isoformat()
         tasks = {task['id']: task for task in client.get('/api/tasks').json()}
         assert tasks[first['id']]['estimated_minutes'] == 30
         assert tasks[second['id']]['scheduled_start'] == result['end_at']
+
+
+def test_legacy_task_schedule_replaces_split_allocations(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'replace-allocations.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={
+            'title': '分割練習', 'estimated_minutes': 60, 'splittable': True,
+        }).json()
+        client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': future_task_start.isoformat(),
+            'end_at': (future_task_start + timedelta(minutes=30)).isoformat(),
+        })
+        client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': (future_task_start + timedelta(hours=1)).isoformat(),
+            'end_at': (future_task_start + timedelta(hours=1, minutes=30)).isoformat(),
+        })
+
+        replacement = client.put(
+            f"/api/tasks/{task['id']}/schedule",
+            json={'start_at': (future_task_start + timedelta(hours=2)).isoformat()},
+        )
+        allocations = client.get(f"/api/tasks/{task['id']}/allocations").json()
+
+    assert replacement.status_code == 200
+    assert len(allocations) == 1
+    assert allocations[0]['start_at'] == (future_task_start + timedelta(hours=2)).isoformat()
+
+
+def test_task_extension_targets_and_moves_the_notified_allocation(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'split-task-extension.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={
+            'title': '分割練習', 'estimated_minutes': 60, 'splittable': True,
+        }).json()
+        first_end = future_task_start + timedelta(minutes=30)
+        first = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': future_task_start.isoformat(), 'end_at': first_end.isoformat(),
+        }).json()
+        second = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': first_end.isoformat(),
+            'end_at': (first_end + timedelta(minutes=30)).isoformat(),
+        }).json()
+
+        schedule_items = reminders_module.schedule_items(
+            future_task_start - timedelta(minutes=1),
+            first_end + timedelta(hours=1),
+        )
+        result = reminders_module.execute_reminder_tool({
+            'kind': 'task', 'item_id': first['id'],
+            'expected_end': first_end.isoformat(), 'minutes': 15,
+        })
+        allocations = {item['id']: item for item in client.get(f"/api/tasks/{task['id']}/allocations").json()}
+
+    assert {item['item_id'] for item in schedule_items if item['kind'] == 'task'} == {first['id'], second['id']}
+    assert result['ok']
+    assert allocations[first['id']]['end_at'] == (first_end + timedelta(minutes=15)).isoformat()
+    assert allocations[second['id']]['start_at'] == allocations[first['id']]['end_at']
 
 
 def test_schedule_notices_ignore_all_day_and_expired_boundaries(monkeypatch, tmp_path, future_task_start):
@@ -2091,7 +2148,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         'propose_schedule',
         'propose_routine',
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
-        'find_task_slots', 'schedule_task', 'unschedule_task',
+        'find_task_slots', 'plan_task_allocations', 'schedule_task', 'unschedule_task',
         'save_memory', 'search_memories', 'update_memory', 'forget_memory',
         'list_goals', 'create_goal', 'update_goal', 'delete_goal',
         'list_projects', 'create_project', 'update_project', 'delete_project',
@@ -3472,6 +3529,7 @@ def test_initialize_database_migrates_legacy_tasks(monkeypatch, tmp_path):
 
     monkeypatch.setattr(database_module, 'DB_PATH', database_path)
     database_module.initialize_database()
+    database_module.initialize_database()
     with database_module.open_database() as migrated:
         columns = {row['name'] for row in migrated.execute('PRAGMA table_info(tasks)').fetchall()}
         task = migrated.execute('SELECT * FROM tasks WHERE id = ?', ('legacy-task',)).fetchone()
@@ -3479,6 +3537,485 @@ def test_initialize_database_migrates_legacy_tasks(monkeypatch, tmp_path):
     assert 'project_id' in columns
     assert task['title'] == '既存タスク'
     assert task['project_id'] is None
+
+
+def test_initialize_database_migrates_schedule_and_routine_models(monkeypatch, tmp_path):
+    database_path = tmp_path / 'legacy-schedule.sqlite3'
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        '''
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            due_at TEXT, estimated_minutes INTEGER, priority TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+        );
+        CREATE TABLE task_allocations (
+            id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+            start_at TEXT NOT NULL, end_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE routine_occurrences (
+            source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            occurrence_date TEXT NOT NULL, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY (source_task_id, occurrence_date)
+        );
+        INSERT INTO tasks (id, title, priority, status, created_at, updated_at)
+        VALUES ('legacy-task', '既存タスク', 'normal', 'open', '2026-01-01', '2026-01-01');
+        INSERT INTO task_allocations (id, task_id, start_at, end_at, created_at, updated_at)
+        VALUES ('legacy-allocation', 'legacy-task', '2026-01-02T10:00:00+09:00',
+                '2026-01-02T11:00:00+09:00', '2026-01-01', '2026-01-01');
+        INSERT INTO routine_occurrences (source_task_id, occurrence_date, task_id)
+        VALUES ('legacy-task', '2026-01-02', 'legacy-task');
+        ''',
+    )
+    connection.commit()
+    connection.close()
+
+    monkeypatch.setattr(database_module, 'DB_PATH', database_path)
+    database_module.initialize_database()
+    with database_module.open_database() as migrated:
+        task_columns = {row['name'] for row in migrated.execute('PRAGMA table_info(tasks)')}
+        event_columns = {row['name'] for row in migrated.execute('PRAGMA table_info(events)')}
+        routine_occurrence_columns = {
+            row['name'] for row in migrated.execute('PRAGMA table_info(routine_occurrences)')
+        }
+        allocation_indexes = migrated.execute("PRAGMA index_list('task_allocations')").fetchall()
+        allocation = migrated.execute(
+            'SELECT * FROM task_allocations WHERE id = ?', ('legacy-allocation',),
+        ).fetchone()
+        legacy_link = migrated.execute(
+            'SELECT * FROM task_occurrence_links WHERE source_task_id = ?', ('legacy-task',),
+        ).fetchone()
+        migrated.execute(
+            '''INSERT INTO task_allocations (id, task_id, start_at, end_at, created_at, updated_at)
+               VALUES ('second-allocation', 'legacy-task', '2026-01-03T10:00:00+09:00',
+                       '2026-01-03T11:00:00+09:00', '2026-01-01', '2026-01-01')''',
+        )
+
+    assert {'remaining_minutes', 'focus_level', 'splittable', 'flexibility'} <= task_columns
+    assert {'kind', 'source', 'task_id', 'is_fixed', 'is_important'} <= event_columns
+    assert {'routine_id', 'plan_id', 'schedule_id', 'status'} <= routine_occurrence_columns
+    assert allocation['id'] == 'legacy-allocation'
+    assert legacy_link['occurrence_date'] == '2026-01-02'
+    assert not any(index['unique'] and index['origin'] == 'u' for index in allocation_indexes)
+
+
+def test_task_can_have_multiple_validated_allocations(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'multi-allocation.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={
+            'title': '分割練習', 'estimated_minutes': 90, 'splittable': True,
+            'min_session_minutes': 30, 'max_session_minutes': 60,
+        }).json()
+        first = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': future_task_start.isoformat(),
+            'end_at': (future_task_start + timedelta(minutes=45)).isoformat(),
+        })
+        second = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': (future_task_start + timedelta(minutes=45)).isoformat(),
+            'end_at': (future_task_start + timedelta(minutes=90)).isoformat(),
+        })
+        allocations = client.get(f"/api/tasks/{task['id']}/allocations")
+        overscheduled = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': (future_task_start + timedelta(hours=2)).isoformat(),
+            'end_at': (future_task_start + timedelta(hours=2, minutes=30)).isoformat(),
+        })
+
+    assert first.status_code == second.status_code == 201
+    assert len(allocations.json()) == 2
+    assert overscheduled.status_code == 409
+    assert overscheduled.json()['detail'] == '作業枠の合計が残り見積時間を超えます。'
+
+
+def test_task_allocation_plan_splits_around_existing_events_without_saving(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'allocation-plan.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={
+            'title': '分割計画', 'estimated_minutes': 90, 'splittable': True,
+            'min_session_minutes': 30, 'max_session_minutes': 60,
+        }).json()
+        client.post('/api/events', json={
+            'title': '固定予定',
+            'start_at': (future_task_start + timedelta(minutes=45)).isoformat(),
+            'end_at': (future_task_start + timedelta(minutes=60)).isoformat(),
+        })
+
+        plan = client.get(f"/api/tasks/{task['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(hours=4)).isoformat(),
+        })
+        allocations = client.get(f"/api/tasks/{task['id']}/allocations").json()
+        expired_task = client.post('/api/tasks', json={
+            'title': '期限切れ', 'estimated_minutes': 30, 'due_at': (future_task_start - timedelta(minutes=1)).isoformat(),
+        }).json()
+        expired_plan = client.get(f"/api/tasks/{expired_task['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(hours=1)).isoformat(),
+        })
+        non_splittable = client.post('/api/tasks', json={
+            'title': '分割不可', 'estimated_minutes': 90, 'splittable': False,
+        }).json()
+        non_splittable_plan = client.get(f"/api/tasks/{non_splittable['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(hours=4)).isoformat(),
+        })
+        constrained = client.post('/api/tasks', json={
+            'title': '上限超過', 'estimated_minutes': 90, 'splittable': False, 'max_session_minutes': 60,
+        }).json()
+        constrained_plan = client.get(f"/api/tasks/{constrained['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(hours=4)).isoformat(),
+        })
+
+    assert plan.status_code == 200
+    assert plan.json()['complete'] is True
+    assert plan.json()['allocated_minutes'] == 90
+    assert plan.json()['unallocated_minutes'] == 0
+    assert [slot['duration_minutes'] for slot in plan.json()['allocations']] == [45, 45]
+    assert plan.json()['allocations'][0]['end_at'] <= plan.json()['allocations'][1]['start_at']
+    assert allocations == []
+    assert expired_plan.json()['complete'] is False
+    assert expired_plan.json()['unallocated_minutes'] == 30
+    assert expired_plan.json()['allocations'] == []
+    assert len(non_splittable_plan.json()['allocations']) == 1
+    assert non_splittable_plan.json()['allocations'][0]['duration_minutes'] == 90
+    assert constrained_plan.json()['complete'] is False
+    assert constrained_plan.json()['unallocated_minutes'] == 90
+
+
+def test_tasks_are_splittable_by_default_and_legacy_rows_migrate_once(monkeypatch, tmp_path):
+    db_path = tmp_path / 'splittable.sqlite3'
+    monkeypatch.setattr(database_module, 'DB_PATH', db_path)
+    with TestClient(norn_app.app) as client:
+        created = client.post('/api/tasks', json={'title': '新規'}).json()
+        assert created['splittable'] == 1
+        legacy = client.post('/api/tasks', json={'title': '旧', 'splittable': False}).json()
+    import sqlite3
+    with sqlite3.connect(db_path) as connection:
+        connection.execute('UPDATE tasks SET splittable = 0')
+        connection.execute('PRAGMA user_version = 0')
+    with TestClient(norn_app.app) as client:
+        assert {task['splittable'] for task in client.get('/api/tasks').json()} == {1}
+        client.patch(f"/api/tasks/{legacy['id']}", json={'splittable': False})
+    with TestClient(norn_app.app) as client:
+        assert next(task for task in client.get('/api/tasks').json() if task['id'] == legacy['id'])        ['splittable'] == 0
+
+
+def test_allocation_plan_distributes_over_distinct_days_and_reports_expired(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'distinct-days.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '3日配分', 'estimated_minutes': 60}).json()
+        plan = client.get(f"/api/tasks/{task['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(days=7)).isoformat(),
+            'distinct_days': 3,
+        }).json()
+        expired = client.post('/api/tasks', json={
+            'title': '期限切れ', 'estimated_minutes': 60, 'due_at': (future_task_start - timedelta(days=1)).isoformat(),
+        }).json()
+        expired_plan = client.get(f"/api/tasks/{expired['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(days=3)).isoformat(),
+        }).json()
+        invalid = client.get(f"/api/tasks/{task['id']}/allocation-plan", params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(days=3)).isoformat(),
+            'distinct_days': 9,
+        })
+
+    assert plan['complete'] is True
+    assert [slot['duration_minutes'] for slot in plan['allocations']] == [20, 20, 20]
+    assert len({slot['start_at'][:10] for slot in plan['allocations']}) == 3
+    assert expired_plan['reason'] == 'deadline_passed'
+    assert invalid.status_code == 422
+
+
+def test_prompt_snapshot_limits_events_to_window_and_split_proposal_reply_is_server_generated(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'compact.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    posts = []
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '分割案', 'estimated_minutes': 60}).json()
+        for year_offset in range(1, 4):
+            start = future_task_start + timedelta(days=365 * year_offset)
+            client.post('/api/events', json={'title': f'遠い予定{year_offset}', 'start_at': start.isoformat(), 'end_at': (start + timedelta(hours=1)).isoformat()})
+        client.post('/api/events', json={'title': '近い予定', 'start_at': future_task_start.isoformat(), 'end_at': (future_task_start + timedelta(hours=1)).isoformat()})
+        snapshot = proposals_module.schedule_snapshot(event_window_days=35)
+        assert [event['title'] for event in snapshot['events']] == ['近い予定']
+        assert 'recurrence_json' not in snapshot['events'][0]
+        actions = [
+            {'name': 'create_task_allocation', 'arguments_json': json.dumps({
+                'task_id': task['id'],
+                'start_at': (future_task_start + timedelta(days=day, hours=2)).isoformat(),
+                'end_at': (future_task_start + timedelta(days=day, hours=2, minutes=20)).isoformat(),
+            })}
+            for day in range(3)
+        ]
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, json, headers):
+                posts.append(json)
+                message = {'content': None, 'tool_calls': [{'id': 'p', 'type': 'function', 'function': {'name': 'propose_schedule', 'arguments': globals()['json'].dumps({'actions': actions})}}]}
+                return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+        monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+        reply = client.post('/api/chat', json={'content': '分割案を3日に分けて配置案を作って'}).json()['assistant_message']['content']
+        assert client.get(f"/api/tasks/{task['id']}/allocations").json() == []
+
+    assert len(posts) == 1
+    assert '「分割案」を3回に分ける案' in reply and reply.count('20分') == 3 and 'まだ保存はしていません' in reply
+
+
+def test_chat_routes_plan_task_allocations_to_task_tools(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'plan-route.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    posts = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            posts.append(json)
+            if len(posts) == 1:
+                arguments = globals()['json'].dumps({
+                    'task_id': task_id, 'from_at': future_task_start.isoformat(),
+                    'through_at': (future_task_start + timedelta(days=7)).isoformat(), 'distinct_days': 3,
+                })
+                message = {'content': None, 'tool_calls': [{'id': 'p', 'type': 'function', 'function': {'name': 'plan_task_allocations', 'arguments': arguments}}]}
+            else:
+                message = {'content': '分割案を確認したよ。'}
+            return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        task_id = client.post('/api/tasks', json={'title': '分割案', 'estimated_minutes': 60}).json()['id']
+        client.post('/api/chat', json={'content': '分割案を3日に分けて配置案を作って'})
+
+    tool_message = next(message for message in posts[1]['messages'] if message['role'] == 'tool')
+    result = json.loads(tool_message['content'])
+    assert result['ok'] is True and len(result['allocations']) == 3
+
+
+@pytest.mark.parametrize('tool_name', ['unschedule_task', 'delete_task'])
+def test_chat_verifies_claims_about_every_removed_allocation(monkeypatch, tmp_path, future_task_start, tool_name):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / f'remove-{tool_name}.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    first_day = future_task_start
+    with TestClient(norn_app.app) as client:
+        task_id = client.post('/api/tasks', json={'title': '消す対象', 'estimated_minutes': 60}).json()['id']
+        allocation_ids = [
+            client.post(f'/api/tasks/{task_id}/allocations', json={
+                'start_at': (first_day + timedelta(hours=day)).isoformat(),
+                'end_at': (first_day + timedelta(hours=day, minutes=20)).isoformat(),
+            }).json()['id'] for day in range(3)
+        ]
+        calls = []
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, json, headers):
+                calls.append(json)
+                if 'response_format' in json:
+                    claims = [{'kind': 'allocation', 'id': allocation_id, 'fields': {}, 'exists': False, 'changed': True} for allocation_id in allocation_ids]
+                    message = {'content': globals()['json'].dumps({'supported': True, 'claims': claims})}
+                elif 'tools' in json and not any(message['role'] == 'tool' for message in json['messages']):
+                    message = {'content': None, 'tool_calls': [{'id': 'r', 'type': 'function', 'function': {'name': tool_name, 'arguments': globals()['json'].dumps({'task_id': task_id})}}]}
+                else:
+                    message = {'content': '3件の予定を消したよ。'}
+                return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+        monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+        response = client.post('/api/chat', json={'content': '消す対象の予定をすべて消して'})
+        assert response.status_code == 200
+        remaining = [] if tool_name == 'delete_task' else client.get(f'/api/tasks/{task_id}/allocations').json()
+        assert remaining == []
+    assert response.json()['assistant_message']['content'] == '3件の予定を消したよ。'
+    assert len(calls) == 2
+
+
+def test_split_allocation_proposal_applies_all_blocks_after_approval(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'split-allocation-proposal.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={
+            'title': '分割練習', 'estimated_minutes': 90, 'splittable': True,
+            'min_session_minutes': 30, 'max_session_minutes': 60,
+        }).json()
+        client.post('/api/events', json={
+            'title': '固定予定',
+            'start_at': (future_task_start + timedelta(minutes=45)).isoformat(),
+            'end_at': (future_task_start + timedelta(minutes=60)).isoformat(),
+        })
+        plan = tasks_module.execute_task_tool('plan_task_allocations', {
+            'task_id': task['id'],
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(hours=4)).isoformat(),
+        })
+        actions = [{
+            'name': 'create_task_allocation',
+            'arguments_json': json.dumps({
+                'task_id': task['id'], 'start_at': block['start_at'], 'end_at': block['end_at'],
+            }),
+        } for block in plan['allocations']]
+        conversation_id = str(uuid.uuid4())
+        proposal = proposals_module.propose_schedule(conversation_id, {'actions': actions})
+        assert proposal['ok'] and proposal['state'] == 'proposed'
+        assert client.get(f"/api/tasks/{task['id']}/allocations").json() == []
+        with closing(database_module.open_database()) as connection:
+            timestamp = database_module.now_iso()
+            connection.execute(
+                'INSERT INTO conversations VALUES (?, ?, ?, ?)',
+                (conversation_id, '分割作業枠の案', timestamp, timestamp),
+            )
+            message_id = connection.execute(
+                '''INSERT INTO messages (conversation_id, role, content, created_at)
+                   VALUES (?, 'assistant', ?, ?)''',
+                (conversation_id, '2枠の案でよい？', timestamp),
+            ).lastrowid
+            connection.execute(
+                'UPDATE schedule_proposals SET response_message_id=? WHERE conversation_id=?',
+                (message_id, conversation_id),
+            )
+            connection.commit()
+
+        results = proposals_module.apply_approved_proposal(conversation_id, 'お願いします')
+        allocations = client.get(f"/api/tasks/{task['id']}/allocations").json()
+
+    assert all(result['ok'] for result in results)
+    assert len(allocations) == 2
+    assert sum(
+        int((datetime.fromisoformat(item['end_at']) - datetime.fromisoformat(item['start_at'])).total_seconds() // 60)
+        for item in allocations
+    ) == 90
+
+
+def test_task_metadata_is_persisted_and_validated(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'task-metadata.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={
+            'title': '集中作業', 'estimated_minutes': 90, 'remaining_minutes': 60,
+            'focus_level': 4, 'preferred_period': 'morning', 'splittable': True,
+            'min_session_minutes': 20, 'max_session_minutes': 45,
+            'context': 'ノートPC', 'flexibility': 'flexible',
+        })
+        invalid_bounds = client.post('/api/tasks', json={
+            'title': '不正な作業', 'estimated_minutes': 60,
+            'min_session_minutes': 45, 'max_session_minutes': 30,
+        })
+        assert task.status_code == 201
+        task_id = task.json()['id']
+        updated = client.patch(f'/api/tasks/{task_id}', json={'remaining_minutes': 30, 'focus_level': 2})
+        invalid_update = client.patch(
+            f'/api/tasks/{task_id}', json={'min_session_minutes': 50},
+        )
+
+    assert task.json()['remaining_minutes'] == 60
+    assert task.json()['focus_level'] == 4
+    assert task.json()['splittable'] == 1
+    assert task.json()['flexibility'] == 'flexible'
+    assert invalid_bounds.status_code == 422
+    assert updated.status_code == 200
+    assert updated.json()['remaining_minutes'] == 30
+    assert updated.json()['focus_level'] == 2
+    assert invalid_update.status_code == 422
+
+
+def test_routine_definitions_and_plans_are_persisted(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'routine-models.sqlite3')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json={
+            'title': '週の練習', 'routine_type': 'achievement', 'frequency': 'weekly',
+            'target_count': 3, 'duration_minutes': 45, 'min_count': 2, 'max_count': 4,
+            'adjustment_policy': 'flexible', 'flexible': True,
+        })
+        routine_id = routine.json()['id']
+        plan = client.post(f'/api/routines/{routine_id}/plans', json={
+            'period_start': '2026-11-09', 'period_end': '2026-11-15',
+            'target_count': 2, 'duration_minutes': 30,
+            'adjustment_reason': '今週だけ調整', 'adjustment_source': 'user',
+        })
+        overlapping_plan = client.post(f'/api/routines/{routine_id}/plans', json={
+            'period_start': '2026-11-15', 'period_end': '2026-11-21',
+            'target_count': 2, 'duration_minutes': 30,
+        })
+        listed = client.get('/api/routine-plans', params={
+            'routine_id': routine_id, 'start': '2026-11-10', 'end': '2026-11-11',
+        })
+
+    assert routine.status_code == 201
+    assert routine.json()['flexible'] == 1
+    assert plan.status_code == 201
+    assert plan.json()['target_count'] == 2
+    assert overlapping_plan.status_code == 409
+    assert [row['id'] for row in listed.json()] == [plan.json()['id']]
+
+
+def test_routine_update_validates_and_deactivates(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'routine-update.sqlite3')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json={
+            'title': '朝の習慣', 'duration_minutes': 20,
+            'target_count': 2, 'min_count': 1, 'max_count': 3,
+        }).json()
+        invalid_update = client.put(f"/api/routines/{routine['id']}", json={'target_count': 4})
+        updated = client.put(f"/api/routines/{routine['id']}", json={'title': '朝の記録'})
+        deactivated = client.delete(f"/api/routines/{routine['id']}")
+        active = client.get('/api/routines', params={'active': True})
+        inactive = client.get('/api/routines', params={'active': False})
+
+    assert invalid_update.status_code == 422
+    assert updated.status_code == 200
+    assert updated.json()['title'] == '朝の記録'
+    assert deactivated.status_code == 204
+    assert all(item['id'] != routine['id'] for item in active.json())
+    assert any(item['id'] == routine['id'] and item['is_active'] == 0 for item in inactive.json())
+
+
+def test_execution_log_records_actuals_without_completing_task(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'execution-log.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '実績記録用', 'estimated_minutes': 60}).json()
+        response = client.post('/api/execution-logs', json={
+            'task_id': task['id'],
+            'started_at': future_task_start.isoformat(),
+            'ended_at': (future_task_start + timedelta(minutes=35)).isoformat(),
+            'status': 'partial',
+            'resume_point': '次はテストを実行する',
+        })
+        logs = client.get('/api/execution-logs', params={'task_id': task['id']})
+        updated_task = client.get('/api/tasks').json()[0]
+
+    assert response.status_code == 201
+    assert response.json()['actual_minutes'] == 35
+    assert response.json()['status'] == 'partial'
+    assert response.json()['resume_point'] == '次はテストを実行する'
+    assert len(logs.json()) == 1
+    assert updated_task['status'] == 'open'
 
 
 def test_gemini_creates_goal_and_linked_project_without_approval(monkeypatch, tmp_path):

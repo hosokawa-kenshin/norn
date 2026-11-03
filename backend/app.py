@@ -9,10 +9,12 @@ from fastapi.responses import RedirectResponse
 from chat import router as chat_router
 from database import initialize_database
 from events import router as events_router
+from execution import router as execution_router
 from google_calendar import router as google_calendar_router, sync_worker
 from memory import router as memory_router
 from planning import router as planning_router
 from reminders import router as reminders_router
+from routines import router as routines_router
 from tasks import router as tasks_router
 import settings
 from tts import SpeechService, router as tts_router
@@ -47,10 +49,12 @@ app.add_middleware(
 )
 app.include_router(chat_router)
 app.include_router(events_router)
+app.include_router(execution_router)
 app.include_router(google_calendar_router)
 app.include_router(memory_router)
 app.include_router(planning_router)
 app.include_router(reminders_router)
+app.include_router(routines_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
 app.include_router(tts_router)

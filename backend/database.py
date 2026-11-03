@@ -60,6 +60,28 @@ def open_database() -> sqlite3.Connection:
 
 def initialize_database() -> None:
     with closing(open_database()) as connection:
+        existing_tables = {
+            row['name'] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'",
+            ).fetchall()
+        }
+        if 'routine_occurrences' in existing_tables:
+            routine_occurrence_columns = {
+                row['name'] for row in connection.execute(
+                    'PRAGMA table_info(routine_occurrences)',
+                ).fetchall()
+            }
+            if 'source_task_id' in routine_occurrence_columns and 'routine_id' not in routine_occurrence_columns:
+                if 'task_occurrence_links' not in existing_tables:
+                    connection.execute(
+                        'ALTER TABLE routine_occurrences RENAME TO task_occurrence_links',
+                    )
+                else:
+                    connection.execute(
+                        '''INSERT OR IGNORE INTO task_occurrence_links (source_task_id, occurrence_date, task_id)
+                           SELECT source_task_id, occurrence_date, task_id FROM routine_occurrences''',
+                    )
+                    connection.execute('DROP TABLE routine_occurrences')
         connection.executescript(
             '''
             CREATE TABLE IF NOT EXISTS conversations (
@@ -117,6 +139,16 @@ def initialize_database() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 start_at TEXT NOT NULL,
                 end_at TEXT NOT NULL,
+                task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                routine_occurrence_id TEXT,
+                kind TEXT NOT NULL DEFAULT 'fixed'
+                    CHECK(kind IN ('fixed', 'task_block', 'routine_block', 'break', 'personal')),
+                source TEXT NOT NULL DEFAULT 'user'
+                    CHECK(source IN ('user', 'norn', 'google')),
+                schedule_status TEXT NOT NULL DEFAULT 'scheduled'
+                    CHECK(schedule_status IN ('scheduled', 'completed', 'cancelled')),
+                is_fixed INTEGER NOT NULL DEFAULT 1,
+                is_important INTEGER NOT NULL DEFAULT 0,
                 is_all_day INTEGER NOT NULL DEFAULT 0,
                 recurrence_timezone TEXT NOT NULL DEFAULT 'Asia/Tokyo',
                 recurrence_json TEXT NOT NULL DEFAULT '[]',
@@ -185,8 +217,17 @@ def initialize_database() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 due_at TEXT,
                 estimated_minutes INTEGER,
+                remaining_minutes INTEGER,
                 priority TEXT NOT NULL CHECK(priority IN ('low', 'normal', 'high')),
                 status TEXT NOT NULL CHECK(status IN ('open', 'in_progress', 'done', 'cancelled')),
+                focus_level INTEGER CHECK(focus_level BETWEEN 1 AND 5),
+                preferred_period TEXT,
+                splittable INTEGER NOT NULL DEFAULT 1,
+                min_session_minutes INTEGER,
+                max_session_minutes INTEGER,
+                context TEXT NOT NULL DEFAULT '',
+                flexibility TEXT NOT NULL DEFAULT 'user_approval'
+                    CHECK(flexibility IN ('flexible', 'user_approval', 'fixed')),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
@@ -195,7 +236,7 @@ def initialize_database() -> None:
                 ON tasks(status, due_at);
             CREATE TABLE IF NOT EXISTS task_allocations (
                 id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                 start_at TEXT NOT NULL,
                 end_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -203,12 +244,83 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_task_allocations_start_end
                 ON task_allocations(start_at, end_at);
-            CREATE TABLE IF NOT EXISTS routine_occurrences (
+            CREATE INDEX IF NOT EXISTS ix_task_allocations_task_start
+                ON task_allocations(task_id, start_at);
+            CREATE TABLE IF NOT EXISTS task_occurrence_links (
                 source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                 occurrence_date TEXT NOT NULL,
                 task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
                 PRIMARY KEY (source_task_id, occurrence_date)
             );
+            CREATE TABLE IF NOT EXISTS routines (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                routine_type TEXT NOT NULL DEFAULT 'maintenance'
+                    CHECK(routine_type IN ('achievement', 'maintenance', 'fixed')),
+                frequency TEXT NOT NULL DEFAULT 'weekly',
+                target_count INTEGER NOT NULL DEFAULT 1 CHECK(target_count > 0),
+                duration_minutes INTEGER NOT NULL CHECK(duration_minutes > 0),
+                preferred_period TEXT,
+                min_count INTEGER NOT NULL DEFAULT 0 CHECK(min_count >= 0),
+                max_count INTEGER NOT NULL CHECK(max_count > 0),
+                adjustment_policy TEXT NOT NULL DEFAULT 'user_approval'
+                    CHECK(adjustment_policy IN ('flexible', 'user_approval', 'fixed')),
+                flexible INTEGER NOT NULL DEFAULT 0,
+                priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS routine_plans (
+                id TEXT PRIMARY KEY,
+                routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                target_count INTEGER NOT NULL CHECK(target_count >= 0),
+                duration_minutes INTEGER NOT NULL CHECK(duration_minutes > 0),
+                adjustment_reason TEXT NOT NULL DEFAULT '',
+                adjustment_source TEXT NOT NULL DEFAULT 'user',
+                status TEXT NOT NULL DEFAULT 'planned'
+                    CHECK(status IN ('planned', 'active', 'completed', 'cancelled')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(period_end >= period_start)
+            );
+            CREATE INDEX IF NOT EXISTS ix_routine_plans_period
+                ON routine_plans(routine_id, period_start, period_end);
+            CREATE TABLE IF NOT EXISTS routine_occurrences (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT REFERENCES routine_plans(id) ON DELETE SET NULL,
+                routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+                schedule_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+                scheduled_start TEXT NOT NULL,
+                scheduled_end TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'scheduled'
+                    CHECK(status IN ('scheduled', 'completed', 'partial', 'skipped', 'cancelled')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(scheduled_end > scheduled_start)
+            );
+            CREATE INDEX IF NOT EXISTS ix_routine_occurrences_routine_start
+                ON routine_occurrences(routine_id, scheduled_start);
+            CREATE TABLE IF NOT EXISTS execution_logs (
+                id TEXT PRIMARY KEY,
+                schedule_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+                task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                routine_id TEXT REFERENCES routines(id) ON DELETE SET NULL,
+                started_at TEXT,
+                ended_at TEXT,
+                actual_minutes INTEGER CHECK(actual_minutes IS NULL OR actual_minutes >= 0),
+                status TEXT NOT NULL CHECK(status IN ('completed', 'partial', 'skipped', 'cancelled')),
+                note TEXT NOT NULL DEFAULT '',
+                resume_point TEXT NOT NULL DEFAULT '',
+                recorded_source TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL,
+                CHECK(started_at IS NOT NULL OR ended_at IS NOT NULL OR status IN ('skipped', 'cancelled'))
+            );
+            CREATE INDEX IF NOT EXISTS ix_execution_logs_task_created
+                ON execution_logs(task_id, created_at);
             CREATE TABLE IF NOT EXISTS schedule_notices (
                 notice_key TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -225,10 +337,24 @@ def initialize_database() -> None:
         task_columns = {
             row['name'] for row in connection.execute('PRAGMA table_info(tasks)').fetchall()
         }
-        if 'project_id' not in task_columns:
-            connection.execute(
-                'ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL'
-            )
+        task_migrations = {
+            'project_id': 'TEXT REFERENCES projects(id) ON DELETE SET NULL',
+            'remaining_minutes': 'INTEGER',
+            'focus_level': 'INTEGER CHECK(focus_level BETWEEN 1 AND 5)',
+            'preferred_period': 'TEXT',
+            'splittable': 'INTEGER NOT NULL DEFAULT 1',
+            'min_session_minutes': 'INTEGER',
+            'max_session_minutes': 'INTEGER',
+            'context': "TEXT NOT NULL DEFAULT ''",
+            'flexibility': "TEXT NOT NULL DEFAULT 'user_approval'",
+        }
+        for column, definition in task_migrations.items():
+            if column not in task_columns:
+                connection.execute(f'ALTER TABLE tasks ADD COLUMN {column} {definition}')
+        # 初期値を0にしていた旧版のタスクを一度だけ分割可能へ揃える
+        if connection.execute('PRAGMA user_version').fetchone()[0] < 1:
+            connection.execute('UPDATE tasks SET splittable = 1')
+            connection.execute('PRAGMA user_version = 1')
         goal_columns = {
             row['name'] for row in connection.execute('PRAGMA table_info(goals)').fetchall()
         }
@@ -238,6 +364,13 @@ def initialize_database() -> None:
             row['name'] for row in connection.execute('PRAGMA table_info(events)').fetchall()
         }
         event_migrations = {
+            'task_id': 'TEXT REFERENCES tasks(id) ON DELETE SET NULL',
+            'routine_occurrence_id': 'TEXT',
+            'kind': "TEXT NOT NULL DEFAULT 'fixed'",
+            'source': "TEXT NOT NULL DEFAULT 'user'",
+            'schedule_status': "TEXT NOT NULL DEFAULT 'scheduled'",
+            'is_fixed': 'INTEGER NOT NULL DEFAULT 1',
+            'is_important': 'INTEGER NOT NULL DEFAULT 0',
             'is_all_day': 'INTEGER NOT NULL DEFAULT 0',
             'recurrence_timezone': "TEXT NOT NULL DEFAULT 'Asia/Tokyo'",
             'recurrence_json': "TEXT NOT NULL DEFAULT '[]'",
@@ -256,6 +389,37 @@ def initialize_database() -> None:
         for column, definition in event_migrations.items():
             if column not in event_columns:
                 connection.execute(f'ALTER TABLE events ADD COLUMN {column} {definition}')
+        connection.execute(
+            '''UPDATE events SET source = CASE WHEN google_event_id IS NOT NULL THEN 'google' ELSE 'user' END,
+               is_fixed = 1 WHERE kind = 'fixed' AND source = 'user' AND is_fixed = 0''',
+        )
+        allocation_indexes = connection.execute(
+            "PRAGMA index_list('task_allocations')",
+        ).fetchall()
+        if any(index['unique'] and index['origin'] == 'u' for index in allocation_indexes):
+            connection.execute(
+                '''CREATE TABLE task_allocations_rebuilt (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    start_at TEXT NOT NULL,
+                    end_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )''',
+            )
+            connection.execute(
+                '''INSERT INTO task_allocations_rebuilt
+                   (id, task_id, start_at, end_at, created_at, updated_at)
+                   SELECT id, task_id, start_at, end_at, created_at, updated_at FROM task_allocations''',
+            )
+            connection.execute('DROP TABLE task_allocations')
+            connection.execute('ALTER TABLE task_allocations_rebuilt RENAME TO task_allocations')
+            connection.execute(
+                'CREATE INDEX IF NOT EXISTS ix_task_allocations_start_end ON task_allocations(start_at, end_at)',
+            )
+            connection.execute(
+                'CREATE INDEX IF NOT EXISTS ix_task_allocations_task_start ON task_allocations(task_id, start_at)',
+            )
         connection.execute(
             'CREATE UNIQUE INDEX IF NOT EXISTS ix_events_google_event_id ON events(google_event_id)'
         )

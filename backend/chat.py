@@ -170,8 +170,34 @@ def has_action_completion(text: str) -> bool:
     return any(ACTION_COMPLETION_PATTERN.search(clause) and not re.search(r'失敗|できな|できません|していません|未登録|未反映|未確定', clause) for clause in clauses)
 
 
+def split_allocation_proposal_reply(proposal: dict[str, Any]) -> str | None:
+    if proposal.get('state') != 'proposed' or not proposal.get('ok'):
+        return None
+    actions = proposal.get('actions') or []
+    if len(actions) < 2 or any(action.get('name') != 'create_task_allocation' for action in actions):
+        return None
+    try:
+        slots = [json.loads(action['arguments_json']) for action in actions]
+        task_ids = {slot['task_id'] for slot in slots}
+        if len(task_ids) != 1:
+            return None
+        title = next((task['title'] for task in schedule_snapshot()['tasks'] if task['id'] in task_ids), None)
+        if title is None:
+            return None
+        weekdays = '月火水木金土日'
+        lines = []
+        for slot in sorted(slots, key=lambda item: item['start_at']):
+            start = datetime.fromisoformat(slot['start_at']).astimezone(LOCAL_TIMEZONE)
+            end = datetime.fromisoformat(slot['end_at']).astimezone(LOCAL_TIMEZONE)
+            minutes = int((end - start).total_seconds() // 60)
+            lines.append(f'・{start.month}/{start.day}({weekdays[start.weekday()]}) {start:%H:%M}〜{end:%H:%M}（{minutes}分）')
+    except (KeyError, ValueError, TypeError):
+        return None
+    return f'「{title}」を{len(lines)}回に分ける案を作ったよ。まだ保存はしていません。\n' + '\n'.join(lines) + '\nこの内容でよければ「お願いします」と返してね。'
+
+
 def deterministic_action_reply(results: list[dict[str, Any]]) -> str | None:
-    read_only_tools = {'list_events', 'list_tasks', 'find_task_slots'}
+    read_only_tools = {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations'}
     supported_tools = {'create_event', 'update_event', 'create_task', 'update_task', 'schedule_task'}
     actions = []
     for result in results:
@@ -557,7 +583,7 @@ async def generate_llm_reply(
         check_llm_available()
         available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *PROPOSAL_TOOLS, *ROUTINE_TOOLS]
         if proposal_only:
-            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'propose_schedule', 'propose_routine'}]
+            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'propose_schedule', 'propose_routine'}]
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
@@ -652,10 +678,7 @@ async def generate_llm_reply(
                 else:
                     if name in mutating_tools:
                         seen_tool_calls.add(call_key)
-                    task_tools = {
-                        'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
-                        'find_task_slots', 'schedule_task', 'unschedule_task',
-                    }
+                    task_tools = {tool['function']['name'] for tool in TASK_TOOLS}
                     memory_tools = {tool['function']['name'] for tool in MEMORY_TOOLS}
                     goal_project_tools = {tool['function']['name'] for tool in GOAL_PROJECT_TOOLS}
                     if name in memory_tools:
@@ -689,6 +712,10 @@ async def generate_llm_reply(
         if any(result.get('state') in {'proposed', 'needs_input'} and result.get('proposal_id') for result in tool_results):
             latest_proposal = next(result for result in reversed(tool_results) if result.get('proposal_id') and result.get('state') in {'proposed', 'needs_input'})
             committed = [result for result in tool_results if result.get('ok') and result.get('state') != 'proposed' and (result.get('summary') or result.get('task'))]
+            if not committed:
+                split_reply = split_allocation_proposal_reply(latest_proposal)
+                if split_reply is not None:
+                    return split_reply
             return await generate_action_reply(build_system_prompt() + proposal_context(conversation_id), messages, [*committed, latest_proposal])
         if any(not result.get('ok') and result.get('error') == '同じツール呼び出しを重複実行しませんでした。' for result in tool_results):
             return await generate_action_reply(llm_messages[0]['content'], messages, tool_results)
