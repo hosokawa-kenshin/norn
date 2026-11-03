@@ -84,6 +84,7 @@ def initialize_database() -> None:
                 baseline_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(state IN ('pending', 'applied', 'invalid')),
                 result_json TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 response_message_id INTEGER,
                 created_at TEXT NOT NULL
             );
@@ -202,6 +203,12 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_task_allocations_start_end
                 ON task_allocations(start_at, end_at);
+            CREATE TABLE IF NOT EXISTS routine_occurrences (
+                source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                occurrence_date TEXT NOT NULL,
+                task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+                PRIMARY KEY (source_task_id, occurrence_date)
+            );
             CREATE TABLE IF NOT EXISTS schedule_notices (
                 notice_key TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -212,6 +219,9 @@ def initialize_database() -> None:
             );
             '''
         )
+        proposal_columns = {row['name'] for row in connection.execute('PRAGMA table_info(schedule_proposals)').fetchall()}
+        if 'metadata_json' not in proposal_columns:
+            connection.execute("ALTER TABLE schedule_proposals ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
         task_columns = {
             row['name'] for row in connection.execute('PRAGMA table_info(tasks)').fetchall()
         }

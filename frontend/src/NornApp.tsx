@@ -504,6 +504,12 @@ export default function NornApp() {
         body: JSON.stringify({ conversation_id: activeId, content }),
         signal,
       })
+      if (response.status === 429) {
+        setError(await responseError(response))
+        setDraft(content)
+        handsFree.endSession()
+        return
+      }
       if (!response.ok) throw new Error(await responseError(response))
       const result = (await response.json()) as {
         conversation_id: string

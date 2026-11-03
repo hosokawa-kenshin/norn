@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from database import now_iso, open_database
+from events import find_event_conflicts, query_events
 from settings import PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS
 
 LOCAL_TIMEZONE = ZoneInfo('Asia/Tokyo')
@@ -291,10 +292,7 @@ def find_task_slots(
         if local_end <= local_start:
             return {'task_id': task_id, 'title': task['title'], 'slots': []}
 
-        busy_events = connection.execute(
-            'SELECT start_at, end_at FROM events WHERE start_at < ? AND end_at > ?',
-            (task_datetime_iso(local_end), task_datetime_iso(local_start)),
-        ).fetchall()
+        busy_events = [event for event in query_events(local_start, local_end) if not event.get('is_cancelled')]
         busy_tasks = connection.execute(
             '''
             SELECT start_at, end_at FROM task_allocations
@@ -383,9 +381,7 @@ def schedule_task_record(task_id: str, start_at: datetime) -> dict[str, Any]:
 
         start_iso = task_datetime_iso(start)
         end_iso = task_datetime_iso(end)
-        conflicts = connection.execute(
-            'SELECT title FROM events WHERE start_at < ? AND end_at > ?', (end_iso, start_iso)
-        ).fetchall()
+        conflicts = find_event_conflicts(connection, start_iso, end_iso)
         conflicts += connection.execute(
             '''
             SELECT tasks.title FROM task_allocations
@@ -449,10 +445,13 @@ def query_tasks(
     query = '''
         SELECT tasks.*, projects.title AS project_title,
             task_allocations.start_at AS scheduled_start,
-            task_allocations.end_at AS scheduled_end
+            task_allocations.end_at AS scheduled_end,
+            routine_occurrences.source_task_id AS routine_source_task_id,
+            routine_occurrences.occurrence_date AS routine_date
         FROM tasks
         LEFT JOIN projects ON projects.id = tasks.project_id
         LEFT JOIN task_allocations ON task_allocations.task_id = tasks.id
+        LEFT JOIN routine_occurrences ON routine_occurrences.task_id = tasks.id
     '''
     if conditions:
         query += ' WHERE ' + ' AND '.join(conditions)

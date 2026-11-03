@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from database import now_iso, open_database
 from events import LOCAL_TIMEZONE, event_datetime_iso, find_event_conflicts, query_events
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, logger
+from llm_limits import check_llm_available, check_llm_response
 from tasks import (
     PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS,
     ceil_to_quarter_hour, configured_time, list_task_allocations,
@@ -68,6 +69,7 @@ def following_item(item: dict[str, Any], items: list[dict[str, Any]]) -> dict[st
 def generate_notice_text(item: dict[str, Any], boundary: str, following: dict[str, Any] | None) -> str:
     from chat import build_system_prompt
 
+    check_llm_available()
     if not LLM_MODEL:
         raise HTTPException(503, '通知文の生成にはGeminiの設定が必要です。')
     fields = ('title', 'kind', 'start_at', 'end_at')
@@ -99,6 +101,7 @@ def generate_notice_text(item: dict[str, Any], boundary: str, following: dict[st
                     ],
                 },
             )
+        check_llm_response(response)
         response.raise_for_status()
         message = response.json()['choices'][0]['message']
         text = message.get('content')
