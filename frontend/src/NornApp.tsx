@@ -8,11 +8,13 @@ import {
   ChevronLeft,
   ClipboardList,
   CircleAlert,
+  ClipboardCheck,
   Clock3,
   Mic,
   MicOff,
   Plus,
   Pencil,
+  Repeat,
   Send,
   Settings2,
   Sparkles,
@@ -22,6 +24,8 @@ import {
   Square,
 } from 'lucide-react'
 import GoalsView from './GoalsView'
+import RoutinesView from './RoutinesView'
+import ActualsView from './ActualsView'
 import TasksView from './TasksView'
 import useSpeech from './useSpeech'
 import useHandsFree from './useHandsFree'
@@ -34,7 +38,7 @@ type ApiStatus = {
   llm: { configured: boolean; model: string }
 }
 type VoiceState = 'idle' | 'recording' | 'transcribing'
-type AppView = 'chat' | 'schedule' | 'tasks' | 'goals'
+type AppView = 'chat' | 'schedule' | 'tasks' | 'routines' | 'actuals' | 'goals'
 type CalendarMode = 'day' | 'week'
 type EventItem = {
   id: string
@@ -44,6 +48,7 @@ type EventItem = {
   end_at: string
   is_all_day: boolean
   recurrence: string[]
+  kind?: string
   series_id?: string | null
   occurrence_id?: string
   series_title?: string
@@ -770,12 +775,14 @@ export default function NornApp() {
 
       <main className="main-panel">
         <header className="topbar">
-          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : view === 'schedule' ? '予定' : view === 'tasks' ? 'タスク' : '目標'}</h1></div>
+          <div><div className="eyebrow">NORN / PERSONAL SYSTEM</div><h1>{view === 'chat' ? '会話' : view === 'schedule' ? '予定' : view === 'tasks' ? 'タスク' : view === 'routines' ? 'ルーティン' : view === 'actuals' ? '実績' : '目標'}</h1></div>
           <div className="topbar-actions">
             <nav className="main-view-switch" aria-label="表示切替">
               <button className={view === 'chat' ? 'is-active' : ''} type="button" onClick={() => setView('chat')}><AudioLines size={15} />会話</button>
               <button className={view === 'schedule' ? 'is-active' : ''} type="button" onClick={() => setView('schedule')}><CalendarDays size={15} />予定</button>
               <button className={view === 'tasks' ? 'is-active' : ''} type="button" onClick={() => setView('tasks')}><ClipboardList size={15} />タスク</button>
+              <button className={view === 'routines' ? 'is-active' : ''} type="button" onClick={() => setView('routines')}><Repeat size={15} />ルーティン</button>
+              <button className={view === 'actuals' ? 'is-active' : ''} type="button" onClick={() => setView('actuals')}><ClipboardCheck size={15} />実績</button>
               <button className={view === 'goals' ? 'is-active' : ''} type="button" onClick={() => setView('goals')}><Target size={15} />目標</button>
             </nav>
             <div className="topbar-state"><span className={`llm-dot ${status?.llm.configured ? 'is-ready' : ''}`} />
@@ -865,7 +872,7 @@ export default function NornApp() {
                   {dayEvents.map((event) => <article className="event-row" key={event.occurrence_id ?? event.id}>
                     <div className="event-time"><strong>{event.is_all_day ? '終日' : formatEventTime(event.start_at)}</strong>{!event.is_all_day && <span>{formatEventTime(event.end_at)}</span>}</div>
                     <div className="event-color-mark" />
-                    <div className="event-content"><h3>{event.title}</h3>{event.recurrence.length > 0 && <span className="event-repeat-label">繰り返し</span>}{event.description && <p>{event.description}</p>}</div>
+                    <div className="event-content">{event.kind === 'routine_block' && <button className="task-slot-label routine-slot-link" type="button" onClick={() => setView('routines')} title="ルーティン画面を開く">ルーティン枠</button>}<h3>{event.title}</h3>{event.recurrence.length > 0 && <span className="event-repeat-label">繰り返し</span>}{event.description && <p>{event.description}</p>}</div>
                     <div className="event-controls">
                       <button className="calendar-icon-button" type="button" onClick={() => openEditEvent(event)} aria-label={`${event.title}を編集`} title="編集"><Pencil size={15} /></button>
                       <button className="calendar-icon-button danger" type="button" onClick={() => void deleteEvent(event)} aria-label={`${event.title}を削除`} title="削除"><Trash2 size={15} /></button>
@@ -882,7 +889,7 @@ export default function NornApp() {
             })}
           </div>
           {events.length === 0 && taskAllocations.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
-        </section> : view === 'tasks' ? <TasksView onRequestSchedule={requestTaskSchedule} onRequestWeekPlan={requestWeekPlan} /> : (
+        </section> : view === 'tasks' ? <TasksView onRequestSchedule={requestTaskSchedule} onRequestWeekPlan={requestWeekPlan} /> : view === 'routines' ? <RoutinesView /> : view === 'actuals' ? <ActualsView /> : (
           <GoalsView onPlanProject={planProjectTasks} />
         )}
 

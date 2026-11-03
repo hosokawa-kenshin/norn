@@ -18,15 +18,18 @@ class ExecutionLogPayload(BaseModel):
     schedule_id: str | None = None
     task_id: str | None = None
     routine_id: str | None = None
+    occurrence_id: str | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
     actual_minutes: int | None = Field(default=None, ge=0, le=1440)
     status: ExecutionStatus
     note: str = Field(default='', max_length=4000)
     resume_point: str = Field(default='', max_length=2000)
+    interruption_reason: str = Field(default='', max_length=2000)
+    progress_percent: int | None = Field(default=None, ge=0, le=100)
     recorded_source: Literal['user', 'norn'] = 'user'
 
-    @field_validator('schedule_id', 'task_id', 'routine_id')
+    @field_validator('schedule_id', 'task_id', 'routine_id', 'occurrence_id')
     @classmethod
     def validate_id(cls, value: str | None) -> str | None:
         if value is None:
@@ -47,7 +50,7 @@ class ExecutionLogPayload(BaseModel):
 
     @model_validator(mode='after')
     def validate_execution(self):
-        if not (self.schedule_id or self.task_id or self.routine_id):
+        if not (self.schedule_id or self.task_id or self.routine_id or self.occurrence_id):
             raise ValueError('予定・タスク・ルーティンのいずれかを指定してください。')
         if self.started_at and self.ended_at and self.ended_at <= self.started_at:
             raise ValueError('終了時刻は開始時刻より後にしてください。')
@@ -69,6 +72,7 @@ def _execution_row(connection: Any, log_id: str) -> dict[str, Any]:
 def list_execution_logs(
     task_id: str | None = None,
     routine_id: str | None = None,
+    occurrence_id: str | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -76,7 +80,7 @@ def list_execution_logs(
         raise HTTPException(status_code=422, detail='期間の開始と終了を両方指定してください。')
     conditions = []
     parameters: list[Any] = []
-    for column, value in (('task_id', task_id), ('routine_id', routine_id)):
+    for column, value in (('task_id', task_id), ('routine_id', routine_id), ('occurrence_id', occurrence_id)):
         if value is not None:
             try:
                 value = str(uuid.UUID(value))
@@ -105,10 +109,21 @@ def list_execution_logs(
 @router.post('/api/execution-logs', status_code=201)
 def create_execution_log(payload: ExecutionLogPayload) -> dict[str, Any]:
     with closing(open_database()) as connection:
+        schedule_id, routine_id = payload.schedule_id, payload.routine_id
+        if payload.occurrence_id is not None:
+            occurrence = connection.execute(
+                'SELECT routine_id, schedule_id FROM routine_occurrences WHERE id = ?', (payload.occurrence_id,),
+            ).fetchone()
+            if occurrence is None:
+                raise HTTPException(status_code=404, detail='関連するルーティン実施予定が見つかりません。')
+            if routine_id is not None and routine_id != occurrence['routine_id']:
+                raise HTTPException(status_code=422, detail='実施予定と異なるルーティンが指定されています。')
+            routine_id = occurrence['routine_id']
+            schedule_id = schedule_id or occurrence['schedule_id']
         for table, record_id, message in (
-            ('events', payload.schedule_id, '関連する予定が見つかりません。'),
+            ('events', schedule_id, '関連する予定が見つかりません。'),
             ('tasks', payload.task_id, '関連するタスクが見つかりません。'),
-            ('routines', payload.routine_id, '関連するルーティンが見つかりません。'),
+            ('routines', routine_id, '関連するルーティンが見つかりません。'),
         ):
             if record_id is not None and not connection.execute(
                 f'SELECT id FROM {table} WHERE id = ?', (record_id,),
@@ -120,16 +135,22 @@ def create_execution_log(payload: ExecutionLogPayload) -> dict[str, Any]:
         log_id = str(uuid.uuid4())
         connection.execute(
             '''INSERT INTO execution_logs (
-                id, schedule_id, task_id, routine_id, started_at, ended_at, actual_minutes,
-                status, note, resume_point, recorded_source, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                id, schedule_id, task_id, routine_id, occurrence_id, started_at, ended_at, actual_minutes,
+                status, note, resume_point, interruption_reason, progress_percent, recorded_source, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (
-                log_id, payload.schedule_id, payload.task_id, payload.routine_id,
+                log_id, schedule_id, payload.task_id, routine_id, payload.occurrence_id,
                 payload.started_at.isoformat() if payload.started_at else None,
                 payload.ended_at.isoformat() if payload.ended_at else None,
                 actual_minutes, payload.status, payload.note.strip(), payload.resume_point.strip(),
+                payload.interruption_reason.strip(), payload.progress_percent,
                 payload.recorded_source, now_iso(),
             ),
         )
+        if payload.occurrence_id is not None:
+            connection.execute(
+                'UPDATE routine_occurrences SET status = ?, updated_at = ? WHERE id = ?',
+                (payload.status, now_iso(), payload.occurrence_id),
+            )
         connection.commit()
         return _execution_row(connection, log_id)

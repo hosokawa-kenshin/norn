@@ -26,6 +26,8 @@ import tasks as tasks_module
 import reminders as reminders_module
 import schedule_actions as actions_module
 import routines as routines_module
+import routine_planning as routine_planning_module
+import execution_tools as execution_tools_module
 import llm_limits as llm_limits_module
 import voice as voice_module
 import tts as tts_module
@@ -2059,7 +2061,9 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         'extend_schedule',
         'apply_schedule',
         'schedule_week_plan',
-        'schedule_routine', 'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
+        'schedule_routine', 'list_routine_plans', 'plan_routine_week', 'reevaluate_routine_plan',
+        'list_unrecorded_executions', 'record_execution',
+        'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
         'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'schedule_task', 'unschedule_task',
         'save_memory', 'search_memories', 'update_memory', 'forget_memory',
         'list_goals', 'create_goal', 'update_goal', 'delete_goal',
@@ -3728,9 +3732,9 @@ def test_every_chat_tool_has_an_executor_route():
     def names(tools):
         return {tool['function']['name'] for tool in tools}
 
-    special = {'extend_schedule', 'apply_schedule', 'schedule_week_plan', 'schedule_routine'}
+    special = {'extend_schedule', 'apply_schedule', 'schedule_week_plan', 'schedule_routine', 'list_routine_plans', 'plan_routine_week', 'reevaluate_routine_plan', 'list_unrecorded_executions', 'record_execution'}
     routed_elsewhere = names(chat_module.TASK_TOOLS) | names(chat_module.MEMORY_TOOLS) | names(chat_module.GOAL_PROJECT_TOOLS) | special
-    everything = names([*chat_module.SCHEDULE_TOOLS, *chat_module.TASK_TOOLS, *chat_module.MEMORY_TOOLS, *chat_module.GOAL_PROJECT_TOOLS, *chat_module.REMINDER_TOOLS, *chat_module.BATCH_TOOLS, *chat_module.ROUTINE_TOOLS])
+    everything = names([*chat_module.SCHEDULE_TOOLS, *chat_module.TASK_TOOLS, *chat_module.MEMORY_TOOLS, *chat_module.GOAL_PROJECT_TOOLS, *chat_module.REMINDER_TOOLS, *chat_module.BATCH_TOOLS, *chat_module.ROUTINE_TOOLS, *chat_module.ROUTINE_PLAN_TOOLS, *chat_module.EXECUTION_TOOLS])
     fallback = everything - routed_elsewhere
     assert fallback == {'list_events', 'create_event', 'update_event', 'delete_event'}
 
@@ -4017,6 +4021,32 @@ def test_routine_update_validates_and_deactivates(monkeypatch, tmp_path):
     assert any(item['id'] == routine['id'] and item['is_active'] == 0 for item in inactive.json())
 
 
+def test_deleting_routine_removes_scheduled_events_and_preserves_history(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-delete')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        plan = client.post(
+            f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK},
+        ).json()['plan']
+        before = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()
+        delete_response = client.delete(f"/api/routines/{routine['id']}")
+        active_routines = client.get('/api/routines', params={'active': True}).json()
+        plans = client.get('/api/routine-plans', params={'routine_id': routine['id']}).json()
+        after = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()
+        events = client.get('/api/events').json()
+
+    assert delete_response.status_code == 204
+    assert all(item['id'] != routine['id'] for item in active_routines)
+    assert next(item for item in plans if item['id'] == plan['id'])['status'] == 'cancelled'
+    assert len(after) == len(before)
+    assert all(item['status'] == 'cancelled' and item['schedule_id'] is None for item in after)
+    assert not any(event.get('routine_occurrence_id') in {item['id'] for item in before} for event in events)
+
+
 def test_execution_log_records_actuals_without_completing_task(monkeypatch, tmp_path, future_task_start):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'execution-log.sqlite3')
     with TestClient(norn_app.app) as client:
@@ -4037,6 +4067,336 @@ def test_execution_log_records_actuals_without_completing_task(monkeypatch, tmp_
     assert response.json()['resume_point'] == '次はテストを実行する'
     assert len(logs.json()) == 1
     assert updated_task['status'] == 'open'
+
+
+ROUTINE_WEEK = '2027-03-01'
+TOKYO = ZoneInfo('Asia/Tokyo')
+
+
+def backdate_work_session(session_id, minutes):
+    started = (datetime.now(TOKYO) - timedelta(minutes=minutes)).isoformat(timespec='seconds')
+    with closing(database_module.open_database()) as connection:
+        connection.execute('UPDATE work_sessions SET started_at = ? WHERE id = ?', (started, session_id))
+        connection.commit()
+
+
+def test_work_session_records_actuals_resume_point_and_summary(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'work-session.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task = client.post('/api/tasks', json={'title': '作曲', 'estimated_minutes': 60}).json()
+        assert client.get('/api/work-sessions/active').json() is None
+        started = client.post('/api/work-sessions/start', json={'task_id': task['id']})
+        duplicate = client.post('/api/work-sessions/start', json={'task_id': task['id']})
+        active = client.get('/api/work-sessions/active').json()
+        backdate_work_session(started.json()['id'], 45)
+        finished = client.post(f"/api/work-sessions/{started.json()['id']}/finish", json={
+            'status': 'partial', 'resume_point': 'Bメロから', 'interruption_reason': '会議', 'progress_percent': 60,
+        })
+        after = client.get('/api/work-sessions/active').json()
+        second = client.post('/api/work-sessions/start', json={'task_id': task['id']})
+        summary = client.get('/api/execution-summary').json()
+        task_after = client.get('/api/tasks').json()[0]
+        discarded = client.delete(f"/api/work-sessions/{second.json()['id']}")
+        missing = client.post('/api/work-sessions/start', json={'task_id': str(uuid.uuid4())})
+        empty = client.post('/api/work-sessions/start', json={})
+
+    assert started.status_code == 201 and duplicate.status_code == 409
+    assert active['title'] == '作曲' and active['resume_point'] == ''
+    log = finished.json()
+    assert finished.status_code == 200 and log['status'] == 'partial' and 44 <= log['actual_minutes'] <= 46
+    assert log['interruption_reason'] == '会議' and log['progress_percent'] == 60
+    assert after is None
+    assert second.status_code == 201 and second.json()['resume_point'] == 'Bメロから'
+    row = summary['tasks'][0]
+    assert row['title'] == '作曲' and row['partial'] == 1 and row['resume_point'] == 'Bメロから'
+    assert 44 <= row['actual_minutes'] <= 46 and row['estimated_minutes'] == 60
+    assert summary['totals']['achievement_rate'] == 1.0
+    assert task_after['status'] == 'open'
+    assert missing.status_code == 404 and empty.status_code == 422 and discarded.status_code == 204
+
+
+def test_work_session_on_occurrence_updates_status_and_summary(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'work-session-routine')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK, 'target_count': 1})
+        occurrence = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()[0]
+        started = client.post('/api/work-sessions/start', json={'occurrence_id': occurrence['id']}).json()
+        finished = client.post(f"/api/work-sessions/{started['id']}/finish", json={'status': 'completed'})
+        updated = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()[0]
+        summary = client.get('/api/execution-summary').json()
+        window = client.get('/api/execution-summary', params={'start': ROUTINE_WEEK, 'end': '2027-03-07'}).json()
+        invalid = client.get('/api/execution-summary', params={'start': '2027-03-07', 'end': ROUTINE_WEEK})
+
+    assert started['routine_id'] == routine['id'] and started['schedule_id'] == occurrence['schedule_id']
+    assert finished.status_code == 200 and finished.json()['occurrence_id'] == occurrence['id']
+    assert updated['status'] == 'completed'
+    assert summary['routines'][0]['completed'] == 1 and summary['totals']['completed'] == 1
+    assert window['routines'][0]['planned_minutes'] == 45 and window['routines'][0]['completed'] == 0
+    assert invalid.status_code == 422
+
+
+def test_execution_tools_resolve_date_and_ask_when_ambiguous(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'execution-tools')
+    now = datetime(2027, 3, 3, 12, 0, tzinfo=TOKYO)
+    monkeypatch.setattr(execution_tools_module, '_now', lambda: now)
+    run = execution_tools_module.execute_execution_tool
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK})
+        task = client.post('/api/tasks', json={'title': '作曲', 'estimated_minutes': 60}).json()
+        with closing(database_module.open_database()) as connection:
+            connection.execute(
+                'INSERT INTO task_allocations (id, task_id, start_at, end_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+                (str(uuid.uuid4()), task['id'], '2027-03-02T10:00:00+09:00', '2027-03-02T11:00:00+09:00', 'x', 'x'),
+            )
+            connection.commit()
+
+        listed = run('list_unrecorded_executions', {})
+        ambiguous = run('record_execution', {'routine_id': routine['id'], 'status': 'completed'})
+        monday = run('record_execution', {'routine_id': routine['id'], 'date': '2027-03-01', 'status': 'completed'})
+        repeated = run('record_execution', {'routine_id': routine['id'], 'date': '2027-03-01', 'status': 'completed'})
+        corrected = run('record_execution', {'routine_id': routine['id'], 'date': '2027-03-01', 'status': 'partial', 'actual_minutes': 20, 'correction': True})
+        no_slot = run('record_execution', {'routine_id': routine['id'], 'date': '2027-03-02', 'status': 'completed'})
+        single = run('record_execution', {'routine_id': routine['id'], 'status': 'skipped', 'interruption_reason': '体調'})
+        task_log = run('record_execution', {'task_id': task['id'], 'status': 'partial', 'resume_point': 'Bメロから'})
+        relisted = run('list_unrecorded_executions', {})
+        occurrences = {item['scheduled_start'][:10]: item['status'] for item in client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()}
+        task_after = client.get('/api/tasks').json()[0]
+
+    assert [item['label'] for item in listed['routine_occurrences']] == ['朝の練習（3/1 09:00）', '朝の練習（3/3 09:00）']
+    assert [item['label'] for item in listed['task_slots']] == ['作曲（3/2 10:00）']
+    assert ambiguous['state'] == 'needs_input' and len(ambiguous['candidates']) == 2
+    assert monday['ok'] and '3/1 09:00' in monday['summary'] and '完了' in monday['summary'] and '45分' in monday['summary']
+    assert not repeated['ok'] and '記録済み' in repeated['error']
+    assert corrected['ok'] and '20分' in corrected['summary']
+    assert not no_slot['ok']
+    assert single['ok'] and single['execution_log']['actual_minutes'] == 0 and single['execution_log']['interruption_reason'] == '体調'
+    assert occurrences == {'2027-03-01': 'partial', '2027-03-03': 'skipped', '2027-03-05': 'scheduled'}
+    assert task_log['ok'] and task_log['execution_log']['actual_minutes'] == 60 and 'Bメロから' in task_log['summary']
+    assert relisted['routine_occurrences'] == [] and relisted['task_slots'] == []
+    assert task_after['status'] == 'open'
+
+
+def test_execution_log_columns_migrate_on_existing_database(monkeypatch, tmp_path):
+    path = tmp_path / 'old-logs.sqlite3'
+    monkeypatch.setattr(database_module, 'DB_PATH', path)
+    with TestClient(norn_app.app):
+        pass
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript('''
+            DROP TABLE work_sessions;
+            ALTER TABLE execution_logs DROP COLUMN interruption_reason;
+            ALTER TABLE execution_logs DROP COLUMN progress_percent;
+        ''')
+    with TestClient(norn_app.app) as client:
+        columns = {row[1] for row in sqlite3.connect(path).execute('PRAGMA table_info(execution_logs)')}
+        active = client.get('/api/work-sessions/active')
+
+    assert {'interruption_reason', 'progress_percent'} <= columns and active.status_code == 200
+
+
+def routine_planning_setup(monkeypatch, tmp_path, name, **overrides):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / f'{name}.sqlite3')
+    monkeypatch.setattr(tasks_module, 'PLANNING_WORKDAYS', frozenset({0, 1, 2, 3, 4}))
+    monkeypatch.setattr(tasks_module, 'PLANNING_DAY_START', '09:00')
+    monkeypatch.setattr(tasks_module, 'PLANNING_DAY_END', '18:00')
+    return {
+        'title': '朝の練習', 'routine_type': 'achievement', 'target_count': 3, 'duration_minutes': 45,
+        'min_count': 2, 'max_count': 5, 'preferred_period': 'morning',
+        'adjustment_policy': 'flexible', 'flexible': True, **overrides,
+    }
+
+
+def test_weekly_plan_generates_spread_occurrences_idempotently(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-week')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        client.post('/api/events', json={
+            'title': '会議', 'start_at': f'{ROUTINE_WEEK}T09:00:00+09:00', 'end_at': f'{ROUTINE_WEEK}T10:00:00+09:00',
+        })
+        created = client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK})
+        plan = created.json()['plan']
+        again = client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK})
+        regenerated = client.post(f"/api/routine-plans/{plan['id']}/occurrences/generate")
+        occurrences = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()
+        events = client.get('/api/events', params={'start': f'{ROUTINE_WEEK}T00:00:00+09:00', 'end': '2027-03-08T00:00:00+09:00'}).json()
+
+    assert created.status_code == 201 and plan['status'] == 'active' and plan['target_count'] == 3
+    assert again.status_code == 409
+    assert regenerated.json()['created'] == [] and regenerated.json()['kept'] == 3
+    assert [item['scheduled_start'][:16] for item in occurrences] == ['2027-03-01T10:00', '2027-03-03T09:00', '2027-03-05T09:00']
+    assert all(item['plan_id'] == plan['id'] and item['status'] == 'scheduled' for item in occurrences)
+    blocks = {event['routine_occurrence_id']: event for event in events if event['kind'] == 'routine_block'}
+    assert set(blocks) == {item['id'] for item in occurrences}
+    assert all(block['source'] == 'norn' and block['title'] == '朝の練習' for block in blocks.values())
+
+
+def test_deleting_routine_event_cancels_occurrence_and_reevaluation_replaces_it(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-delete-event')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        plan = client.post(
+            f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK},
+        ).json()['plan']
+        occurrences = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()
+        deleted_occurrence = occurrences[0]
+        deleted_event = client.delete(f"/api/events/{deleted_occurrence['schedule_id']}")
+        after_delete = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()
+        remaining_events = client.get('/api/events').json()
+        reevaluated = client.post(f"/api/routine-plans/{plan['id']}/reevaluate").json()
+        after_reevaluation = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()
+
+    deleted_state = next(item for item in after_delete if item['id'] == deleted_occurrence['id'])
+    assert deleted_event.status_code == 204
+    assert deleted_state['status'] == 'cancelled' and deleted_state['schedule_id'] is None
+    assert all(event['id'] != deleted_occurrence['schedule_id'] for event in remaining_events)
+    assert len(reevaluated['created']) == 1
+    assert next(item for item in after_reevaluation if item['id'] == deleted_occurrence['id'])['status'] == 'cancelled'
+    assert sum(item['status'] == 'scheduled' for item in after_reevaluation) == plan['target_count']
+
+
+def test_updating_routine_event_time_updates_occurrence_schedule(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-update-event')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK})
+        occurrence = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()[0]
+        event = client.get('/api/events').json()[0]
+        new_start = datetime.fromisoformat(event['start_at']) + timedelta(hours=1)
+        new_end = datetime.fromisoformat(event['end_at']) + timedelta(hours=1)
+        updated_event = client.put(f"/api/events/{event['id']}", json={
+            'title': event['title'],
+            'description': event['description'],
+            'start_at': new_start.isoformat(),
+            'end_at': new_end.isoformat(),
+            'is_all_day': event['is_all_day'],
+            'recurrence': event['recurrence'],
+        })
+        updated_occurrence = next(
+            item for item in client.get(
+                '/api/routine-occurrences', params={'routine_id': routine['id']},
+            ).json() if item['id'] == occurrence['id']
+        )
+
+    assert updated_event.status_code == 200
+    assert updated_occurrence['scheduled_start'] == updated_event.json()['start_at']
+    assert updated_occurrence['scheduled_end'] == updated_event.json()['end_at']
+
+
+def test_weekly_plan_overrides_do_not_change_base_routine(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-override')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        response = client.post(f"/api/routines/{routine['id']}/weekly-plan", json={
+            'week_start': ROUTINE_WEEK, 'target_count': 2, 'duration_minutes': 30, 'adjustment_reason': '今週は忙しい',
+        })
+        base = client.get('/api/routines').json()[0]
+        occurrences = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()
+
+    assert response.json()['plan']['target_count'] == 2 and response.json()['plan']['adjustment_source'] == 'user'
+    assert (base['target_count'], base['duration_minutes']) == (3, 45)
+    assert len(occurrences) == 2
+    assert all(datetime.fromisoformat(item['scheduled_end']) - datetime.fromisoformat(item['scheduled_start']) == timedelta(minutes=30) for item in occurrences)
+
+
+def test_routine_plan_chat_tools_plan_and_reevaluate(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-chat-tools')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        listed = routine_planning_module.execute_routine_plan_tool('list_routine_plans', {})
+        planned = routine_planning_module.execute_routine_plan_tool('plan_routine_week', {
+            'routine_id': routine['id'], 'week_start': ROUTINE_WEEK, 'target_count': 2,
+        })
+        duplicate = routine_planning_module.execute_routine_plan_tool('plan_routine_week', {
+            'routine_id': routine['id'], 'week_start': ROUTINE_WEEK,
+        })
+        reevaluated = routine_planning_module.execute_routine_plan_tool('reevaluate_routine_plan', {'plan_id': planned['plan']['id']})
+        invalid = routine_planning_module.execute_routine_plan_tool('reevaluate_routine_plan', {'plan_id': 'bad'})
+        after = routine_planning_module.execute_routine_plan_tool('list_routine_plans', {})
+
+    assert listed['routines'][0]['id'] == routine['id'] and listed['routines'][0]['plans'] == []
+    assert planned['ok'] and len(planned['generation']['created']) == 2 and '2回分を配置' in planned['summary']
+    assert not duplicate['ok'] and not invalid['ok']
+    assert reevaluated['ok'] and reevaluated['summary']
+    assert after['routines'][0]['plans'][0]['target_count'] == 2
+
+
+def test_execution_log_updates_occurrence_status(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-log')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        other = client.post('/api/routines', json={**routine_payload, 'title': '別の習慣'}).json()
+        client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK})
+        occurrence = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()[0]
+        logged = client.post('/api/execution-logs', json={
+            'occurrence_id': occurrence['id'], 'status': 'partial',
+            'started_at': occurrence['scheduled_start'], 'ended_at': occurrence['scheduled_end'],
+        })
+        mismatch = client.post('/api/execution-logs', json={
+            'occurrence_id': occurrence['id'], 'routine_id': other['id'], 'status': 'skipped',
+        })
+        missing = client.post('/api/execution-logs', json={'occurrence_id': str(uuid.uuid4()), 'status': 'skipped'})
+        listed = client.get('/api/execution-logs', params={'occurrence_id': occurrence['id']}).json()
+        updated = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()[0]
+
+    assert logged.status_code == 201
+    assert logged.json()['routine_id'] == routine['id'] and logged.json()['schedule_id'] == occurrence['schedule_id']
+    assert mismatch.status_code == 422 and missing.status_code == 404
+    assert [log['id'] for log in listed] == [logged.json()['id']]
+    assert updated['status'] == 'partial'
+
+
+def test_reevaluate_skips_missed_replans_and_lowers_target_only_for_shortfall(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-reevaluate')
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        plan_id = client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK}).json()['plan']['id']
+        occurrences = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()
+        client.post('/api/execution-logs', json={
+            'occurrence_id': occurrences[0]['id'], 'status': 'completed',
+            'started_at': occurrences[0]['scheduled_start'], 'ended_at': occurrences[0]['scheduled_end'],
+        })
+        midweek = routine_planning_module.reevaluate_plan(plan_id, datetime(2027, 3, 4, 12, 0, tzinfo=TOKYO))
+        after_midweek = client.get('/api/routine-occurrences', params={'routine_id': routine['id']}).json()
+        lateweek = routine_planning_module.reevaluate_plan(plan_id, datetime(2027, 3, 5, 12, 0, tzinfo=TOKYO))
+        plan = client.get('/api/routine-plans', params={'routine_id': routine['id']}).json()[0]
+        base = client.get('/api/routines').json()[0]
+        ended = routine_planning_module.reevaluate_plan(plan_id, datetime(2027, 3, 9, 8, 0, tzinfo=TOKYO))
+        final_plan = client.get('/api/routine-plans', params={'routine_id': routine['id']}).json()[0]
+
+    assert [item['id'] for item in midweek['missed']] == [occurrences[1]['id']]
+    assert midweek['achieved'] == 1 and len(midweek['created']) == 1
+    assert midweek['shortfall'] == 0 and midweek['target_count'] == 3
+    assert {item['status'] for item in after_midweek} == {'completed', 'skipped', 'scheduled'}
+    assert lateweek['shortfall'] == 1 and lateweek['target_count'] == 2 and lateweek['below_minimum'] is False
+    assert plan['target_count'] == 2 and plan['adjustment_source'] == 'norn'
+    assert '3回から2回' in plan['adjustment_reason']
+    assert base['target_count'] == 3
+    assert ended['plan_status'] == 'completed' and final_plan['status'] == 'completed'
+    assert final_plan['target_count'] == 2
+
+
+def test_reevaluate_keeps_fixed_routine_target_and_reports_shortfall(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(
+        monkeypatch, tmp_path, 'routine-fixed', routine_type='fixed', adjustment_policy='fixed', flexible=False,
+    )
+    with TestClient(norn_app.app) as client:
+        routine = client.post('/api/routines', json=routine_payload).json()
+        plan_id = client.post(f"/api/routines/{routine['id']}/weekly-plan", json={'week_start': ROUTINE_WEEK}).json()['plan']['id']
+        result = routine_planning_module.reevaluate_plan(plan_id, datetime(2027, 3, 5, 18, 0, tzinfo=TOKYO))
+        plan = client.get('/api/routine-plans', params={'routine_id': routine['id']}).json()[0]
+
+    assert result['shortfall'] == 3 and result['target_locked'] is True
+    assert result['target_count'] == 3 and plan['target_count'] == 3
 
 
 def test_gemini_creates_goal_and_linked_project_without_approval(monkeypatch, tmp_path):

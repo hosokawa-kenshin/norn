@@ -352,7 +352,8 @@ def update_event_record(event_id: str, payload: EventPayload) -> dict[str, Any]:
     timestamp = now_iso()
     with closing(open_database()) as connection:
         existing = connection.execute(
-            'SELECT id, sync_status, recurrence_timezone FROM events WHERE id = ?', (event_id,),
+            'SELECT id, sync_status, recurrence_timezone, routine_occurrence_id FROM events WHERE id = ?',
+            (event_id,),
         ).fetchone()
         if existing is None:
             raise HTTPException(status_code=404, detail='予定が見つかりません。')
@@ -370,6 +371,12 @@ def update_event_record(event_id: str, payload: EventPayload) -> dict[str, Any]:
              existing['recurrence_timezone'] or str(LOCAL_TIMEZONE),
              json.dumps(payload.recurrence), timestamp, event_id),
         )
+        if existing['routine_occurrence_id']:
+            connection.execute(
+                '''UPDATE routine_occurrences SET scheduled_start=?, scheduled_end=?, updated_at=?
+                   WHERE id=?''',
+                (start_at, end_at, timestamp, existing['routine_occurrence_id']),
+            )
         connection.commit()
         row = connection.execute('SELECT * FROM events WHERE id = ?', (event_id,)).fetchone()
     return serialize_event(row)
@@ -378,12 +385,18 @@ def update_event_record(event_id: str, payload: EventPayload) -> dict[str, Any]:
 def delete_event_record(event_id: str) -> str:
     with closing(open_database()) as connection:
         row = connection.execute(
-            'SELECT title, google_event_id, sync_status FROM events WHERE id = ?', (event_id,),
+            'SELECT title, google_event_id, sync_status, routine_occurrence_id FROM events WHERE id = ?', (event_id,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail='予定が見つかりません。')
         if row['sync_status'] == 'conflict':
             raise HTTPException(status_code=409, detail='Google Calendarとの競合を先に解決してください。')
+        if row['routine_occurrence_id']:
+            connection.execute(
+                '''UPDATE routine_occurrences SET status='cancelled', updated_at=?
+                   WHERE id=? AND status='scheduled' ''',
+                (now_iso(), row['routine_occurrence_id']),
+            )
         if row['google_event_id']:
             timestamp = now_iso()
             connection.execute(

@@ -232,14 +232,41 @@ def deactivate_routine(routine_id: str) -> None:
         routine_id = str(uuid.UUID(routine_id))
     except ValueError as error:
         raise HTTPException(status_code=422, detail='ルーティンIDが不正です。') from error
-    with closing(open_database()) as connection:
+    with database_transaction() as connection:
         result = connection.execute(
             'UPDATE routines SET is_active=0, updated_at=? WHERE id=?',
             (now_iso(), routine_id),
         )
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail='ルーティンが見つかりません。')
-        connection.commit()
+        timestamp = now_iso()
+        pending_events = connection.execute(
+            '''SELECT e.id, e.google_event_id, e.sync_status
+               FROM events e
+               JOIN routine_occurrences o ON o.id=e.routine_occurrence_id
+               WHERE o.routine_id=? AND o.status='scheduled' AND e.deleted_at IS NULL''',
+            (routine_id,),
+        ).fetchall()
+        if any(event['sync_status'] == 'conflict' for event in pending_events):
+            raise HTTPException(status_code=409, detail='Google Calendarとの競合を先に解決してください。')
+        for event in pending_events:
+            if event['google_event_id']:
+                connection.execute(
+                    """UPDATE events SET deleted_at=?, updated_at=?, sync_status='dirty' WHERE id=?""",
+                    (timestamp, timestamp, event['id']),
+                )
+            else:
+                connection.execute('DELETE FROM events WHERE id=?', (event['id'],))
+        connection.execute(
+            '''UPDATE routine_occurrences SET status='cancelled', schedule_id=NULL, updated_at=?
+               WHERE routine_id=? AND status='scheduled' ''',
+            (timestamp, routine_id),
+        )
+        connection.execute(
+            """UPDATE routine_plans SET status='cancelled', updated_at=?
+               WHERE routine_id=? AND status IN ('planned', 'active')""",
+            (timestamp, routine_id),
+        )
 
 
 @router.get('/api/routine-plans')

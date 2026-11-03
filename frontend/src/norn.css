@@ -217,6 +217,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .task-allocation-row { background: rgba(253, 248, 243, .9); border-style: dashed; }
 .task-allocation-row:hover { border-color: #d7a58f; }
 .task-slot-label { display: block; margin-bottom: 3px; color: #a45b46; font-size: 8px; font-weight: 700; }
+.routine-slot-link { padding: 0; border: 0; background: none; color: #4c7a55; cursor: pointer; text-decoration: underline; }
 .event-content { min-width: 0; }
 .event-content h3 { margin: 0; color: #26372b; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
 .event-content p { margin: 4px 0 0; color: #788176; font-size: 10px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -312,6 +313,12 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .goal-toolbar p { color: var(--muted); font-size: 10px; }
 .goal-toolbar-actions { display: flex; align-items: center; gap: 8px; }
 .goal-list { display: flex; flex-direction: column; }
+.routine-form { display: flex; flex-direction: column; gap: 10px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.routine-occurrences { list-style: none; margin: 10px 0 0 26px; padding: 0; color: #5f6d5c; font-size: 10px; }
+.routine-occurrences li { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid #e8ebe4; }
+.routine-occurrences li:last-child { border-bottom: 0; }
+.routine-status { color: var(--muted); font: 9px var(--mono); }
+.actuals-heading { margin: 18px 0 6px; color: var(--ink); font-size: 13px; }
 .goal-row { padding: 18px 0 14px; border-bottom: 1px solid var(--line); animation: enter 200ms ease both; }
 .goal-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .goal-title-block { display: flex; align-items: center; gap: 10px; min-width: 0; color: #577653; }

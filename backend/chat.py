@@ -26,6 +26,8 @@ from tasks import TASK_TOOLS, execute_task_tool
 from reminders import REMINDER_TOOLS, execute_reminder_tool, is_notice_reply, reminder_context
 from schedule_actions import BATCH_TOOLS, apply_schedule, schedule_context, schedule_snapshot, schedule_week_plan, verify_schedule_reply
 from routines import ROUTINE_TOOLS, schedule_routine
+from routine_planning import ROUTINE_PLAN_TOOLS, execute_routine_plan_tool
+from execution_tools import EXECUTION_TOOLS, execute_execution_tool
 from llm_limits import check_llm_available, check_llm_response
 from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
 
@@ -47,6 +49,8 @@ SYSTEM_PROMPT = (
     '日程の配置・再調整は承認を求めず、apply_scheduleに具体的な操作を渡して一括で保存してください。成功した内容だけを保存済みとして説明してください。'
     '複数の予定や作業枠の再調整は、食事等の固定予定とタスク枠の移動を同じapply_scheduleにまとめてください。単独の明確な操作依頼は既存ツールで直接実行できます。'
     'タスクを複数日・複数枠へ「分けて」「振り分けて」と頼まれたら、schedule_taskで1枠だけ置かず、plan_task_allocations（日数はdistinct_days）で枠を計算してapply_scheduleで保存してください。'
+    'ルーティン（週N回など回数で決まる習慣）の週ごとの計画・配置はlist_routine_plansでIDを確認してplan_routine_weekを使い、未実施の見直しはreevaluate_routine_planを使ってください。'
+    '「終わった」「できなかった」等の実施報告は、日付が示されていればdateを付け、なければlist_unrecorded_executionsで候補を確認してrecord_executionで実績に記録してください。候補が複数で日付が決められないときは推測で記録せず、日付と時刻を挙げて聞き返し、記録後はどの日のどの予定かを必ず伝えてください。実績の記録はタスクや予定を完了扱いにしません。'
     '誤認識された名前の訂正は同じIDのタイトル変更です。日時・所要時間・割当はそのまま維持し、古い会話の時刻へ戻さないでください。'
     'NORN内の予定の検索・追加・変更・削除は、ユーザーから明確に依頼されたら承認を求めず予定ツールで実行してください。'
     '対象や日時など実行に必要な情報が曖昧または不足している場合に限り、その情報を質問してください。'
@@ -523,7 +527,7 @@ async def generate_action_reply(
             raise ValueError('Missing final reply')
         if has_action_completion(content) and not any(result.get('ok') and (result.get('summary') or result.get('task') or result.get('state') == 'applied') for result in results):
             raise ValueError('Completion without a successful operation')
-        schedule_results = any(result.get('tool') in {tool['function']['name'] for tool in [*SCHEDULE_TOOLS, *TASK_TOOLS, *REMINDER_TOOLS, *BATCH_TOOLS, *ROUTINE_TOOLS]}
+        schedule_results = any(result.get('tool') in {tool['function']['name'] for tool in [*SCHEDULE_TOOLS, *TASK_TOOLS, *REMINDER_TOOLS,         *BATCH_TOOLS, *ROUTINE_TOOLS, *ROUTINE_PLAN_TOOLS, *EXECUTION_TOOLS]}
                                or result.get('task') or result.get('scheduling') or result.get('state') == 'applied' for result in results)
         if schedule_results and not await verify_schedule_reply(content, results, has_action_completion(content)):
             if retry:
@@ -579,7 +583,7 @@ async def generate_llm_reply(
 
     for _ in range(8):
         check_llm_available()
-        available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *BATCH_TOOLS, *ROUTINE_TOOLS]
+        available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *BATCH_TOOLS, *ROUTINE_TOOLS, *ROUTINE_PLAN_TOOLS, *EXECUTION_TOOLS]
         if routine_turn:
             available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'apply_schedule', 'schedule_week_plan', 'schedule_routine'}]
         payload = {
@@ -662,7 +666,7 @@ async def generate_llm_reply(
                     'schedule_task', 'unschedule_task',
                     'extend_schedule',
                     'apply_schedule', 'schedule_week_plan',
-                    'schedule_routine',
+                    'schedule_routine', 'plan_routine_week', 'reevaluate_routine_plan', 'record_execution',
                     'save_memory', 'update_memory', 'forget_memory',
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
@@ -689,6 +693,10 @@ async def generate_llm_reply(
                         result = await asyncio.to_thread(schedule_week_plan, arguments)
                     elif name == 'schedule_routine':
                         result = await asyncio.to_thread(schedule_routine, arguments, latest)
+                    elif name in {tool['function']['name'] for tool in EXECUTION_TOOLS}:
+                        result = await asyncio.to_thread(execute_execution_tool, name, arguments)
+                    elif name in {tool['function']['name'] for tool in ROUTINE_PLAN_TOOLS}:
+                        result = await asyncio.to_thread(execute_routine_plan_tool, name, arguments)
                     elif name in task_tools:
                         result = execute_task_tool(name, arguments)
                     else:

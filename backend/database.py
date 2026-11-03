@@ -305,18 +305,30 @@ def initialize_database() -> None:
                 schedule_id TEXT REFERENCES events(id) ON DELETE SET NULL,
                 task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
                 routine_id TEXT REFERENCES routines(id) ON DELETE SET NULL,
+                occurrence_id TEXT REFERENCES routine_occurrences(id) ON DELETE SET NULL,
                 started_at TEXT,
                 ended_at TEXT,
                 actual_minutes INTEGER CHECK(actual_minutes IS NULL OR actual_minutes >= 0),
                 status TEXT NOT NULL CHECK(status IN ('completed', 'partial', 'skipped', 'cancelled')),
                 note TEXT NOT NULL DEFAULT '',
                 resume_point TEXT NOT NULL DEFAULT '',
+                interruption_reason TEXT NOT NULL DEFAULT '',
+                progress_percent INTEGER CHECK(progress_percent IS NULL OR progress_percent BETWEEN 0 AND 100),
                 recorded_source TEXT NOT NULL DEFAULT 'user',
                 created_at TEXT NOT NULL,
                 CHECK(started_at IS NOT NULL OR ended_at IS NOT NULL OR status IN ('skipped', 'cancelled'))
             );
             CREATE INDEX IF NOT EXISTS ix_execution_logs_task_created
                 ON execution_logs(task_id, created_at);
+            CREATE TABLE IF NOT EXISTS work_sessions (
+                id TEXT PRIMARY KEY,
+                task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+                routine_id TEXT REFERENCES routines(id) ON DELETE CASCADE,
+                occurrence_id TEXT REFERENCES routine_occurrences(id) ON DELETE CASCADE,
+                schedule_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+                started_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS schedule_notices (
                 notice_key TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -384,6 +396,19 @@ def initialize_database() -> None:
         for column, definition in event_migrations.items():
             if column not in event_columns:
                 connection.execute(f'ALTER TABLE events ADD COLUMN {column} {definition}')
+        log_columns = {
+            row['name'] for row in connection.execute('PRAGMA table_info(execution_logs)').fetchall()
+        }
+        if 'occurrence_id' not in log_columns:
+            connection.execute(
+                'ALTER TABLE execution_logs ADD COLUMN occurrence_id TEXT REFERENCES routine_occurrences(id) ON DELETE SET NULL',
+            )
+        if 'interruption_reason' not in log_columns:
+            connection.execute("ALTER TABLE execution_logs ADD COLUMN interruption_reason TEXT NOT NULL DEFAULT ''")
+        if 'progress_percent' not in log_columns:
+            connection.execute(
+                'ALTER TABLE execution_logs ADD COLUMN progress_percent INTEGER CHECK(progress_percent IS NULL OR progress_percent BETWEEN 0 AND 100)',
+            )
         connection.execute(
             '''UPDATE events SET source = CASE WHEN google_event_id IS NOT NULL THEN 'google' ELSE 'user' END,
                is_fixed = 1 WHERE kind = 'fixed' AND source = 'user' AND is_fixed = 0''',

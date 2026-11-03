@@ -15,6 +15,8 @@ from memory import router as memory_router
 from planning import router as planning_router
 from reminders import router as reminders_router
 from routines import router as routines_router
+from routine_planning import router as routine_planning_router
+from work_sessions import router as work_sessions_router
 from tasks import router as tasks_router
 import settings
 from tts import SpeechService, router as tts_router
@@ -55,6 +57,8 @@ app.include_router(memory_router)
 app.include_router(planning_router)
 app.include_router(reminders_router)
 app.include_router(routines_router)
+app.include_router(routine_planning_router)
+app.include_router(work_sessions_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
 app.include_router(tts_router)
