@@ -1256,7 +1256,7 @@ def test_automatic_task_preserves_time_before_task_name_and_explains_unaligned_s
         assert len(tasks) == 1 and tasks[0]['id'] == task['id'] and tasks[0]['estimated_minutes'] == 5
         assert tasks[0]['scheduled_start'] is None
         result_prompt = payloads[-1]['messages'][0]['content']
-        assert '15分刻み' in result_prompt and 'alternatives' in result_prompt
+        assert '5分刻み' in result_prompt and 'alternatives' in result_prompt
         assert preferred.replace(minute=45).isoformat() in result_prompt
         assert 'tools' not in payloads[-1]
         actions[:] = [{'title': task['title'], 'task_id': task['id'], 'evidence': '14時45分',
@@ -2146,9 +2146,9 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         'list_events', 'create_event', 'update_event', 'delete_event',
         'extend_schedule',
         'propose_schedule',
-        'propose_routine',
-        'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
-        'find_task_slots', 'plan_task_allocations', 'schedule_task', 'unschedule_task',
+        'propose_week_plan',
+        'propose_routine', 'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
+        'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'schedule_task', 'unschedule_task',
         'save_memory', 'search_memories', 'update_memory', 'forget_memory',
         'list_goals', 'create_goal', 'update_goal', 'delete_goal',
         'list_projects', 'create_project', 'update_project', 'delete_project',
@@ -3729,6 +3729,43 @@ def test_allocation_plan_distributes_over_distinct_days_and_reports_expired(monk
     assert invalid.status_code == 422
 
 
+def test_week_plan_orders_by_priority_and_respects_density_and_breaks(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'week-plan.sqlite3')
+    with TestClient(norn_app.app) as client:
+        low = client.post('/api/tasks', json={'title': '低優先', 'estimated_minutes': 240, 'priority': 'low'}).json()
+        high = client.post('/api/tasks', json={
+            'title': '高優先', 'estimated_minutes': 240, 'priority': 'high',
+            'due_at': (future_task_start + timedelta(days=3)).isoformat(),
+        }).json()
+        client.post('/api/tasks', json={'title': '見積なし'})
+        response = client.get('/api/task-allocation-plan', params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(days=7)).isoformat(),
+        })
+        bad = client.get('/api/task-allocation-plan', params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(days=40)).isoformat(),
+        })
+
+    plan = response.json()
+    assert bad.status_code == 422
+    assert [item['task_id'] for item in plan['tasks']] == [high['id'], low['id']]
+    assert plan['tasks'][0]['priority_score'] > plan['tasks'][1]['priority_score']
+    assert all(item['complete'] for item in plan['tasks'])
+    assert [item['reason'] for item in plan['skipped']] == ['missing_estimate']
+    assert all(day['ratio'] <= 0.85 for day in plan['days'])
+    blocks = sorted(
+        (datetime.fromisoformat(slot['start_at']), datetime.fromisoformat(slot['end_at']), slot['duration_minutes'])
+        for item in plan['tasks'] for slot in item['allocations']
+    )
+    assert all(second[0] - first[1] >= timedelta(minutes=10) for first, second in zip(blocks, blocks[1:]) if first[0].date() == second[0].date())
+    assert any(second[0] - first[1] == timedelta(minutes=10) for first, second in zip(blocks, blocks[1:]) if first[0].date() == second[0].date())
+    assert all(block[0].minute % 5 == 0 for block in blocks)
+    assert all(duration <= 90 for _, _, duration in blocks)
+    due = future_task_start + timedelta(days=3)
+    assert all(datetime.fromisoformat(slot['end_at']) <= due for slot in plan['tasks'][0]['allocations'])
+
+
 def test_prompt_snapshot_limits_events_to_window_and_split_proposal_reply_is_server_generated(monkeypatch, tmp_path, future_task_start):
     monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'compact.sqlite3')
     monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
@@ -3773,6 +3810,103 @@ def test_prompt_snapshot_limits_events_to_window_and_split_proposal_reply_is_ser
 
     assert len(posts) == 1
     assert '「分割案」を3回に分ける案' in reply and reply.count('20分') == 3 and 'まだ保存はしていません' in reply
+
+
+def test_every_chat_tool_has_an_executor_route():
+    def names(tools):
+        return {tool['function']['name'] for tool in tools}
+
+    special = {'extend_schedule', 'propose_schedule', 'propose_week_plan', 'propose_routine'}
+    routed_elsewhere = names(chat_module.TASK_TOOLS) | names(chat_module.MEMORY_TOOLS) | names(chat_module.GOAL_PROJECT_TOOLS) | special
+    everything = names([*chat_module.SCHEDULE_TOOLS, *chat_module.TASK_TOOLS, *chat_module.MEMORY_TOOLS, *chat_module.GOAL_PROJECT_TOOLS, *chat_module.REMINDER_TOOLS, *chat_module.PROPOSAL_TOOLS, *chat_module.ROUTINE_TOOLS])
+    fallback = everything - routed_elsewhere
+    assert fallback == {'list_events', 'create_event', 'update_event', 'delete_event'}
+
+
+def test_week_plan_dependencies_order_tasks_and_adaptive_break(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'week-deps.sqlite3')
+    with TestClient(norn_app.app) as client:
+        first = client.post('/api/tasks', json={'title': '前提', 'estimated_minutes': 30, 'priority': 'low', 'focus_level': 5}).json()
+        second = client.post('/api/tasks', json={'title': '後続', 'estimated_minutes': 30, 'priority': 'high'}).json()
+        no_estimate = client.post('/api/tasks', json={'title': '見積なし'}).json()
+        blocked = client.post('/api/tasks', json={'title': '待ち', 'estimated_minutes': 30}).json()
+        assert client.put(f"/api/tasks/{second['id']}/dependencies", json={'depends_on': [first['id']]}).json()['depends_on'] == [first['id']]
+        assert client.put(f"/api/tasks/{first['id']}/dependencies", json={'depends_on': [second['id']]}).status_code == 409
+        assert client.put(f"/api/tasks/{first['id']}/dependencies", json={'depends_on': [first['id']]}).status_code == 422
+        assert client.put(f"/api/tasks/{first['id']}/dependencies", json={'depends_on': [str(uuid.uuid4())]}).status_code == 404
+        assert client.put(f"/api/tasks/{blocked['id']}/dependencies", json={'depends_on': [no_estimate['id']]}).status_code == 200
+        listed = {task['id']: task for task in client.get('/api/tasks').json()}
+        plan = client.get('/api/task-allocation-plan', params={
+            'from_at': future_task_start.isoformat(),
+            'through_at': (future_task_start + timedelta(days=3)).isoformat(),
+        }).json()
+
+    assert listed[second['id']]['depends_on'] == [first['id']]
+    by_id = {item['task_id']: item for item in plan['tasks']}
+    assert by_id[first['id']]['score_components']['dependency'] == 100
+    first_block = by_id[first['id']]['allocations'][0]
+    second_block = by_id[second['id']]['allocations'][0]
+    assert second_block['start_at'] >= first_block['end_at']
+    assert first_block['break_after_minutes'] == 15
+    assert second_block['break_after_minutes'] == 10
+    assert {item['task_id']: item['reason'] for item in plan['skipped']} == {no_estimate['id']: 'missing_estimate', blocked['id']: 'prerequisite_unplanned'}
+
+
+def test_allocations_accept_five_minute_start_and_reject_others(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'five-minutes.sqlite3')
+    with TestClient(norn_app.app) as client:
+        task_id = client.post('/api/tasks', json={'title': '5分刻み', 'estimated_minutes': 20}).json()['id']
+        start = future_task_start.replace(minute=5)
+        accepted = client.post(f'/api/tasks/{task_id}/allocations', json={'start_at': start.isoformat(), 'end_at': (start + timedelta(minutes=20)).isoformat()})
+        rejected = client.post(f'/api/tasks/{task_id}/allocations', json={'start_at': (start + timedelta(hours=1, minutes=2)).isoformat(), 'end_at': (start + timedelta(hours=1, minutes=22)).isoformat()})
+
+    assert accepted.status_code == 201 or accepted.status_code == 200
+    assert rejected.status_code == 409 and '5分刻み' in rejected.json()['detail']
+
+
+def test_chat_propose_week_plan_is_server_built_and_applies_on_approval(monkeypatch, tmp_path, future_task_start):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'week-chat.sqlite3')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    posts = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            posts.append(json)
+            if len(posts) > 1:
+                return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': {'content': '反映しました。'}}]})
+            arguments = globals()['json'].dumps({'from_at': future_task_start.isoformat(), 'through_at': (future_task_start + timedelta(days=7)).isoformat()})
+            message = {'content': None, 'tool_calls': [{'id': 'w', 'type': 'function', 'function': {'name': 'propose_week_plan', 'arguments': arguments}}]}
+            return SimpleNamespace(is_error=False, raise_for_status=lambda: None, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        ids = [client.post('/api/tasks', json={'title': title, 'estimated_minutes': 120, 'priority': priority}).json()['id']
+               for title, priority in (('資料作成', 'high'), ('片付け', 'low'))]
+        client.post('/api/tasks', json={'title': '見積なし'})
+        before = client.get('/api/task-allocations', params={'start': future_task_start.isoformat(), 'end': (future_task_start + timedelta(days=8)).isoformat()}).json()
+        response = client.post('/api/chat', json={'content': '今週のタスクを全部配置する案を作って'})
+        reply = response.json()['assistant_message']['content']
+        proposal_posts = len(posts)
+        pending = client.get('/api/task-allocations', params={'start': future_task_start.isoformat(), 'end': (future_task_start + timedelta(days=8)).isoformat()}).json()
+        approval = client.post('/api/chat', json={'content': 'お願いします', 'conversation_id': response.json()['conversation_id']})
+        applied = client.get('/api/task-allocations', params={'start': future_task_start.isoformat(), 'end': (future_task_start + timedelta(days=8)).isoformat()}).json()
+
+    assert proposal_posts == 1
+    assert '2件のタスクを優先度順に配置する案' in reply and 'まだ保存はしていません' in reply and '「見積なし」は見積時間が未設定' in reply
+    assert before == pending == []
+    assert approval.status_code == 200
+    assert {allocation['task_id'] for allocation in applied} == set(ids)
+    assert sum(1 for _ in applied) >= 2
 
 
 def test_chat_routes_plan_task_allocations_to_task_tools(monkeypatch, tmp_path, future_task_start):

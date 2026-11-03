@@ -12,10 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from database import database_transaction, now_iso, open_database
 from events import execute_schedule_tool
-from tasks import LOCAL_TIMEZONE, PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS, execute_task_tool
+from tasks import LOCAL_TIMEZONE, PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS, execute_task_tool, plan_week_allocations
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, logger
 from llm_limits import check_llm_available, check_llm_response
 
+MAX_PROPOSE_SCHEDULE_ACTIONS = 8
+MAX_WEEK_PLAN_ACTIONS = 40
 reply_proposal_id: ContextVar[str | None] = ContextVar('reply_proposal_id', default=None)
 
 
@@ -53,10 +55,24 @@ class ProposedAction(BaseModel):
 
 class ProposalPayload(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    actions: list[ProposedAction] = Field(min_length=1, max_length=8)
+    actions: list[ProposedAction] = Field(min_length=1, max_length=MAX_WEEK_PLAN_ACTIONS)
 
 
 PROPOSAL_TOOLS = [{
+    'type': 'function',
+    'function': {
+        'name': 'propose_week_plan',
+        'description': '指定期間の未完了タスクを優先度・期限・依存関係・分割条件・1日85%の密度・適応型休憩に従って配置した週間案を、サーバーが作成して了承待ちとして保存する。まだ予定には反映しない。「今週のタスクを全部配置して」「1週間の予定を組んで」のような依頼で使い、操作の中身はサーバーが決める。返答はサーバーが生成する。',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'from_at': {'type': 'string', 'format': 'date-time'},
+                'through_at': {'type': 'string', 'format': 'date-time'},
+            },
+            'required': ['from_at', 'through_at'], 'additionalProperties': False,
+        },
+    },
+}, {
     'type': 'function',
     'function': {
         'name': 'propose_schedule',
@@ -279,6 +295,8 @@ def propose_schedule(conversation_id: str | None, arguments: dict[str, Any]) -> 
             raise ValueError('提案先の会話がありません。')
         uuid.UUID(conversation_id)
         payload = ProposalPayload.model_validate(arguments)
+        if len(payload.actions) > MAX_PROPOSE_SCHEDULE_ACTIONS:
+            raise ValueError(f'一度に提案できる操作は{MAX_PROPOSE_SCHEDULE_ACTIONS}件までです。')
         if any(action.name == 'link_routine_occurrence' for action in payload.actions):
             raise ValueError('ルーティン関連付けは専用の提案ツールを使ってください。')
         with database_transaction(rollback=True):
@@ -288,6 +306,49 @@ def propose_schedule(conversation_id: str | None, arguments: dict[str, Any]) -> 
         proposal_id = store_proposal(conversation_id, payload.actions, baseline)
         return {'ok': True, 'state': 'proposed', 'proposal_id': proposal_id,
                 'actions': [action.model_dump() for action in payload.actions],
+                'instruction': 'これは未反映の提案です。変更内容を具体的に伝え、了承を尋ねてください。'}
+    except (ValueError, TypeError, HTTPException) as error:
+        invalidate_pending_proposal(conversation_id)
+        return {'ok': False, 'error': error.detail if isinstance(error, HTTPException) else str(error),
+            'instruction': '予定は変更しておらず、有効な提案もありません。具体的な失敗理由や不足情報を説明し、了承すれば反映できると案内しないでください。'}
+
+
+def propose_week_plan(conversation_id: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        if not conversation_id:
+            raise ValueError('提案先の会話がありません。')
+        uuid.UUID(conversation_id)
+        if set(arguments) != {'from_at', 'through_at'}:
+            raise ValueError('計画期間を指定してください。')
+        plan = plan_week_allocations(datetime.fromisoformat(arguments['from_at']), datetime.fromisoformat(arguments['through_at']))
+        actions: list[ProposedAction] = []
+        notes: list[str] = []
+        for item in plan['tasks']:
+            slots = item['allocations']
+            if not slots:
+                notes.append(f'「{item["title"]}」は期間内に配置できませんでした。')
+                continue
+            if len(actions) + len(slots) > MAX_WEEK_PLAN_ACTIONS:
+                notes.append(f'「{item["title"]}」は一度に提案できる件数の上限のため含めていません。')
+                continue
+            actions.extend(ProposedAction(
+                name='create_task_allocation',
+                arguments_json=json.dumps({'task_id': item['task_id'], 'start_at': slot['start_at'], 'end_at': slot['end_at']}),
+            ) for slot in slots)
+            if item['unallocated_minutes']:
+                notes.append(f'「{item["title"]}」は{item["unallocated_minutes"]}分が期間内に収まりませんでした。')
+        reasons = {'missing_estimate': '見積時間が未設定', 'deadline_passed': '期限が過ぎている', 'prerequisite_unplanned': '先に必要なタスクを配置できない'}
+        notes.extend(f'「{item["title"]}」は{reasons.get(item["reason"], item["reason"])}ため対象外です。' for item in plan['skipped'])
+        if not actions:
+            raise ValueError('期間内に配置できるタスクがありません。' + ''.join(notes))
+        payload = ProposalPayload(actions=actions)
+        with database_transaction(rollback=True):
+            baseline = schedule_snapshot()
+            run_actions(payload.actions)
+            check_final_conflicts()
+        proposal_id = store_proposal(conversation_id, payload.actions, baseline, {'kind': 'week_plan'})
+        return {'ok': True, 'state': 'proposed', 'proposal_id': proposal_id,
+                'actions': [action.model_dump() for action in payload.actions], 'plan_notes': notes,
                 'instruction': 'これは未反映の提案です。変更内容を具体的に伝え、了承を尋ねてください。'}
     except (ValueError, TypeError, HTTPException) as error:
         invalidate_pending_proposal(conversation_id)
@@ -328,7 +389,7 @@ def proposal_context(conversation_id: str | None) -> str:
     return '\nDBに保存されている現在の予定・タスク・作業枠（会話中の古い説明より優先）:\n' + json.dumps(
         {'current': snapshot, 'pending_proposal': dict(pending) if pending else None,
          'planning_rules': {'start': PLANNING_DAY_START, 'end': PLANNING_DAY_END,
-                            'workdays': sorted(PLANNING_WORKDAYS), 'start_interval_minutes': 15}}, ensure_ascii=False,
+                            'workdays': sorted(PLANNING_WORKDAYS), 'start_interval_minutes': 5}}, ensure_ascii=False,
     )
 
 

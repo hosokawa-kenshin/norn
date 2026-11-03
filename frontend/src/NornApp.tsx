@@ -705,6 +705,11 @@ export default function NornApp() {
     setView('chat')
   }
 
+  function requestWeekPlan() {
+    setDraft('今週の未完了タスクを優先度順に、休憩も入れて配置する案を作って。')
+    setView('chat')
+  }
+
   function moveCalendar(offset: number) {
     const date = new Date(`${selectedDate}T00:00:00`)
     date.setDate(date.getDate() + offset * (calendarMode === 'week' ? 7 : 1))
@@ -877,7 +882,7 @@ export default function NornApp() {
             })}
           </div>
           {events.length === 0 && taskAllocations.length === 0 && !eventError && <div className="calendar-empty-note"><CalendarDays size={18} /><span>この期間に予定はありません</span></div>}
-        </section> : view === 'tasks' ? <TasksView onRequestSchedule={requestTaskSchedule} /> : (
+        </section> : view === 'tasks' ? <TasksView onRequestSchedule={requestTaskSchedule} onRequestWeekPlan={requestWeekPlan} /> : (
           <GoalsView onPlanProject={planProjectTasks} />
         )}
 

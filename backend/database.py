@@ -234,6 +234,13 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS ix_tasks_status_due
                 ON tasks(status, due_at);
+            CREATE TABLE IF NOT EXISTS task_dependencies (
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (task_id, depends_on_task_id),
+                CHECK (task_id != depends_on_task_id)
+            );
             CREATE TABLE IF NOT EXISTS task_allocations (
                 id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

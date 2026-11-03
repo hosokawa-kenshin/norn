@@ -18,6 +18,26 @@ type TaskItem = {
   completed_at: string | null
   scheduled_start: string | null
   scheduled_end: string | null
+  remaining_minutes: number | null
+  focus_level: number | null
+  splittable: number | boolean
+  min_session_minutes: number | null
+  max_session_minutes: number | null
+  depends_on: string[]
+}
+type Allocation = { id: string; task_id: string; start_at: string; end_at: string }
+type PlanTask = {
+  task_id: string
+  title: string
+  priority_score: number
+  allocated_minutes: number
+  unallocated_minutes: number
+  allocations: { start_at: string; end_at: string; break_after_minutes?: number }[]
+}
+type WeekPlan = {
+  tasks: PlanTask[]
+  skipped: { task_id: string; title?: string; reason: string }[]
+  days: { date: string; available_minutes: number; planned_minutes: number; ratio: number }[]
 }
 type TaskDraft = {
   title: string
@@ -26,15 +46,25 @@ type TaskDraft = {
   dueAt: string
   estimatedMinutes: string
   priority: TaskPriority
+  remainingMinutes: string
+  focusLevel: string
+  splittable: boolean
+  minSession: string
+  maxSession: string
+  dependsOn: string[]
 }
 type TaskFilter = 'active' | 'done' | 'all'
 type ProjectOption = { id: string; title: string }
 type TasksViewProps = {
   onRequestSchedule: (task: Pick<TaskItem, 'title' | 'estimated_minutes' | 'due_at'>) => void
+  onRequestWeekPlan: () => void
 }
 
 function emptyDraft(): TaskDraft {
-  return { title: '', projectId: '', description: '', dueAt: '', estimatedMinutes: '', priority: 'normal' }
+  return {
+    title: '', projectId: '', description: '', dueAt: '', estimatedMinutes: '', priority: 'normal',
+    remainingMinutes: '', focusLevel: '', splittable: true, minSession: '', maxSession: '', dependsOn: [],
+  }
 }
 
 function toLocalDateTime(value: string | null) {
@@ -65,8 +95,11 @@ async function errorMessage(response: Response) {
     : `リクエストに失敗しました (${response.status})`
 }
 
-export default function TasksView({ onRequestSchedule }: TasksViewProps) {
+export default function TasksView({ onRequestSchedule, onRequestWeekPlan }: TasksViewProps) {
   const [tasks, setTasks] = useState<TaskItem[]>([])
+  const [allocations, setAllocations] = useState<Allocation[]>([])
+  const [plan, setPlan] = useState<WeekPlan | null>(null)
+  const [isPlanLoading, setIsPlanLoading] = useState(false)
   const [projects, setProjects] = useState<ProjectOption[]>([])
   const [filter, setFilter] = useState<TaskFilter>('active')
   const [error, setError] = useState('')
@@ -75,6 +108,44 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
   const [showEditor, setShowEditor] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState<TaskDraft>(emptyDraft)
+
+  function allocationRange() {
+    const start = new Date()
+    const end = new Date(start.getTime() + 60 * 86400000)
+    return `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`
+  }
+
+  async function refreshAllocations() {
+    const response = await fetch(`/api/task-allocations?${allocationRange()}`)
+    if (response.ok) setAllocations((await response.json()) as Allocation[])
+  }
+
+  async function loadPlan() {
+    setIsPlanLoading(true)
+    setError('')
+    try {
+      const from = new Date()
+      const through = new Date(from.getTime() + 7 * 86400000)
+      const response = await fetch(`/api/task-allocation-plan?from_at=${encodeURIComponent(from.toISOString())}&through_at=${encodeURIComponent(through.toISOString())}`)
+      if (!response.ok) throw new Error(await errorMessage(response))
+      setPlan((await response.json()) as WeekPlan)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '週間計画を取得できませんでした。')
+    } finally {
+      setIsPlanLoading(false)
+    }
+  }
+
+  async function deleteAllocation(allocation: Allocation) {
+    setError('')
+    try {
+      const response = await fetch(`/api/tasks/${allocation.task_id}/allocations/${allocation.id}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await errorMessage(response))
+      await Promise.all([refreshTasks(), refreshAllocations()])
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '作業枠を削除できませんでした。')
+    }
+  }
 
   async function refreshTasks() {
     const [taskResponse, projectResponse] = await Promise.all([
@@ -93,19 +164,21 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
 
   useEffect(() => {
     let active = true
-    Promise.all([fetch('/api/tasks'), fetch('/api/projects')])
-      .then(async ([taskResponse, projectResponse]) => {
+    Promise.all([fetch('/api/tasks'), fetch('/api/projects'), fetch(`/api/task-allocations?${allocationRange()}`)])
+      .then(async ([taskResponse, projectResponse, allocationResponse]) => {
         if (!taskResponse.ok) throw new Error(await errorMessage(taskResponse))
         if (!projectResponse.ok) throw new Error(await errorMessage(projectResponse))
         return Promise.all([
           taskResponse.json() as Promise<TaskItem[]>,
           projectResponse.json() as Promise<ProjectOption[]>,
+          allocationResponse.ok ? allocationResponse.json() as Promise<Allocation[]> : Promise.resolve([] as Allocation[]),
         ])
       })
-      .then(([taskItems, projectItems]) => {
+      .then(([taskItems, projectItems, allocationItems]) => {
         if (!active) return
         setTasks(taskItems)
         setProjects(projectItems)
+        setAllocations(allocationItems)
       })
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : 'タスクを取得できませんでした。') })
       .finally(() => { if (active) setIsLoading(false) })
@@ -128,6 +201,12 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
       dueAt: toLocalDateTime(task.due_at),
       estimatedMinutes: task.estimated_minutes?.toString() ?? '',
       priority: task.priority,
+      remainingMinutes: task.remaining_minutes?.toString() ?? '',
+      focusLevel: task.focus_level?.toString() ?? '',
+      splittable: Boolean(task.splittable),
+      minSession: task.min_session_minutes?.toString() ?? '',
+      maxSession: task.max_session_minutes?.toString() ?? '',
+      dependsOn: task.depends_on ?? [],
     })
     setError('')
     setShowEditor(true)
@@ -137,12 +216,18 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
     event.preventDefault()
     setIsSaving(true)
     setError('')
+    const optionalNumber = (value: string) => value ? Number(value) : null
     const payload = {
       title: draft.title,
       project_id: draft.projectId || null,
       description: draft.description,
       due_at: draft.dueAt ? new Date(draft.dueAt).toISOString() : null,
-      estimated_minutes: draft.estimatedMinutes ? Number(draft.estimatedMinutes) : null,
+      estimated_minutes: optionalNumber(draft.estimatedMinutes),
+      remaining_minutes: optionalNumber(draft.remainingMinutes),
+      focus_level: optionalNumber(draft.focusLevel),
+      splittable: draft.splittable,
+      min_session_minutes: optionalNumber(draft.minSession),
+      max_session_minutes: optionalNumber(draft.maxSession),
       priority: draft.priority,
     }
     try {
@@ -152,7 +237,14 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
         body: JSON.stringify(payload),
       })
       if (!response.ok) throw new Error(await errorMessage(response))
-      await refreshTasks()
+      const saved = (await response.json()) as TaskItem
+      const dependencyResponse = await fetch(`/api/tasks/${saved.id}/dependencies`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ depends_on: draft.dependsOn }),
+      })
+      if (!dependencyResponse.ok) throw new Error(await errorMessage(dependencyResponse))
+      await Promise.all([refreshTasks(), refreshAllocations()])
       setShowEditor(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'タスクを保存できませんでした。')
@@ -199,6 +291,12 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
     open: '未着手', in_progress: '進行中', done: '完了', cancelled: '中止',
   }
   const priorityLabel: Record<TaskPriority, string> = { low: '低', normal: '通常', high: '高' }
+  const skipReason: Record<string, string> = {
+    missing_estimate: '見積なし', deadline_passed: '期限切れ', prerequisite_unplanned: '前提タスク未配置',
+  }
+  const allocationsByTask = new Map<string, Allocation[]>()
+  for (const allocation of allocations) allocationsByTask.set(allocation.task_id, [...(allocationsByTask.get(allocation.task_id) ?? []), allocation])
+  const titleById = new Map(tasks.map((task) => [task.id, task.title]))
 
   return (
     <section className="task-stage" aria-label="タスク管理">
@@ -208,8 +306,30 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
           <h2>やること</h2>
           <p>予定は確定した時間、タスクは完了させる作業として管理します。</p>
         </div>
-        <button className="add-event-button" type="button" onClick={openNewTask}><Plus size={16} />タスクを追加</button>
+        <div className="task-toolbar-actions">
+          <button className="cancel-button" type="button" onClick={() => void loadPlan()} disabled={isPlanLoading}><CalendarClock size={15} />{isPlanLoading ? '計算中…' : '今週の計画を見る'}</button>
+          <button className="add-event-button" type="button" onClick={openNewTask}><Plus size={16} />タスクを追加</button>
+        </div>
       </div>
+
+      {plan && <section className="week-plan-panel" aria-label="今週の配置案">
+        <div className="week-plan-heading">
+          <h3>今週の配置案（未保存）</h3>
+          <div>
+            <button className="dialog-close" type="button" onClick={onRequestWeekPlan}>チャットで案を作ってもらう</button>
+            <button className="icon-button" type="button" aria-label="閉じる" onClick={() => setPlan(null)}>×</button>
+          </div>
+        </div>
+        {plan.tasks.length === 0 ? <p>配置できるタスクはありません。</p> : <ol className="week-plan-list">
+          {plan.tasks.map((item) => <li key={item.task_id}>
+            <strong>{item.title}</strong> <span>スコア {item.priority_score}</span>
+            {item.allocations.length > 0 && <ul>{item.allocations.map((slot) => <li key={slot.start_at}>{formatScheduledRange(slot.start_at, slot.end_at)}{slot.break_after_minutes ? `（休憩${slot.break_after_minutes}分）` : ''}</li>)}</ul>}
+            {item.unallocated_minutes > 0 && <em>未配置 {item.unallocated_minutes}分</em>}
+          </li>)}
+        </ol>}
+        {plan.skipped.length > 0 && <p className="week-plan-skipped">対象外: {plan.skipped.map((item) => `${item.title ?? item.task_id}（${skipReason[item.reason] ?? item.reason}）`).join('、')}</p>}
+        <div className="week-plan-days">{plan.days.filter((day) => day.available_minutes > 0).map((day) => <span key={day.date}>{day.date.slice(5)} {day.planned_minutes}/{day.available_minutes}分（{Math.round(day.ratio * 100)}%）</span>)}</div>
+      </section>}
 
       {error && <div className="error-banner task-error" role="alert"><CircleAlert size={16} /><span>{error}</span><button type="button" aria-label="エラーを閉じる" onClick={() => setError('')}>×</button></div>}
 
@@ -241,10 +361,18 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
               <span className={`task-priority ${task.priority}`}>優先度 {priorityLabel[task.priority]}</span>
               <span className={task.due_at ? 'task-due' : 'task-no-due'}>期限 {formatDue(task.due_at)}</span>
               {task.estimated_minutes && <span className="task-estimate"><Clock3 size={12} />{task.estimated_minutes}分</span>}
+              {task.depends_on?.length > 0 && <span className="task-dependency">前提: {task.depends_on.map((id) => titleById.get(id) ?? '不明').join('、')}</span>}
+              {!task.splittable && <span className="task-dependency">分割しない</span>}
               {task.scheduled_start && task.scheduled_end
                 ? <span className="task-scheduled"><CalendarClock size={12} />{formatScheduledRange(task.scheduled_start, task.scheduled_end)}</span>
                 : task.status !== 'done' && task.status !== 'cancelled' && <button className="task-slot-button" type="button" onClick={() => onRequestSchedule(task)}><CalendarClock size={13} />時間を割り当て</button>}
             </div>
+            {(allocationsByTask.get(task.id)?.length ?? 0) > 0 && <ul className="task-allocation-list">
+              {allocationsByTask.get(task.id)!.map((allocation) => <li key={allocation.id}>
+                <CalendarClock size={12} />{formatScheduledRange(allocation.start_at, allocation.end_at)}
+                <button type="button" aria-label={`${task.title}の作業枠${formatScheduledRange(allocation.start_at, allocation.end_at)}を削除`} onClick={() => void deleteAllocation(allocation)}>×</button>
+              </li>)}
+            </ul>}
           </div>
           <div className="task-controls">
             <button className="calendar-icon-button" type="button" onClick={() => openEditTask(task)} aria-label={`${task.title}を編集`} title="編集"><Pencil size={15} /></button>
@@ -274,6 +402,26 @@ export default function TasksView({ onRequestSchedule }: TasksViewProps) {
           <label className="task-field">優先度<select value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: event.target.value as TaskPriority })}>
             <option value="low">低</option><option value="normal">通常</option><option value="high">高</option>
           </select></label>
+          <div className="task-form-grid">
+            <label className="task-field">残り時間（分）<input type="number" min="0" max="1440" value={draft.remainingMinutes} onChange={(event) => setDraft({ ...draft, remainingMinutes: event.target.value })} /></label>
+            <label className="task-field">集中度（1-5）<select value={draft.focusLevel} onChange={(event) => setDraft({ ...draft, focusLevel: event.target.value })}>
+              <option value="">未設定</option>{[1, 2, 3, 4, 5].map((level) => <option key={level} value={level}>{level}</option>)}
+            </select></label>
+          </div>
+          <label className="task-check"><input type="checkbox" checked={draft.splittable} onChange={(event) => setDraft({ ...draft, splittable: event.target.checked })} />複数の枠に分割してよい</label>
+          <div className="task-form-grid">
+            <label className="task-field">最低作業時間（分）<input type="number" min="1" max="1440" value={draft.minSession} onChange={(event) => setDraft({ ...draft, minSession: event.target.value })} /></label>
+            <label className="task-field">最大作業時間（分）<input type="number" min="1" max="1440" value={draft.maxSession} onChange={(event) => setDraft({ ...draft, maxSession: event.target.value })} /></label>
+          </div>
+          {tasks.filter((task) => task.id !== editingId && (task.status === 'open' || task.status === 'in_progress')).length > 0 && <fieldset className="task-dependency-field">
+            <legend>前提タスク（先に終えるもの）</legend>
+            {tasks.filter((task) => task.id !== editingId && (task.status === 'open' || task.status === 'in_progress')).map((task) => <label className="task-check" key={task.id}>
+              <input type="checkbox" checked={draft.dependsOn.includes(task.id)} onChange={(event) => setDraft({
+                ...draft,
+                dependsOn: event.target.checked ? [...draft.dependsOn, task.id] : draft.dependsOn.filter((id) => id !== task.id),
+              })} />{task.title}
+            </label>)}
+          </fieldset>}
           <div className="event-dialog-actions"><button className="cancel-button" type="button" onClick={() => setShowEditor(false)} disabled={isSaving}>キャンセル</button><button className="dialog-close" type="submit" disabled={isSaving}>{isSaving ? '保存中…' : editingId ? '変更を保存' : 'タスクを保存'}</button></div>
         </form>
       </div>}

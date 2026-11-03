@@ -246,6 +246,22 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .task-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 17px; border-bottom: 1px solid var(--line); }
 .task-toolbar h2 { margin: 7px 0 5px; color: var(--ink); font-size: 19px; }
 .task-toolbar p { color: var(--muted); font-size: 10px; }
+.task-toolbar-actions { display: flex; gap: 8px; align-items: center; }
+.week-plan-panel { margin: 14px 0; padding: 12px 14px; background: #fbfcf8; border: 1px solid var(--line); border-radius: 6px; font-size: 11px; color: var(--ink); }
+.week-plan-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.week-plan-heading h3 { margin: 0; font-size: 13px; }
+.week-plan-list { margin: 8px 0; padding-left: 20px; display: grid; gap: 6px; }
+.week-plan-list ul { margin: 2px 0 0; padding-left: 16px; color: var(--muted); }
+.week-plan-list span, .week-plan-list em { color: var(--muted); margin-left: 6px; font-style: normal; }
+.week-plan-skipped { color: var(--muted); }
+.week-plan-days { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--moss); font-family: var(--mono); font-size: 10px; }
+.task-allocation-list { margin: 6px 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 4px 10px; color: #a45b46; font-size: 10px; }
+.task-allocation-list li { display: inline-flex; align-items: center; gap: 4px; }
+.task-allocation-list button { border: 0; background: none; color: var(--muted); cursor: pointer; }
+.task-dependency { color: var(--moss); }
+.task-check { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #5e6b5d; }
+.task-dependency-field { display: grid; gap: 4px; margin: 0; padding: 8px 10px; border: 1px solid #d9e0d4; border-radius: 5px; max-height: 120px; overflow: auto; }
+.task-dependency-field legend { font-size: 10px; font-weight: 650; color: #5e6b5d; }
 .task-list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 13px 0 8px; }
 .task-filter-switch { display: inline-flex; gap: 4px; }
 .task-filter-switch button { display: inline-flex; align-items: center; gap: 7px; min-height: 31px; padding: 0 9px; color: #647064; background: transparent; border: 1px solid transparent; border-radius: 5px; cursor: pointer; font-size: 10px; }

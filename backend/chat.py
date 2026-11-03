@@ -24,7 +24,7 @@ from planning import (
 )
 from tasks import TASK_TOOLS, execute_task_tool
 from reminders import REMINDER_TOOLS, execute_reminder_tool, is_notice_reply, reminder_context
-from schedule_proposals import PROPOSAL_TOOLS, apply_approved_proposal, invites_approval_after_failed_proposal, is_approval, proposal_context, propose_schedule, reply_proposal_id, schedule_snapshot, verify_schedule_reply
+from schedule_proposals import PROPOSAL_TOOLS, apply_approved_proposal, invites_approval_after_failed_proposal, is_approval, proposal_context, propose_schedule, propose_week_plan, reply_proposal_id, schedule_snapshot, verify_schedule_reply
 from routines import ROUTINE_TOOLS, pending_routine_request, propose_routine
 from llm_limits import check_llm_available, check_llm_response
 from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_MESSAGE_LENGTH, logger
@@ -65,7 +65,7 @@ SYSTEM_PROMPT = (
     'ユーザーから特定タスクの時間割当や再割当を頼まれた場合も、空き時間を検索して最適候補へ割り当ててください。空きがなければ未割当のまま理由を伝えてください。'
     'タスクを登録したときに見積時間が不明なら、タスク本体を保存したうえで所要時間を自然に尋ねてください。開始日時を既に伝えている場合は聞き直さず、未指定の場合だけ希望を尋ねてください。返答は直前に登録したタスクの所要時間・希望日時として反映し、時間枠まで保存してください。'
     'ユーザーが時間割当は不要・後でと述べた場合は質問や割当を強制しないでください。希望日時に重複や作業時間外等の問題があれば、勝手に別時刻へ変えず理由を伝えて代案を相談してください。'
-    'タスクの開始は15分刻みです。14時31分等の指定を勝手に丸めず、所要時間と希望を保持し、登録できない理由と空き時間候補を短く伝えて了承を待ってください。'
+    'タスクの開始は5分刻みです。14時32分等の指定を勝手に丸めず、所要時間と希望を保持し、登録できない理由と空き時間候補を短く伝えて了承を待ってください。'
     'タスク操作の結果もツールの戻り値に従って報告してください。'
     '目標とプロジェクトの検索・追加・更新・削除は、ユーザーの明確な依頼に基づいて専用ツールで実行してください。'
     '目標を作成するときは長期的な到達状態、プロジェクトは具体的な取り組みとして区別し、プロジェクトは該当する目標へ関連付けてください。'
@@ -174,30 +174,40 @@ def split_allocation_proposal_reply(proposal: dict[str, Any]) -> str | None:
     if proposal.get('state') != 'proposed' or not proposal.get('ok'):
         return None
     actions = proposal.get('actions') or []
-    if len(actions) < 2 or any(action.get('name') != 'create_task_allocation' for action in actions):
+    if not actions or any(action.get('name') != 'create_task_allocation' for action in actions):
         return None
     try:
         slots = [json.loads(action['arguments_json']) for action in actions]
         task_ids = {slot['task_id'] for slot in slots}
-        if len(task_ids) != 1:
+        if len(task_ids) == 1 and len(actions) < 2:
             return None
-        title = next((task['title'] for task in schedule_snapshot()['tasks'] if task['id'] in task_ids), None)
-        if title is None:
+        titles = {task['id']: task['title'] for task in schedule_snapshot()['tasks']}
+        if not task_ids <= set(titles):
             return None
         weekdays = '月火水木金土日'
-        lines = []
-        for slot in sorted(slots, key=lambda item: item['start_at']):
+
+        def describe(slot: dict[str, Any]) -> str:
             start = datetime.fromisoformat(slot['start_at']).astimezone(LOCAL_TIMEZONE)
             end = datetime.fromisoformat(slot['end_at']).astimezone(LOCAL_TIMEZONE)
             minutes = int((end - start).total_seconds() // 60)
-            lines.append(f'・{start.month}/{start.day}({weekdays[start.weekday()]}) {start:%H:%M}〜{end:%H:%M}（{minutes}分）')
+            return f'{start.month}/{start.day}({weekdays[start.weekday()]}) {start:%H:%M}〜{end:%H:%M}（{minutes}分）'
+
+        if len(task_ids) == 1:
+            title = titles[next(iter(task_ids))]
+            lines = [f'・{describe(slot)}' for slot in sorted(slots, key=lambda item: item['start_at'])]
+            return f'「{title}」を{len(lines)}回に分ける案を作ったよ。まだ保存はしていません。\n' + '\n'.join(lines) + '\nこの内容でよければ「お願いします」と返してね。'
+        sections = []
+        for task_id in sorted(task_ids, key=lambda value: min(slot['start_at'] for slot in slots if slot['task_id'] == value)):
+            lines = [f'  ・{describe(slot)}' for slot in sorted((slot for slot in slots if slot['task_id'] == task_id), key=lambda item: item['start_at'])]
+            sections.append(f'「{titles[task_id]}」\n' + '\n'.join(lines))
+        notes = ''.join(f'\n※{note}' for note in proposal.get('plan_notes') or [])
+        return f'{len(task_ids)}件のタスクを優先度順に配置する案を作ったよ。作業の合間に休憩も入れてあるよ。まだ保存はしていません。\n' + '\n'.join(sections) + notes + '\nこの内容でよければ「お願いします」と返してね。'
     except (KeyError, ValueError, TypeError):
         return None
-    return f'「{title}」を{len(lines)}回に分ける案を作ったよ。まだ保存はしていません。\n' + '\n'.join(lines) + '\nこの内容でよければ「お願いします」と返してね。'
 
 
 def deterministic_action_reply(results: list[dict[str, Any]]) -> str | None:
-    read_only_tools = {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations'}
+    read_only_tools = {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations'}
     supported_tools = {'create_event', 'update_event', 'create_task', 'update_task', 'schedule_task'}
     actions = []
     for result in results:
@@ -583,7 +593,7 @@ async def generate_llm_reply(
         check_llm_available()
         available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *PROPOSAL_TOOLS, *ROUTINE_TOOLS]
         if proposal_only:
-            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'propose_schedule', 'propose_routine'}]
+            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'propose_schedule', 'propose_week_plan', 'propose_routine'}]
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
@@ -665,13 +675,13 @@ async def generate_llm_reply(
                     'create_task', 'update_task', 'complete_task', 'delete_task',
                     'schedule_task', 'unschedule_task',
                     'extend_schedule',
-                    'propose_schedule',
+                    'propose_schedule', 'propose_week_plan',
                     'propose_routine',
                     'save_memory', 'update_memory', 'forget_memory',
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
                 }
-                if proposal_only and name in mutating_tools and name not in {'propose_schedule', 'propose_routine'}:
+                if proposal_only and name in mutating_tools and name not in {'propose_schedule', 'propose_week_plan', 'propose_routine'}:
                     result = {'ok': False, 'error': '今回は提案の相談です。直接変更せずpropose_scheduleで未反映の案を作成してください。'}
                 elif name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
@@ -691,6 +701,8 @@ async def generate_llm_reply(
                         result = execute_reminder_tool(arguments)
                     elif name == 'propose_schedule':
                         result = propose_schedule(conversation_id, arguments)
+                    elif name == 'propose_week_plan':
+                        result = propose_week_plan(conversation_id, arguments)
                     elif name == 'propose_routine':
                         result = propose_routine(conversation_id, arguments, latest)
                     elif name in task_tools:

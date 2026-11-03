@@ -282,6 +282,22 @@ TASK_TOOLS = [
     {
         'type': 'function',
         'function': {
+            'name': 'plan_week_allocations',
+            'description': '週間など指定期間で、未完了の複数タスクを優先度順（期限30%・目標貢献30%・緊急性20%・依存10%・停滞10%）に、1日の利用可能時間の85%以内・作業間の休憩10分込みで配置する案を読み取り専用で計算する。保存は行わない。週間の配置案を内容確認だけしたいときに使う。ユーザーが案の作成・配置を求めたら、操作を自分で組み立てずpropose_week_planを使う。',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'from_at': {'type': 'string', 'format': 'date-time'},
+                    'through_at': {'type': 'string', 'format': 'date-time'},
+                },
+                'required': ['from_at', 'through_at'],
+                'additionalProperties': False,
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'schedule_task',
             'description': '空き時間検索結果から選んだ開始時刻にタスクを割り当てる。所要時間はタスクの見積時間を使う。',
             'parameters': {
@@ -324,6 +340,12 @@ def configured_time(value: str) -> time:
         return time.fromisoformat(value)
     except ValueError as error:
         raise RuntimeError('作業時間の設定はHH:MM形式で指定してください。') from error
+
+
+def ceil_to_five_minutes(value: datetime) -> datetime:
+    if value.second or value.microsecond:
+        value = value.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return value.replace(minute=value.minute, second=0, microsecond=0) + timedelta(minutes=-value.minute % 5)
 
 
 def ceil_to_quarter_hour(value: datetime) -> datetime:
@@ -506,7 +528,7 @@ def plan_task_allocations(
     for period_start, period_end in periods:
         if len(allocations) >= block_limit:
             break
-        cursor = ceil_to_quarter_hour(period_start)
+        cursor = ceil_to_five_minutes(period_start)
         while remaining > 0 and cursor < period_end and len(allocations) < block_limit:
             if distinct_days and cursor.date() in used_dates:
                 break
@@ -525,7 +547,7 @@ def plan_task_allocations(
             })
             remaining -= duration
             used_dates.add(cursor.date())
-            cursor = ceil_to_quarter_hour(allocation_end)
+            cursor = ceil_to_five_minutes(allocation_end)
             if not task['splittable'] or max_session == 0:
                 break
 
@@ -544,6 +566,224 @@ def plan_task_allocations(
     return result
 
 
+TARGET_SCHEDULE_RATIO = 0.85
+BREAK_MINUTES = 10
+DEFAULT_MAX_SESSION_MINUTES = 90
+PRIORITY_WEIGHTS = {'deadline': 0.30, 'goal': 0.30, 'urgency': 0.20, 'dependency': 0.10, 'stagnation': 0.10}
+
+
+def adaptive_break_minutes(focus_level: int | None, duration_minutes: int) -> int:
+    # 基本10分を下回らせない。高集中または長時間の作業の後は15分に延ばす。
+    if (focus_level or 0) >= 4 or duration_minutes >= 90:
+        return BREAK_MINUTES + 5
+    return BREAK_MINUTES
+
+
+def task_priority_score(task: Any, goal_status: str | None, now: datetime, blocks_others: bool = False) -> dict[str, Any]:
+    if task['due_at']:
+        days_left = (datetime.fromisoformat(task['due_at']) - now).total_seconds() / 86400
+        deadline = 100.0 if days_left <= 0 else max(0.0, 100.0 * (1 - days_left / 14))
+    else:
+        deadline = 0.0
+    if goal_status == 'active':
+        goal = 100.0
+    elif task['project_id']:
+        goal = 50.0
+    else:
+        goal = 0.0
+    urgency = {'high': 100.0, 'normal': 50.0, 'low': 0.0}[task['priority']]
+    idle_days = (now - datetime.fromisoformat(task['updated_at'])).total_seconds() / 86400
+    stagnation = min(100.0, max(0.0, idle_days) / 14 * 100)
+    components = {'deadline': deadline, 'goal': goal, 'urgency': urgency, 'dependency': 100.0 if blocks_others else 0.0, 'stagnation': stagnation}
+    score = sum(components[name] * weight for name, weight in PRIORITY_WEIGHTS.items())
+    return {'score': round(score, 1), 'components': {name: round(value, 1) for name, value in components.items()}}
+
+
+def plan_week_allocations(from_at: datetime, through_at: datetime) -> dict[str, Any]:
+    range_start = task_datetime_iso(from_at)
+    range_end = task_datetime_iso(through_at)
+    if range_start is None or range_end is None or range_end <= range_start:
+        raise HTTPException(status_code=422, detail='検索期間が正しくありません。')
+    now = datetime.now(LOCAL_TIMEZONE)
+    local_start = max(datetime.fromisoformat(range_start), now)
+    local_end = datetime.fromisoformat(range_end)
+    if local_end - local_start > timedelta(days=31):
+        raise HTTPException(status_code=422, detail='計画期間は31日以内にしてください。')
+
+    with closing(open_database()) as connection:
+        rows = connection.execute(
+            '''SELECT tasks.*, goals.status AS goal_status FROM tasks
+               LEFT JOIN projects ON projects.id = tasks.project_id
+               LEFT JOIN goals ON goals.id = projects.goal_id
+               WHERE tasks.status IN ('open', 'in_progress')''',
+        ).fetchall()
+        allocated = {
+            row['task_id']: int(row['minutes'])
+            for row in connection.execute(
+                '''SELECT task_id, SUM((julianday(end_at) - julianday(start_at)) * 1440 + 0.5) AS minutes
+                   FROM task_allocations GROUP BY task_id''',
+            ).fetchall()
+        }
+        last_end = {
+            row['task_id']: datetime.fromisoformat(row['last_end'])
+            for row in connection.execute(
+                'SELECT task_id, MAX(end_at) AS last_end FROM task_allocations GROUP BY task_id',
+            ).fetchall()
+        }
+        open_ids = {row['id'] for row in rows}
+        prerequisites: dict[str, set[str]] = {}
+        for row in connection.execute('SELECT task_id, depends_on_task_id FROM task_dependencies').fetchall():
+            if row['task_id'] in open_ids and row['depends_on_task_id'] in open_ids:
+                prerequisites.setdefault(row['task_id'], set()).add(row['depends_on_task_id'])
+        blocking = {dependency for dependencies in prerequisites.values() for dependency in dependencies}
+        free: list[tuple[datetime, datetime]] = []
+        if local_end > local_start:
+            busy_events = [event for event in query_events(local_start, local_end) if not event.get('is_cancelled')]
+            busy_tasks = connection.execute(
+                'SELECT start_at, end_at FROM task_allocations WHERE start_at < ? AND end_at > ?',
+                (task_datetime_iso(local_end), task_datetime_iso(local_start)),
+            ).fetchall()
+            busy_periods = sorted(
+                [(datetime.fromisoformat(row['start_at']), datetime.fromisoformat(row['end_at']))
+                 for row in [*busy_events, *busy_tasks]],
+                key=lambda period: period[0],
+            )
+            free = available_work_periods(local_start, local_end, busy_periods)
+
+    day_available: dict[Any, int] = {}
+    for period_start, period_end in free:
+        day_available[period_start.date()] = day_available.get(period_start.date(), 0) + int((period_end - period_start).total_seconds() // 60)
+    day_cap = {day: int(minutes * TARGET_SCHEDULE_RATIO) // 5 * 5 for day, minutes in day_available.items()}
+    day_used = {day: 0 for day in day_available}
+
+    candidates: dict[str, tuple[Any, int, dict[str, Any]]] = {}
+    skipped = []
+    skipped_ids: set[str] = set()
+    for task in rows:
+        if task['estimated_minutes'] is None:
+            skipped.append({'task_id': task['id'], 'title': task['title'], 'reason': 'missing_estimate'})
+            skipped_ids.add(task['id'])
+            continue
+        budget = task['remaining_minutes'] if task['remaining_minutes'] is not None else task['estimated_minutes']
+        remaining = budget - allocated.get(task['id'], 0)
+        if remaining <= 0:
+            continue
+        if task['due_at'] and datetime.fromisoformat(task['due_at']) <= now:
+            skipped.append({'task_id': task['id'], 'title': task['title'], 'reason': 'deadline_passed'})
+            skipped_ids.add(task['id'])
+            continue
+        candidates[task['id']] = (task, remaining, task_priority_score(task, task['goal_status'], now, task['id'] in blocking))
+    pending = sorted(
+        candidates,
+        key=lambda task_id: (-candidates[task_id][2]['score'], candidates[task_id][0]['due_at'] is None,
+                             candidates[task_id][0]['due_at'] or '', candidates[task_id][0]['created_at']),
+    )
+
+    results = []
+    incomplete: set[str] = set()
+    processed: set[str] = set()
+    planned_end = dict(last_end)
+    while pending:
+        # 前提タスクの配置が済んだものから、優先度の高い順に処理する。
+        ready = next((task_id for task_id in pending if all(
+            dependency in processed or (dependency not in candidates and dependency not in skipped_ids)
+            for dependency in prerequisites.get(task_id, ())
+        )), None)
+        task_id = ready or pending[0]
+        pending.remove(task_id)
+        task, remaining, score = candidates[task_id]
+        processed.add(task_id)
+        blocked_by = [
+            dependency for dependency in prerequisites.get(task_id, ())
+            if dependency in skipped_ids or dependency in incomplete or (ready is None and dependency not in processed)
+        ]
+        if blocked_by:
+            skipped.append({'task_id': task['id'], 'title': task['title'], 'reason': 'prerequisite_unplanned'})
+            incomplete.add(task_id)
+            continue
+        earliest = max((planned_end[dependency] for dependency in prerequisites.get(task_id, ()) if dependency in planned_end), default=None)
+        due = datetime.fromisoformat(task['due_at']) if task['due_at'] else None
+        min_session = task['min_session_minutes'] or 5
+        max_session = task['max_session_minutes'] or (DEFAULT_MAX_SESSION_MINUTES if task['splittable'] else remaining)
+        if not task['splittable']:
+            max_session = remaining if remaining <= max_session else 0
+            min_session = remaining
+        total = remaining
+        allocations: list[dict[str, str | int]] = []
+        while remaining > 0 and max_session:
+            placed = False
+            for index, (period_start, period_end) in enumerate(free):
+                cursor = ceil_to_five_minutes(max(period_start, earliest) if earliest else period_start)
+                limit = min(period_end, due) if due else period_end
+                day = period_start.date()
+                capacity = int((limit - cursor).total_seconds() // 60)
+                duration = min(remaining, max_session, capacity, day_cap.get(day, 0) - day_used.get(day, 0))
+                if duration < remaining:
+                    duration = duration // 5 * 5
+                leftover = remaining - duration
+                if 0 < leftover < min_session:
+                    duration = (remaining - min_session) // 5 * 5
+                if duration < min_session or duration <= 0 or not task['splittable'] and duration != remaining:
+                    continue
+                block_end = cursor + timedelta(minutes=duration)
+                break_minutes = adaptive_break_minutes(task['focus_level'], duration)
+                allocations.append({
+                    'start_at': task_datetime_iso(cursor) or '',
+                    'end_at': task_datetime_iso(block_end) or '',
+                    'duration_minutes': duration,
+                    'break_after_minutes': break_minutes,
+                })
+                replacement = []
+                if cursor > period_start:
+                    replacement.append((period_start, cursor))
+                resume = ceil_to_five_minutes(block_end + timedelta(minutes=break_minutes))
+                if resume < period_end:
+                    replacement.append((resume, period_end))
+                free[index:index + 1] = replacement
+                day_used[day] = day_used.get(day, 0) + duration
+                remaining -= duration
+                placed = True
+                break
+            if not placed:
+                break
+        if remaining > 0:
+            incomplete.add(task_id)
+        if allocations:
+            planned_end[task_id] = max(datetime.fromisoformat(str(slot['end_at'])) for slot in allocations)
+        results.append({
+            'task_id': task['id'],
+            'title': task['title'],
+            'priority_score': score['score'],
+            'score_components': score['components'],
+            'depends_on': sorted(prerequisites.get(task_id, ())),
+            'estimated_minutes': task['estimated_minutes'],
+            'allocated_minutes': total - remaining,
+            'unallocated_minutes': remaining,
+            'complete': remaining == 0,
+            'allocations': allocations,
+        })
+    results.sort(key=lambda item: -item['priority_score'])
+
+    days = [
+        {
+            'date': day.isoformat(),
+            'available_minutes': day_available[day],
+            'planned_minutes': day_used[day],
+            'ratio': round(day_used[day] / day_available[day], 2) if day_available[day] else 0,
+        }
+        for day in sorted(day_available)
+    ]
+    return {
+        'from_at': task_datetime_iso(local_start),
+        'through_at': task_datetime_iso(local_end),
+        'target_schedule_ratio': TARGET_SCHEDULE_RATIO,
+        'break_minutes': BREAK_MINUTES,
+        'tasks': results,
+        'skipped': skipped,
+        'days': days,
+    }
+
+
 def schedule_task_record(task_id: str, start_at: datetime) -> dict[str, Any]:
     task_id = str(uuid.UUID(task_id))
     start = datetime.fromisoformat(task_datetime_iso(start_at) or '')
@@ -560,8 +800,8 @@ def schedule_task_record(task_id: str, start_at: datetime) -> dict[str, Any]:
         end = start + timedelta(minutes=task['estimated_minutes'])
         work_start = configured_time(PLANNING_DAY_START)
         work_end = configured_time(PLANNING_DAY_END)
-        if start.minute % 15 != 0 or start.second or start.microsecond:
-            raise HTTPException(status_code=409, detail='時間枠の開始時刻は15分刻みにしてください。')
+        if start.minute % 5 != 0 or start.second or start.microsecond:
+            raise HTTPException(status_code=409, detail='時間枠の開始時刻は5分刻みにしてください。')
         if start < datetime.now(LOCAL_TIMEZONE):
             raise HTTPException(status_code=409, detail='過去の時間にはタスクを割り当てられません。')
         if start.weekday() not in PLANNING_WORKDAYS:
@@ -624,8 +864,8 @@ def create_task_allocation_record(task_id: str, payload: TaskAllocationPayload) 
     duration = int((end - start).total_seconds() // 60)
     if duration <= 0 or (end - start).total_seconds() != duration * 60:
         raise HTTPException(status_code=422, detail='作業枠は1分以上の整数分で指定してください。')
-    if start.minute % 15 != 0 or start.second or start.microsecond:
-        raise HTTPException(status_code=409, detail='時間枠の開始時刻は15分刻みにしてください。')
+    if start.minute % 5 != 0 or start.second or start.microsecond:
+        raise HTTPException(status_code=409, detail='時間枠の開始時刻は5分刻みにしてください。')
     if start.date() != end.date():
         raise HTTPException(status_code=409, detail='作業枠は同じ日の中に収めてください。')
     if start < datetime.now(LOCAL_TIMEZONE):
@@ -733,7 +973,10 @@ def query_tasks(
     query += ' ORDER BY CASE tasks.priority WHEN \'high\' THEN 0 WHEN \'normal\' THEN 1 ELSE 2 END, tasks.due_at IS NULL, tasks.due_at, tasks.created_at DESC'
     with closing(open_database()) as connection:
         rows = connection.execute(query, parameters).fetchall()
-    return [dict(row) for row in rows]
+        dependencies: dict[str, list[str]] = {}
+        for row in connection.execute('SELECT task_id, depends_on_task_id FROM task_dependencies ORDER BY depends_on_task_id').fetchall():
+            dependencies.setdefault(row['task_id'], []).append(row['depends_on_task_id'])
+    return [{**dict(row), 'depends_on': dependencies.get(row['id'], [])} for row in rows]
 
 
 def create_task_record(payload: TaskPayload) -> dict[str, Any]:
@@ -966,6 +1209,65 @@ def get_task_allocation_plan(
     return plan_task_allocations(task_id, from_at, through_at, distinct_days)
 
 
+class TaskDependenciesPayload(BaseModel):
+    depends_on: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator('depends_on')
+    @classmethod
+    def clean_ids(cls, value: list[str]) -> list[str]:
+        try:
+            return sorted({str(uuid.UUID(item)) for item in value})
+        except ValueError as error:
+            raise ValueError('タスクIDが不正です。') from error
+
+
+def set_task_dependencies(task_id: str, depends_on: list[str]) -> list[str]:
+    task_id = str(uuid.UUID(task_id))
+    depends_on = sorted({str(uuid.UUID(item)) for item in depends_on})
+    if task_id in depends_on:
+        raise HTTPException(status_code=422, detail='タスクは自分自身に依存できません。')
+    with closing(open_database()) as connection:
+        if connection.execute('SELECT 1 FROM tasks WHERE id = ?', (task_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail='タスクが見つかりません。')
+        for dependency in depends_on:
+            if connection.execute('SELECT 1 FROM tasks WHERE id = ?', (dependency,)).fetchone() is None:
+                raise HTTPException(status_code=404, detail='依存先のタスクが見つかりません。')
+        edges: dict[str, set[str]] = {}
+        for row in connection.execute('SELECT task_id, depends_on_task_id FROM task_dependencies WHERE task_id != ?', (task_id,)).fetchall():
+            edges.setdefault(row['task_id'], set()).add(row['depends_on_task_id'])
+        edges[task_id] = set(depends_on)
+        stack, seen = list(depends_on), set()
+        while stack:
+            current = stack.pop()
+            if current == task_id:
+                raise HTTPException(status_code=409, detail='依存関係が循環します。')
+            if current not in seen:
+                seen.add(current)
+                stack.extend(edges.get(current, ()))
+        connection.execute('DELETE FROM task_dependencies WHERE task_id = ?', (task_id,))
+        timestamp = now_iso()
+        connection.executemany(
+            'INSERT INTO task_dependencies (task_id, depends_on_task_id, created_at) VALUES (?, ?, ?)',
+            [(task_id, dependency, timestamp) for dependency in depends_on],
+        )
+        connection.commit()
+    return depends_on
+
+
+@router.get('/api/task-allocation-plan')
+def get_week_allocation_plan(from_at: datetime, through_at: datetime) -> dict[str, Any]:
+    return plan_week_allocations(from_at, through_at)
+
+
+@router.put('/api/tasks/{task_id}/dependencies')
+def put_task_dependencies(task_id: str, payload: TaskDependenciesPayload) -> dict[str, Any]:
+    try:
+        task_id = str(uuid.UUID(task_id))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail='タスクIDが不正です。') from error
+    return {'task_id': task_id, 'depends_on': set_task_dependencies(task_id, payload.depends_on)}
+
+
 @router.put('/api/tasks/{task_id}/schedule')
 def schedule_task(task_id: str, payload: TaskSchedulePayload) -> dict[str, Any]:
     return schedule_task_record(task_id, payload.start_at)
@@ -1022,6 +1324,16 @@ def execute_task_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 datetime.fromisoformat(arguments['from_at']),
                 datetime.fromisoformat(arguments['through_at']),
                 int(arguments['distinct_days']) if arguments.get('distinct_days') is not None else None,
+            )
+            plan['ok'] = True
+            return plan
+
+        if name == 'plan_week_allocations':
+            if set(arguments) != {'from_at', 'through_at'}:
+                raise ValueError('計画期間を指定してください。')
+            plan = plan_week_allocations(
+                datetime.fromisoformat(arguments['from_at']),
+                datetime.fromisoformat(arguments['through_at']),
             )
             plan['ok'] = True
             return plan
