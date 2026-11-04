@@ -22,6 +22,7 @@ import settings
 from tts import SpeechService, router as tts_router
 import tts
 from voice import is_model_loaded, router as voice_router
+from voice_metrics import router as voice_metrics_router
 from wake import router as wake_router
 from work_calendar import router as work_calendar_router
 
@@ -63,6 +64,7 @@ app.include_router(work_sessions_router)
 app.include_router(work_calendar_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
+app.include_router(voice_metrics_router)
 app.include_router(tts_router)
 app.include_router(wake_router)
 

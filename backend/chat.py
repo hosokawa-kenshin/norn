@@ -1,7 +1,9 @@
 import asyncio
+from contextvars import ContextVar
 import json
 import re
 import sqlite3
+from time import perf_counter
 import uuid
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
@@ -33,6 +35,19 @@ from settings import CHARACTER_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MAX_M
 
 router = APIRouter()
 LOCAL_TIMEZONE = ZoneInfo('Asia/Tokyo')
+active_chat_timings: ContextVar[dict[str, float] | None] = ContextVar('active_chat_timings', default=None)
+
+
+async def post_llm_request(client: httpx.AsyncClient, *args: Any, **kwargs: Any) -> httpx.Response:
+    started_at = perf_counter()
+    try:
+        return await client.post(*args, **kwargs)
+    finally:
+        timings = active_chat_timings.get()
+        if timings is not None:
+            timings['llm_ms'] += (perf_counter() - started_at) * 1000
+
+
 DEFAULT_PERSONA = (
     'あなたはNORNという日本語のパーソナルアシスタントです。'
     '親しみがあり自然な友人のような話し方をしてください。ただし人間だと偽ったり、根拠のない親密さを演じたりしないでください。'
@@ -398,7 +413,8 @@ async def prepare_automatic_tasks(messages: list[dict[str, str]]) -> list[dict[s
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10)) as client:
                 check_llm_available()
-                response = await client.post(
+                response = await post_llm_request(
+                    client,
                     f'{LLM_BASE_URL}/chat/completions',
                     headers={'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {},
                     json={
@@ -516,7 +532,8 @@ async def generate_action_reply(
     }
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10)) as client:
-            response = await client.post(
+            response = await post_llm_request(
+                client,
                 f'{LLM_BASE_URL}/chat/completions', json=payload,
                 headers={'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {},
             )
@@ -597,7 +614,8 @@ async def generate_llm_reply(
         }
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10)) as client:
-                response = await client.post(
+                response = await post_llm_request(
+                    client,
                     f'{LLM_BASE_URL}/chat/completions',
                     json=payload,
                     headers=headers,
@@ -852,7 +870,8 @@ async def extract_due_memories() -> None:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=5)) as client:
             check_llm_available()
-            response = await client.post(
+            response = await post_llm_request(
+                client,
                 f'{LLM_BASE_URL}/chat/completions', json=payload, headers=headers,
             )
         check_llm_response(response)
@@ -916,6 +935,24 @@ def list_messages(conversation_id: str) -> list[dict[str, str]]:
 
 @router.post('/api/chat')
 async def chat(request: ChatRequest) -> dict[str, Any]:
+    timings = {'llm_ms': 0.0}
+    token = active_chat_timings.set(timings)
+    started_at = perf_counter()
+    try:
+        result = await _handle_chat(request)
+        server_ms = (perf_counter() - started_at) * 1000
+        llm_ms = timings['llm_ms']
+        result['timings_ms'] = {
+            'server_ms': round(server_ms, 2),
+            'llm_ms': round(llm_ms, 2),
+            'processing_ms': round(max(0.0, server_ms - llm_ms), 2),
+        }
+        return result
+    finally:
+        active_chat_timings.reset(token)
+
+
+async def _handle_chat(request: ChatRequest) -> dict[str, Any]:
     if not LLM_MODEL:
         raise HTTPException(
             status_code=503,

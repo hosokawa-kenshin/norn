@@ -1,6 +1,28 @@
 import { useEffect, useRef, useState } from 'react'
 
 type SpeechState = 'idle' | 'loading' | 'generating' | 'playing' | 'blocked' | 'failed'
+export type SpeechTiming = { ttsMs: number; playbackMs: number }
+
+function waitForPlaybackEnd(player: HTMLAudioElement, signal: AbortSignal) {
+  let finish = (_completed: boolean) => {}
+  const promise = new Promise<boolean>((resolve) => {
+    const cleanup = () => {
+      player.removeEventListener('ended', onEnded)
+      player.removeEventListener('error', onError)
+      signal.removeEventListener('abort', onAbort)
+    }
+    finish = (completed) => { cleanup(); resolve(completed) }
+    const onEnded = () => finish(true)
+    const onError = () => finish(false)
+    const onAbort = () => finish(false)
+    player.addEventListener('ended', onEnded, { once: true })
+    player.addEventListener('error', onError, { once: true })
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+    else if (player.ended) onEnded()
+  })
+  return { promise, cancel: () => finish(false) }
+}
 
 export default function useSpeech() {
   const [enabled, setEnabled] = useState(() => localStorage.getItem('norn.speechEnabled') !== '0')
@@ -42,28 +64,31 @@ export default function useSpeech() {
   }
 
   async function play() {
-    if (!audio.current?.src) return
+    if (!audio.current?.src) return false
     try {
       await audio.current.play()
       setState('playing')
       setError('')
+      return true
     } catch (reason) {
       setState(reason instanceof DOMException && reason.name === 'NotAllowedError' ? 'blocked' : 'failed')
       setError('再生ボタンを押して音声を再生してください。')
+      return false
     }
   }
 
-  async function speak(text: string) {
+  async function speak(text: string): Promise<SpeechTiming | null> {
     stop()
     setError('')
     if (audio.current) audio.current.removeAttribute('src')
     if (url.current) URL.revokeObjectURL(url.current)
     url.current = null
     setHasAudio(false)
-    if (!enabledRef.current) return
+    if (!enabledRef.current) return null
     const controller = new AbortController()
     request.current = controller
     setState('loading')
+    const ttsStartedAt = performance.now()
     try {
       const deadline = Date.now() + 15 * 60 * 1000
       while (true) {
@@ -94,15 +119,27 @@ export default function useSpeech() {
         throw new Error(result?.detail ?? '音声生成に失敗しました。')
       }
       const blob = await response.blob()
-      if (controller.signal.aborted || !audio.current) return
+      if (controller.signal.aborted || !audio.current) return null
       url.current = URL.createObjectURL(blob)
       audio.current.src = url.current
       setHasAudio(true)
-      await play()
+      const player = audio.current
+      const playbackEnd = waitForPlaybackEnd(player, controller.signal)
+      const playbackStartedAt = performance.now()
+      if (!await play()) {
+        playbackEnd.cancel()
+        return null
+      }
+      if (!await playbackEnd.promise) return null
+      return {
+        ttsMs: playbackStartedAt - ttsStartedAt,
+        playbackMs: performance.now() - playbackStartedAt,
+      }
     } catch (reason) {
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted) return null
       setState('failed')
       setError(reason instanceof Error ? reason.message : '音声生成に失敗しました。')
+      return null
     }
   }
 

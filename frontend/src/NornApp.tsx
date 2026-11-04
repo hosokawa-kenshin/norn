@@ -29,7 +29,7 @@ import ActualsView from './ActualsView'
 import TasksView from './TasksView'
 import WorkCalendarSettings from './WorkCalendarSettings'
 import useSpeech from './useSpeech'
-import useHandsFree from './useHandsFree'
+import useHandsFree, { type VoiceReplyTiming } from './useHandsFree'
 import WakeCalibrationDialog from './WakeCalibrationDialog'
 
 type Message = { role: 'user' | 'assistant'; content: string; created_at?: string }
@@ -498,11 +498,12 @@ export default function NornApp() {
     await sendChatContent(content)
   }
 
-  async function sendChatContent(content: string, signal?: AbortSignal) {
-    if (!content.trim() || isSending || signal?.aborted) return
+  async function sendChatContent(content: string, signal?: AbortSignal): Promise<VoiceReplyTiming | null> {
+    if (!content.trim() || isSending || signal?.aborted) return null
     speech.stop()
     setError('')
     setIsSending(true)
+    const chatStartedAt = performance.now()
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -514,24 +515,33 @@ export default function NornApp() {
         setError(await responseError(response))
         setDraft(content)
         handsFree.endSession()
-        return
+        return null
       }
       if (!response.ok) throw new Error(await responseError(response))
       const result = (await response.json()) as {
         conversation_id: string
         user_message: Message
         assistant_message: Message
+        timings_ms: { server_ms: number; llm_ms: number; processing_ms: number }
       }
       localStorage.setItem('norn.activeConversation', result.conversation_id)
       setActiveId(result.conversation_id)
       setMessages((current) => [...current, result.user_message, result.assistant_message])
       setDraft('')
       setCalendarRefresh((current) => current + 1)
-      void speech.speak(result.assistant_message.content)
+      const playback = speech.speak(result.assistant_message.content)
       await refreshConversations()
+      return {
+        chatMs: performance.now() - chatStartedAt,
+        serverMs: result.timings_ms.server_ms,
+        llmMs: result.timings_ms.llm_ms,
+        processingMs: result.timings_ms.processing_ms,
+        playback,
+      }
     } catch (reason) {
-      if (signal?.aborted) return
+      if (signal?.aborted) return null
       setError(reason instanceof Error ? reason.message : '応答を取得できませんでした。')
+      return null
     } finally {
       setIsSending(false)
     }

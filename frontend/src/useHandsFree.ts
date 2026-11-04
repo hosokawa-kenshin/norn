@@ -2,10 +2,18 @@ import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import { UtteranceBuffer, VoiceSession, isConversationEnd, stripWakePhrase, type SessionPhase } from './voiceSession'
 import type { MicVAD } from '@ricky0123/vad-web'
 
+export type VoiceReplyTiming = {
+	chatMs: number
+	serverMs: number
+	llmMs: number
+	processingMs: number
+	playback: Promise<{ ttsMs: number; playbackMs: number } | null>
+}
+
 type Options = {
 	processing: boolean
 	playing: boolean
-	onText: (text: string, signal: AbortSignal) => Promise<void>
+	onText: (text: string, signal: AbortSignal) => Promise<VoiceReplyTiming | null>
 	onInterrupt: () => void
 }
 
@@ -26,6 +34,8 @@ export default function useHandsFree(options: Options) {
 	const epoch = useRef(0)
 	const inSpeech = useRef(false)
 	const capture = useRef(false)
+	const speechStartedAt = useRef<number | null>(null)
+	const turnStartedAt = useRef<number | null>(null)
 	const firstUtterance = useRef(false)
 	const requestBusy = useRef(false)
 
@@ -36,6 +46,8 @@ export default function useHandsFree(options: Options) {
 		if (!session.current.wake(Date.now())) return
 		utterance.current.reset()
 		capture.current = false
+		speechStartedAt.current = null
+		turnStartedAt.current = null
 		firstUtterance.current = false
 		publish()
 	}
@@ -68,6 +80,8 @@ export default function useHandsFree(options: Options) {
 		stream.current = null
 		session.current.phase = 'off'
 		capture.current = false
+		speechStartedAt.current = null
+		turnStartedAt.current = null
 		utterance.current.reset()
 		inSpeech.current = false
 		requestBusy.current = false
@@ -108,7 +122,10 @@ export default function useHandsFree(options: Options) {
 					if (message.wake && session.current.wake(Date.now())) {
 						utterance.current.reset()
 						capture.current = inSpeech.current
-						if (capture.current) utterance.current.begin()
+						if (capture.current) {
+							utterance.current.begin()
+							turnStartedAt.current = speechStartedAt.current ?? performance.now()
+						}
 						firstUtterance.current = true
 						const oscillator = audioContext.createOscillator()
 						const gain = audioContext.createGain()
@@ -154,37 +171,82 @@ export default function useHandsFree(options: Options) {
 				onSpeechRealStart: () => {
 					if (epoch.current !== ticket) return
 					inSpeech.current = true
+					speechStartedAt.current = performance.now()
 					if (!session.current.active || requestBusy.current || latest.current.processing) return
 					capture.current = true
+					turnStartedAt.current = speechStartedAt.current
 					utterance.current.begin()
 					session.current.activity(Date.now())
 					if (latest.current.playing) latest.current.onInterrupt()
 				},
-				onVADMisfire: () => { if (epoch.current === ticket) { inSpeech.current = false; capture.current = false } },
+				onVADMisfire: () => {
+					if (epoch.current === ticket) {
+						inSpeech.current = false
+						capture.current = false
+						speechStartedAt.current = null
+						turnStartedAt.current = null
+					}
+				},
 				onSpeechEnd: async () => {
 					if (epoch.current !== ticket) return
 					inSpeech.current = false
 					const accepted = capture.current
 					capture.current = false
+					const speechEndedAt = performance.now()
+					const startedAt = turnStartedAt.current ?? speechStartedAt.current ?? speechEndedAt
+					speechStartedAt.current = null
+					turnStartedAt.current = null
 					const samples = utterance.current.take()
 					if (!session.current.active || !accepted || !samples.length || requestBusy.current || latest.current.processing) return
+					const listeningMs = speechEndedAt - startedAt
 					requestBusy.current = true
 					session.current.phase = 'processing'
 					publish()
 					const controller = new AbortController()
 					request.current = controller
 					try {
+						const sttStartedAt = performance.now()
 						const form = new FormData()
 						form.append('audio', new Blob([utils.encodeWAV(samples)], { type: 'audio/wav' }), 'utterance.wav')
 						const response = await fetch('/api/transcribe', { method: 'POST', body: form, signal: controller.signal })
 						if (!response.ok) throw new Error('音声を文字起こしできませんでした。')
 						const result = await response.json() as { text: string }
+						const sttMs = performance.now() - sttStartedAt
 						let text = result.text.trim()
 						if (firstUtterance.current) text = stripWakePhrase(text)
 						firstUtterance.current = false
 						if (controller.signal.aborted || epoch.current !== ticket) return
 						if (isConversationEnd(text)) { endSession(); return }
-						if (text) await latest.current.onText(text, controller.signal)
+						if (text) {
+							const reply = await latest.current.onText(text, controller.signal)
+							if (reply) {
+								void reply.playback.then(async (playback) => {
+									if (!playback) return
+									const saveResponse = await fetch('/api/voice-metrics', {
+										method: 'POST',
+										headers: { 'Content-Type': 'application/json' },
+										body: JSON.stringify({
+											listening_ms: listeningMs,
+											stt_ms: sttMs,
+											chat_ms: reply.chatMs,
+											server_ms: reply.serverMs,
+											llm_ms: reply.llmMs,
+											processing_ms: reply.processingMs,
+											tts_ms: playback.ttsMs,
+											playback_ms: playback.playbackMs,
+											total_ms: performance.now() - startedAt,
+										}),
+									})
+									if (!saveResponse.ok && epoch.current === ticket) {
+										setError('音声の計測データをCSVへ保存できませんでした。')
+									}
+								}).catch((reason: unknown) => {
+									if (epoch.current === ticket) {
+										setError(reason instanceof Error ? reason.message : '音声の計測データを保存できませんでした。')
+									}
+								})
+							}
+						}
 					} catch (reason) {
 						if (!controller.signal.aborted && epoch.current === ticket) setError(reason instanceof Error ? reason.message : '音声処理に失敗しました。')
 					} finally {

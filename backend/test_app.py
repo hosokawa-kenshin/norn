@@ -535,6 +535,10 @@ def test_automatic_task_saves_intent_without_scheduling(monkeypatch, tmp_path, d
     assert len(payloads) == 1
     assert '追加しました' in response.json()['assistant_message']['content']
     assert '何分くらい' in response.json()['assistant_message']['content']
+    timings = response.json()['timings_ms']
+    assert {'server_ms', 'llm_ms', 'processing_ms'} == set(timings)
+    assert timings['server_ms'] >= timings['llm_ms'] >= 0
+    assert timings['processing_ms'] >= 0
 
 
 @pytest.fixture
