@@ -4474,6 +4474,44 @@ def test_create_routine_chat_tool_registers_routine_and_plans_week(monkeypatch, 
     assert tasks == []
 
 
+def test_chat_new_routine_request_does_not_create_tasks_with_schedule_routine(monkeypatch, tmp_path):
+    routine_planning_setup(monkeypatch, tmp_path, 'routine-no-task')
+    monkeypatch.setattr(chat_module, 'LLM_MODEL', 'test-model')
+    monkeypatch.setattr(chat_module, 'extract_due_memories', no_op_memory_extraction)
+    calls = []
+    encode_json = json.dumps
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json, headers):
+            calls.append(json)
+            if len(calls) == 1:
+                tool_calls = [
+                    {'id': 'c1', 'type': 'function', 'function': {'name': 'create_routine', 'arguments': encode_json({
+                        'title': 'DTM', 'duration_minutes': 60, 'target_count': 7, 'week_start': ROUTINE_WEEK})}},
+                    {'id': 'c2', 'type': 'function', 'function': {'name': 'schedule_routine', 'arguments': encode_json({
+                        'items': [{'title': 'DTM', 'estimated_minutes': 60}]})}},
+                ]
+                message = {'content': None, 'tool_calls': tool_calls}
+            else:
+                message = {'content': 'DTMのルーティンを登録したよ。'}
+            return SimpleNamespace(is_error=False, json=lambda: {'choices': [{'message': message}]})
+
+    monkeypatch.setattr(chat_module.httpx, 'AsyncClient', FakeAsyncClient)
+    with TestClient(norn_app.app) as client:
+        client.post('/api/chat', json={'content': 'DTMのルーティンを毎日1時間で作って'})
+        assert client.get('/api/tasks').json() == []
+        assert len(client.get('/api/routines').json()) == 1
+
+
 def test_execution_log_updates_occurrence_status(monkeypatch, tmp_path):
     routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-log')
     with TestClient(norn_app.app) as client:

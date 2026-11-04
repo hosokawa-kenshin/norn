@@ -54,7 +54,7 @@ DEFAULT_PERSONA = (
 )
 SYSTEM_PROMPT = (
     '予定やタスクを整理し、根拠と不確実性を明確にして簡潔に回答してください。'
-    '既存タスクを毎日・期間の最終日まで組む依頼はschedule_routineを使い、最終日も含めて承認なしで保存してください。'
+    '既存タスクを毎日・期間の最終日まで組む依頼はschedule_routineを使い、最終日も含めて承認なしで保存してください。ただし「〜のルーティンを作って」で、既存タスクの指定がなく新しい習慣を作る依頼は「毎日」でもcreate_routine（毎日ならtarget_count=7）を使い、schedule_routineやタスク作成は併用しないでください。'
     '既存ルーティンの所要時間は引き継ぎ、不明な項目だけ尋ねてください。続く短い返答でも会話に出ている期間・項目を引き継いでschedule_routineを実行してください。'
     'ただし「全部1時間」等の明示的な時間変更は、その指定を各項目のestimated_minutesとestimate_evidenceへ反映して保存してください。以前の見積時間を理由に拒否しません。期間が既に会話に出ていれば聞き直さないでください。'
     'ユーザーが日程を任せた場合は空き時間に配置し、根拠なくハードすぎる・倒れる等と反対したり、同じ意思確認を繰り返したりしないでください。具体的な競合・空き不足・時間外だけを相談してください。'
@@ -669,6 +669,7 @@ async def generate_llm_reply(
             'content': assistant_message.get('content'),
             'tool_calls': tool_calls,
         })
+        batch_tool_names = {(call.get('function') or {}).get('name', '') for call in tool_calls}
         for tool_call in tool_calls:
             function = tool_call.get('function') or {}
             name = function.get('name', '')
@@ -677,6 +678,9 @@ async def generate_llm_reply(
             call_key = (name, raw_arguments)
             arguments: dict[str, Any] = {}
             try:
+                routine_created = 'create_routine' in batch_tool_names or any(
+                    entry.get('tool') == 'create_routine' and entry.get('ok') for entry in tool_results
+                )
                 arguments = json.loads(raw_arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError('ツール引数はオブジェクトである必要があります。')
@@ -691,7 +695,9 @@ async def generate_llm_reply(
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
                 }
-                if name in mutating_tools and call_key in seen_tool_calls:
+                if name in {'schedule_routine', 'create_task'} and routine_created:
+                    result = {'ok': False, 'error': 'ルーティンを新規登録する依頼では、タスクを作らずschedule_routineも使いません。create_routineの結果だけで案内してください。'}
+                elif name in mutating_tools and call_key in seen_tool_calls:
                     result = {'ok': False, 'error': '同じツール呼び出しを重複実行しませんでした。'}
                 else:
                     if name in mutating_tools:
