@@ -10,5 +10,6 @@ fastembed>=0.9,<1
 google-api-python-client>=2.150,<3
 google-auth-oauthlib>=1.2,<2
 python-dateutil>=2.9,<4
+jpholiday>=1.0.3,<2
 python-dotenv>=1.0,<2
 pytest>=8,<9

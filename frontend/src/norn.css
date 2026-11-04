@@ -359,6 +359,14 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #668953; outli
 .setting-row strong { color: #365b42; font: 600 10px var(--mono); }
 .settings-help { margin: 14px 0 20px; color: #667064; font-size: 11px; line-height: 1.7; }
 .settings-help code { padding: 1px 4px; color: #4b5e48; background: #e9eee2; border-radius: 3px; font-family: var(--mono); }
+.work-calendar-settings { margin: 18px 0; padding: 14px; border: 1px solid #dfe5d8; border-radius: 9px; background: #f7f8f3; }
+.work-calendar-settings .settings-help { margin: 8px 0 12px; }
+.work-calendar-settings .routine-form { border: 0; padding: 4px 0 12px; }
+.work-calendar-exceptions { margin-top: 12px; }
+.work-calendar-exceptions > strong { display: block; margin-bottom: 8px; color: #365b42; font-size: 11px; }
+.work-calendar-exceptions .setting-row { align-items: center; padding: 7px 0; }
+.work-calendar-exceptions .setting-row > span { min-width: 0; overflow-wrap: anywhere; }
+.work-calendar-exceptions .settings-help { margin-bottom: 0; }
 .dialog-close { width: 100%; min-height: 38px; color: white; background: var(--moss); border: 0; border-radius: 5px; cursor: pointer; font-size: 11px; }
 
 @keyframes enter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }

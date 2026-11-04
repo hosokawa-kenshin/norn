@@ -242,6 +242,19 @@ def initialize_database() -> None:
                 ON task_allocations(start_at, end_at);
             CREATE INDEX IF NOT EXISTS ix_task_allocations_task_start
                 ON task_allocations(task_id, start_at);
+            CREATE TABLE IF NOT EXISTS work_calendar_exceptions (
+                day TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('paid_leave', 'compensatory_leave', 'other_day_off', 'workday')),
+                label TEXT NOT NULL,
+                start_time TEXT,
+                end_time TEXT,
+                created_at TEXT NOT NULL,
+                CHECK((start_time IS NULL AND end_time IS NULL) OR
+                      (start_time IS NOT NULL AND end_time IS NOT NULL AND end_time > start_time))
+            );
+            CREATE INDEX IF NOT EXISTS ix_work_calendar_exceptions_group
+                ON work_calendar_exceptions(group_id);
             CREATE TABLE IF NOT EXISTS task_occurrence_links (
                 source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                 occurrence_date TEXT NOT NULL,

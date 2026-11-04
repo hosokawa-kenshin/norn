@@ -13,6 +13,7 @@ from events import execute_schedule_tool
 from tasks import LOCAL_TIMEZONE, PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS, execute_task_tool, plan_week_allocations
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, logger
 from llm_limits import check_llm_available, check_llm_response
+from work_calendar import exception_rows
 
 MAX_APPLY_SCHEDULE_ACTIONS = 8
 MAX_WEEK_PLAN_ACTIONS = 40
@@ -120,7 +121,7 @@ async def verify_schedule_reply(text: str, results: list[dict[str, Any]], comple
     check_llm_available()
     snapshot = schedule_snapshot(include_inactive=True, event_window_days=60)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=5)) as client:
             response = await client.post(
                 f'{LLM_BASE_URL}/chat/completions',
                 headers={'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {},
@@ -321,8 +322,13 @@ def schedule_week_plan(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def schedule_context() -> str:
     snapshot = schedule_snapshot(event_window_days=35)
+    today = datetime.now(LOCAL_TIMEZONE).date()
+    calendar_exceptions = exception_rows(today, today + timedelta(days=35))
     return '\nDBに保存されている現在の予定・タスク・作業枠（会話中の古い説明より優先）:\n' + json.dumps(
         {'current': snapshot,
          'planning_rules': {'start': PLANNING_DAY_START, 'end': PLANNING_DAY_END,
-                            'workdays': sorted(PLANNING_WORKDAYS), 'start_interval_minutes': 5}}, ensure_ascii=False,
+                            'workdays': sorted(PLANNING_WORKDAYS), 'start_interval_minutes': 5,
+                            'weekends_and_japanese_holidays_are_non_workdays': True,
+                            'ordinary_events_can_be_outside_work_time': True,
+                            'date_exceptions': calendar_exceptions}}, ensure_ascii=False,
     )

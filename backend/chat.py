@@ -39,7 +39,7 @@ DEFAULT_PERSONA = (
 )
 SYSTEM_PROMPT = (
     '予定やタスクを整理し、根拠と不確実性を明確にして簡潔に回答してください。'
-    '毎日・ルーティンを期間の最終日まで組む依頼はschedule_routineを使い、最終日も含めて承認なしで保存してください。'
+    '既存タスクを毎日・期間の最終日まで組む依頼はschedule_routineを使い、最終日も含めて承認なしで保存してください。'
     '既存ルーティンの所要時間は引き継ぎ、不明な項目だけ尋ねてください。続く短い返答でも会話に出ている期間・項目を引き継いでschedule_routineを実行してください。'
     'ただし「全部1時間」等の明示的な時間変更は、その指定を各項目のestimated_minutesとestimate_evidenceへ反映して保存してください。以前の見積時間を理由に拒否しません。期間が既に会話に出ていれば聞き直さないでください。'
     'ユーザーが日程を任せた場合は空き時間に配置し、根拠なくハードすぎる・倒れる等と反対したり、同じ意思確認を繰り返したりしないでください。具体的な競合・空き不足・時間外だけを相談してください。'
@@ -49,6 +49,7 @@ SYSTEM_PROMPT = (
     '日程の配置・再調整は承認を求めず、apply_scheduleに具体的な操作を渡して一括で保存してください。成功した内容だけを保存済みとして説明してください。'
     '複数の予定や作業枠の再調整は、食事等の固定予定とタスク枠の移動を同じapply_scheduleにまとめてください。単独の明確な操作依頼は既存ツールで直接実行できます。'
     'タスクを複数日・複数枠へ「分けて」「振り分けて」と頼まれたら、schedule_taskで1枠だけ置かず、plan_task_allocations（日数はdistinct_days）で枠を計算してapply_scheduleで保存してください。'
+    '「〜の練習のルーティンを今週分組んで」のように、既存タスクではなく回数で決まる習慣を新しく組む依頼は、まずlist_routine_plansで同名ルーティンを確認し、なければ所要時間を確認してcreate_routine（登録と今週の配置を一度に行う）を使い、タスクは作らないでください。schedule_routineは既存タスクを毎日配置する場合だけ使います。'
     'ルーティン（週N回など回数で決まる習慣）の週ごとの計画・配置はlist_routine_plansでIDを確認してplan_routine_weekを使い、未実施の見直しはreevaluate_routine_planを使ってください。'
     '「終わった」「できなかった」等の実施報告は、日付が示されていればdateを付け、なければlist_unrecorded_executionsで候補を確認してrecord_executionで実績に記録してください。候補が複数で日付が決められないときは推測で記録せず、日付と時刻を挙げて聞き返し、記録後はどの日のどの予定かを必ず伝えてください。実績の記録はタスクや予定を完了扱いにしません。'
     '誤認識された名前の訂正は同じIDのタイトル変更です。日時・所要時間・割当はそのまま維持し、古い会話の時刻へ戻さないでください。'
@@ -514,7 +515,7 @@ async def generate_action_reply(
         ],
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10)) as client:
             response = await client.post(
                 f'{LLM_BASE_URL}/chat/completions', json=payload,
                 headers={'Authorization': f'Bearer {LLM_API_KEY}'} if LLM_API_KEY else {},
@@ -554,9 +555,10 @@ async def generate_llm_reply(
     system_prompt += schedule_context()
     notice_context = reminder_context(conversation_id)
     latest = next((message['content'] for message in reversed(messages) if message['role'] == 'user'), '')
-    routine_turn = bool(re.search(r'ルーティン|毎日|日課', latest))
+    routine_pattern = r'ルーティー?ン|ルーチン|routine|毎日|日課'
+    routine_turn = bool(re.search(routine_pattern, latest, re.IGNORECASE))
     previous_assistant = next((message['content'] for message in reversed(messages[:-1]) if message['role'] == 'assistant'), '')
-    if re.search(r'ルーティン|毎日|日課', previous_assistant) and re.search(r'期間|何日|いつまで', previous_assistant):
+    if re.search(routine_pattern, previous_assistant, re.IGNORECASE) and re.search(r'期間|何日|いつまで', previous_assistant):
         routine_turn = routine_turn or bool(re.search(r'週間|週ぐらい|日間|まで|月末|今日から|ここから', latest))
     answering_extension = is_notice_reply(conversation_id)
     automatic_results = [] if answering_extension or routine_turn else await prepare_automatic_tasks(messages)
@@ -585,7 +587,7 @@ async def generate_llm_reply(
         check_llm_available()
         available_tools = [*SCHEDULE_TOOLS, *TASK_TOOLS, *MEMORY_TOOLS, *GOAL_PROJECT_TOOLS, *REMINDER_TOOLS, *BATCH_TOOLS, *ROUTINE_TOOLS, *ROUTINE_PLAN_TOOLS, *EXECUTION_TOOLS]
         if routine_turn:
-            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'apply_schedule', 'schedule_week_plan', 'schedule_routine'}]
+            available_tools = [tool for tool in available_tools if tool['function']['name'] in {'list_events', 'list_tasks', 'find_task_slots', 'plan_task_allocations', 'plan_week_allocations',             'apply_schedule', 'schedule_week_plan', 'schedule_routine', 'list_routine_plans', 'create_routine', 'plan_routine_week', 'reevaluate_routine_plan'}]
         payload = {
             'model': LLM_MODEL,
             'messages': llm_messages,
@@ -666,7 +668,7 @@ async def generate_llm_reply(
                     'schedule_task', 'unschedule_task',
                     'extend_schedule',
                     'apply_schedule', 'schedule_week_plan',
-                    'schedule_routine', 'plan_routine_week', 'reevaluate_routine_plan', 'record_execution',
+                    'schedule_routine', 'create_routine', 'plan_routine_week', 'reevaluate_routine_plan', 'record_execution',
                     'save_memory', 'update_memory', 'forget_memory',
                     'create_goal', 'update_goal', 'delete_goal',
                     'create_project', 'update_project', 'delete_project',
@@ -848,7 +850,7 @@ async def extract_due_memories() -> None:
         'temperature': 0,
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=5)) as client:
             check_llm_available()
             response = await client.post(
                 f'{LLM_BASE_URL}/chat/completions', json=payload, headers=headers,

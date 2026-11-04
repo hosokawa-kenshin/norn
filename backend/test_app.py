@@ -32,6 +32,7 @@ import llm_limits as llm_limits_module
 import voice as voice_module
 import tts as tts_module
 import wake as wake_module
+import work_calendar as work_calendar_module
 from starlette.websockets import WebSocketDisconnect
 
 
@@ -42,7 +43,7 @@ def isolated_llm_limits(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolated_planning_hours(monkeypatch):
-    for module in (tasks_module, reminders_module, actions_module):
+    for module in (tasks_module, actions_module):
         monkeypatch.setattr(module, 'PLANNING_DAY_START', '09:00')
         monkeypatch.setattr(module, 'PLANNING_DAY_END', '18:00')
         monkeypatch.setattr(module, 'PLANNING_WORKDAYS', frozenset(range(5)))
@@ -282,6 +283,42 @@ def test_extend_schedule_preserves_normal_event(monkeypatch, tmp_path, future_ta
         result = reminders_module.execute_reminder_tool({'kind': 'event', 'item_id': event['id'], 'expected_end': end.isoformat(), 'minutes': 30})
         assert not result['ok'] and '面談' in result['error'] and '確認' in result['error']
         assert client.get('/api/events').json()[0]['end_at'] == end.isoformat()
+
+
+def test_extending_routine_event_respects_worktime_and_updates_occurrence(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-extension')
+    with TestClient(norn_app.app) as client:
+        client.post('/api/work-calendar/exceptions', json={
+            'start_date': ROUTINE_WEEK, 'end_date': ROUTINE_WEEK,
+            'kind': 'workday', 'label': '短縮勤務', 'start_time': '09:00', 'end_time': '10:00',
+        })
+        routine = client.post('/api/routines', json=routine_payload).json()
+        client.post(f"/api/routines/{routine['id']}/weekly-plan", json={
+            'week_start': ROUTINE_WEEK, 'target_count': 1,
+        })
+        occurrence = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()[0]
+        event = next(item for item in client.get('/api/events').json() if item['id'] == occurrence['schedule_id'])
+        result = reminders_module.execute_reminder_tool({
+            'kind': 'event', 'item_id': event['id'], 'expected_end': event['end_at'], 'minutes': 15,
+        })
+        rejected = reminders_module.execute_reminder_tool({
+            'kind': 'event', 'item_id': event['id'],
+            'expected_end': (datetime.fromisoformat(event['end_at']) + timedelta(minutes=15)).isoformat(),
+            'minutes': 15,
+        })
+        updated = next(
+            item for item in client.get(
+                '/api/routine-occurrences', params={'routine_id': routine['id']},
+            ).json() if item['id'] == occurrence['id']
+        )
+
+    assert result['ok']
+    assert not rejected['ok']
+    assert updated['scheduled_end'] == (
+        datetime.fromisoformat(occurrence['scheduled_end']) + timedelta(minutes=15)
+    ).isoformat()
 
 
 def test_extend_schedule_recurring_only_changes_one_occurrence(monkeypatch, tmp_path, future_task_start):
@@ -2061,7 +2098,7 @@ def test_chat_executes_gemini_schedule_tool_without_approval(monkeypatch, tmp_pa
         'extend_schedule',
         'apply_schedule',
         'schedule_week_plan',
-        'schedule_routine', 'list_routine_plans', 'plan_routine_week', 'reevaluate_routine_plan',
+        'schedule_routine', 'list_routine_plans', 'create_routine', 'plan_routine_week', 'reevaluate_routine_plan',
         'list_unrecorded_executions', 'record_execution',
         'list_tasks', 'create_task', 'update_task', 'complete_task', 'delete_task',
         'find_task_slots', 'plan_task_allocations', 'plan_week_allocations', 'schedule_task', 'unschedule_task',
@@ -3732,7 +3769,7 @@ def test_every_chat_tool_has_an_executor_route():
     def names(tools):
         return {tool['function']['name'] for tool in tools}
 
-    special = {'extend_schedule', 'apply_schedule', 'schedule_week_plan', 'schedule_routine', 'list_routine_plans', 'plan_routine_week', 'reevaluate_routine_plan', 'list_unrecorded_executions', 'record_execution'}
+    special = {'extend_schedule', 'apply_schedule', 'schedule_week_plan', 'schedule_routine', 'list_routine_plans', 'create_routine', 'plan_routine_week', 'reevaluate_routine_plan', 'list_unrecorded_executions', 'record_execution'}
     routed_elsewhere = names(chat_module.TASK_TOOLS) | names(chat_module.MEMORY_TOOLS) | names(chat_module.GOAL_PROJECT_TOOLS) | special
     everything = names([*chat_module.SCHEDULE_TOOLS, *chat_module.TASK_TOOLS, *chat_module.MEMORY_TOOLS, *chat_module.GOAL_PROJECT_TOOLS, *chat_module.REMINDER_TOOLS, *chat_module.BATCH_TOOLS, *chat_module.ROUTINE_TOOLS, *chat_module.ROUTINE_PLAN_TOOLS, *chat_module.EXECUTION_TOOLS])
     fallback = everything - routed_elsewhere
@@ -4208,6 +4245,92 @@ def routine_planning_setup(monkeypatch, tmp_path, name, **overrides):
     }
 
 
+def test_work_calendar_holidays_and_date_exceptions_constrain_task_allocations(monkeypatch, tmp_path):
+    monkeypatch.setattr(database_module, 'DB_PATH', tmp_path / 'work-calendar.sqlite3')
+    monkeypatch.setattr(settings_module, 'PLANNING_DAY_START', '09:00')
+    monkeypatch.setattr(settings_module, 'PLANNING_DAY_END', '18:00')
+    monkeypatch.setattr(settings_module, 'PLANNING_WORKDAYS', frozenset(range(5)))
+    monkeypatch.setattr(work_calendar_module, 'PLANNING_DAY_START', '09:00')
+    monkeypatch.setattr(work_calendar_module, 'PLANNING_DAY_END', '18:00')
+    monkeypatch.setattr(work_calendar_module, 'PLANNING_WORKDAYS', frozenset(range(5)))
+    with TestClient(norn_app.app) as client:
+        calendar = client.get('/api/work-calendar').json()
+        task = client.post('/api/tasks', json={
+            'title': '祝日テスト', 'estimated_minutes': 90,
+        }).json()
+        holiday_rejected = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': '2027-01-11T09:00:00+09:00',
+            'end_at': '2027-01-11T09:30:00+09:00',
+        })
+        event_outside_work_time = client.post('/api/events', json={
+            'title': '休日の個人予定',
+            'start_at': '2027-01-11T22:00:00+09:00',
+            'end_at': '2027-01-11T22:30:00+09:00',
+        })
+        workday_override = client.post('/api/work-calendar/exceptions', json={
+            'start_date': '2027-01-11', 'end_date': '2027-01-11',
+            'kind': 'workday', 'label': '臨時勤務', 'start_time': '18:00', 'end_time': '21:00',
+        })
+        opened_holiday = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': '2027-01-11T19:00:00+09:00',
+            'end_at': '2027-01-11T19:30:00+09:00',
+        })
+        leave = client.post('/api/work-calendar/exceptions', json={
+            'start_date': '2027-01-12', 'end_date': '2027-01-12',
+            'kind': 'paid_leave', 'label': '有給休暇',
+        }).json()
+        leave_rejected = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': '2027-01-12T09:00:00+09:00',
+            'end_at': '2027-01-12T09:30:00+09:00',
+        })
+        duplicate_exception = client.post('/api/work-calendar/exceptions', json={
+            'start_date': '2027-01-12', 'end_date': '2027-01-12',
+            'kind': 'other_day_off', 'label': '重複',
+        })
+        leave_periods = tasks_module.available_work_periods(
+            datetime(2027, 1, 12, 0, tzinfo=TOKYO),
+            datetime(2027, 1, 12, 23, 59, tzinfo=TOKYO),
+            [],
+        )
+        removed = client.delete(f"/api/work-calendar/exceptions/{leave['group_id']}")
+        reopened_day = client.post(f"/api/tasks/{task['id']}/allocations", json={
+            'start_at': '2027-01-12T09:00:00+09:00',
+            'end_at': '2027-01-12T09:30:00+09:00',
+        })
+
+    assert calendar['work_start'] == '09:00' and calendar['work_end'] == '18:00'
+    assert holiday_rejected.status_code == 409
+    assert event_outside_work_time.status_code == 201
+    assert workday_override.status_code == 201 and opened_holiday.status_code == 201
+    assert leave_rejected.status_code == 409 and leave_periods == []
+    assert duplicate_exception.status_code == 409
+    assert removed.status_code == 204 and reopened_day.status_code == 201
+
+
+def test_routine_planning_uses_temporary_workday_override(monkeypatch, tmp_path):
+    routine_payload = routine_planning_setup(
+        monkeypatch, tmp_path, 'routine-workday-override',
+        target_count=5, max_count=5, min_count=5,
+    )
+    with TestClient(norn_app.app) as client:
+        client.post('/api/work-calendar/exceptions', json={
+            'start_date': '2027-01-11', 'end_date': '2027-01-11',
+            'kind': 'workday', 'label': '祝日の臨時勤務',
+            'start_time': '18:00', 'end_time': '21:00',
+        })
+        routine = client.post('/api/routines', json=routine_payload).json()
+        plan = client.post(f"/api/routines/{routine['id']}/weekly-plan", json={
+            'week_start': '2027-01-11',
+        })
+        occurrences = client.get(
+            '/api/routine-occurrences', params={'routine_id': routine['id']},
+        ).json()
+
+    assert plan.status_code == 201
+    assert len(occurrences) == 5
+    assert any(item['scheduled_start'].startswith('2027-01-11T') for item in occurrences)
+
+
 def test_weekly_plan_generates_spread_occurrences_idempotently(monkeypatch, tmp_path):
     routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-week')
     with TestClient(norn_app.app) as client:
@@ -4328,6 +4451,23 @@ def test_routine_plan_chat_tools_plan_and_reevaluate(monkeypatch, tmp_path):
     assert not duplicate['ok'] and not invalid['ok']
     assert reevaluated['ok'] and reevaluated['summary']
     assert after['routines'][0]['plans'][0]['target_count'] == 2
+
+
+def test_create_routine_chat_tool_registers_routine_and_plans_week(monkeypatch, tmp_path):
+    routine_planning_setup(monkeypatch, tmp_path, 'routine-create-tool')
+    with TestClient(norn_app.app) as client:
+        created = routine_planning_module.execute_routine_plan_tool('create_routine', {
+            'title': 'ティンホイッスルの練習', 'duration_minutes': 120, 'target_count': 3, 'week_start': ROUTINE_WEEK,
+        })
+        duplicate = routine_planning_module.execute_routine_plan_tool('create_routine', {
+            'title': 'ティンホイッスルの練習', 'duration_minutes': 120,
+        })
+        routines = client.get('/api/routines').json()
+        tasks = client.get('/api/tasks').json()
+
+    assert created['ok'] and len(created['generation']['created']) == 3
+    assert not duplicate['ok'] and len(routines) == 1 and routines[0]['duration_minutes'] == 120
+    assert tasks == []
 
 
 def test_execution_log_updates_occurrence_status(monkeypatch, tmp_path):

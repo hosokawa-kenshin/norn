@@ -27,6 +27,7 @@ import GoalsView from './GoalsView'
 import RoutinesView from './RoutinesView'
 import ActualsView from './ActualsView'
 import TasksView from './TasksView'
+import WorkCalendarSettings from './WorkCalendarSettings'
 import useSpeech from './useSpeech'
 import useHandsFree from './useHandsFree'
 import WakeCalibrationDialog from './WakeCalibrationDialog'
@@ -959,6 +960,7 @@ export default function NornApp() {
           <div className="setting-row"><span>音声認識</span><strong>ローカル / {status?.stt.model ?? '未接続'}</strong></div>
           <div className="setting-row"><span>LLM</span><strong>{status?.llm.configured ? status.llm.model : '未設定'}</strong></div>
           <p className="settings-help">LLMの接続先とAPIキーは、NORN直下の <code>.env</code> で設定します。キーはブラウザーへ送られません。</p>
+          <WorkCalendarSettings />
           <div className="calendar-settings-heading"><CalendarDays size={16} /><strong>Google Calendar</strong></div>
           <div className="setting-row"><span>接続状態</span><strong>{googleCalendar?.connected ? '接続済み' : googleCalendar?.configured ? '未接続' : '未設定'}</strong></div>
           <div className="setting-row"><span>自動同期</span><strong>{googleCalendar ? `${googleCalendar.sync_interval_seconds / 60}分ごと` : '確認中'}</strong></div>

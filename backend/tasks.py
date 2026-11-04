@@ -1,6 +1,6 @@
 import uuid
 from contextlib import closing
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from database import now_iso, open_database
 from events import find_event_conflicts, query_events
 from settings import PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS
+from work_calendar import load_day_overrides, working_hours_for_day
 
 LOCAL_TIMEZONE = ZoneInfo('Asia/Tokyo')
 TaskStatus = Literal['open', 'in_progress', 'done', 'cancelled']
@@ -368,11 +369,13 @@ def available_work_periods(
         raise HTTPException(status_code=500, detail='作業時間・曜日の設定が正しくありません。')
 
     periods: list[tuple[datetime, datetime]] = []
+    overrides = load_day_overrides(start.date(), end.date())
     current_day = start.date()
     while current_day <= end.date():
-        if current_day.weekday() in PLANNING_WORKDAYS:
-            day_start = datetime.combine(current_day, work_start, LOCAL_TIMEZONE)
-            day_end = datetime.combine(current_day, work_end, LOCAL_TIMEZONE)
+        hours = working_hours_for_day(current_day, work_start, work_end, PLANNING_WORKDAYS, overrides)
+        if hours is not None:
+            day_start = datetime.combine(current_day, hours[0], LOCAL_TIMEZONE)
+            day_end = datetime.combine(current_day, hours[1], LOCAL_TIMEZONE)
             cursor = max(day_start, start)
             day_limit = min(day_end, end)
             for busy_start, busy_end in busy_periods:
@@ -387,6 +390,17 @@ def available_work_periods(
                 periods.append((cursor, day_limit))
         current_day += timedelta(days=1)
     return periods
+
+
+def planning_hours_for_day(day: date) -> tuple[time, time] | None:
+    return working_hours_for_day(
+        day, configured_time(PLANNING_DAY_START), configured_time(PLANNING_DAY_END),
+        PLANNING_WORKDAYS,
+    )
+
+
+def is_planning_workday(day: date) -> bool:
+    return planning_hours_for_day(day) is not None
 
 
 def find_task_slots(
@@ -798,15 +812,14 @@ def schedule_task_record(task_id: str, start_at: datetime) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail='時間枠の割り当てには見積時間が必要です。')
 
         end = start + timedelta(minutes=task['estimated_minutes'])
-        work_start = configured_time(PLANNING_DAY_START)
-        work_end = configured_time(PLANNING_DAY_END)
         if start.minute % 5 != 0 or start.second or start.microsecond:
             raise HTTPException(status_code=409, detail='時間枠の開始時刻は5分刻みにしてください。')
         if start < datetime.now(LOCAL_TIMEZONE):
             raise HTTPException(status_code=409, detail='過去の時間にはタスクを割り当てられません。')
-        if start.weekday() not in PLANNING_WORKDAYS:
-            raise HTTPException(status_code=409, detail='設定された作業曜日以外には割り当てられません。')
-        if start.time() < work_start or end.date() != start.date() or end.time() > work_end:
+        work_hours = planning_hours_for_day(start.date())
+        if work_hours is None:
+            raise HTTPException(status_code=409, detail='設定された休日または作業曜日以外には割り当てられません。')
+        if start.time() < work_hours[0] or end.date() != start.date() or end.time() > work_hours[1]:
             raise HTTPException(status_code=409, detail='設定された作業時間内に収まりません。')
         if task['due_at'] and end > datetime.fromisoformat(task['due_at']):
             raise HTTPException(status_code=409, detail='タスクの期限を過ぎる時間枠です。')
@@ -870,9 +883,10 @@ def create_task_allocation_record(task_id: str, payload: TaskAllocationPayload) 
         raise HTTPException(status_code=409, detail='作業枠は同じ日の中に収めてください。')
     if start < datetime.now(LOCAL_TIMEZONE):
         raise HTTPException(status_code=409, detail='過去の時間にはタスクを割り当てられません。')
-    if start.weekday() not in PLANNING_WORKDAYS:
-        raise HTTPException(status_code=409, detail='設定された作業曜日以外には割り当てられません。')
-    if start.time() < configured_time(PLANNING_DAY_START) or end.time() > configured_time(PLANNING_DAY_END):
+    work_hours = planning_hours_for_day(start.date())
+    if work_hours is None:
+        raise HTTPException(status_code=409, detail='設定された休日または作業曜日以外には割り当てられません。')
+    if start.time() < work_hours[0] or end.time() > work_hours[1]:
         raise HTTPException(status_code=409, detail='設定された作業時間内に収まりません。')
 
     start_iso = task_datetime_iso(start)

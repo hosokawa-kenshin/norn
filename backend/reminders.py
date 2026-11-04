@@ -13,8 +13,7 @@ from events import LOCAL_TIMEZONE, event_datetime_iso, find_event_conflicts, que
 from settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, logger
 from llm_limits import check_llm_available, check_llm_response
 from tasks import (
-    PLANNING_DAY_END, PLANNING_DAY_START, PLANNING_WORKDAYS,
-    ceil_to_quarter_hour, configured_time, list_task_allocations,
+    ceil_to_quarter_hour, list_task_allocations, planning_hours_for_day,
 )
 
 router = APIRouter()
@@ -240,8 +239,16 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
             task = connection.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
             if task['status'] not in {'open', 'in_progress'} or (task['due_at'] and new_end > datetime.fromisoformat(task['due_at'])):
                 raise HTTPException(409, '完了・中止済み、または延長すると期限を過ぎるタスクです。')
-            if start.weekday() not in PLANNING_WORKDAYS or new_end.date() != start.date() or new_end.time() > configured_time(PLANNING_DAY_END):
+            hours = planning_hours_for_day(start.date())
+            if hours is None or new_end.date() != start.date() or new_end.time() > hours[1]:
                 raise HTTPException(409, '延長すると設定された作業時間を超えます。')
+        elif row.get('routine_occurrence_id'):
+            hours = planning_hours_for_day(start.date())
+            if (
+                hours is None or start.time() < hours[0] or new_end.date() != start.date()
+                or new_end.time() > hours[1]
+            ):
+                raise HTTPException(409, '延長するとルーティンの作業時間を超えます。')
         conflicts = find_event_conflicts(connection, event_datetime_iso(end), event_datetime_iso(new_end), item_id if payload.kind == 'event' else None)
         if series:
             conflicts += [item for item in query_events(end, new_end) if item['id'] == item_id and not item.get('is_cancelled')]
@@ -279,6 +286,11 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
             )
         if payload.kind == 'event':
             connection.execute("UPDATE events SET sync_status = CASE WHEN google_event_id IS NULL THEN 'local' ELSE 'dirty' END WHERE id = ?", (item_id,))
+            if row.get('routine_occurrence_id'):
+                connection.execute(
+                    'UPDATE routine_occurrences SET scheduled_end=?, updated_at=? WHERE id=?',
+                    (event_datetime_iso(new_end), now_iso(), row['routine_occurrence_id']),
+                )
         moved = []
         for allocation in overlaps:
             connection.execute('DELETE FROM task_allocations WHERE id = ?', (allocation['id'],))
@@ -290,8 +302,9 @@ def extend_schedule(payload: ExtensionRequest) -> dict[str, Any]:
                 limit = min(limit, datetime.fromisoformat(allocation['due_at']))
             while cursor + duration <= limit:
                 candidate_end = cursor + duration
-                in_hours = (cursor.weekday() in PLANNING_WORKDAYS and cursor.time() >= configured_time(PLANNING_DAY_START)
-                            and candidate_end.date() == cursor.date() and candidate_end.time() <= configured_time(PLANNING_DAY_END))
+                hours = planning_hours_for_day(cursor.date())
+                in_hours = (hours is not None and cursor.time() >= hours[0]
+                            and candidate_end.date() == cursor.date() and candidate_end.time() <= hours[1])
                 busy_task = connection.execute(
                     'SELECT 1 FROM task_allocations WHERE start_at < ? AND end_at > ?',
                     (event_datetime_iso(candidate_end), event_datetime_iso(cursor)),

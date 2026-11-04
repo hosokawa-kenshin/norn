@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 import tasks
 from database import database_transaction, now_iso, open_database
 from events import EventPayload, create_event_record, event_datetime_iso, query_events
-from routines import RoutinePlanPayload, create_routine_plan
+from routines import RoutineDefinitionPayload, RoutinePlanPayload, create_routine, create_routine_plan
 
 router = APIRouter()
 
@@ -117,7 +117,7 @@ def _place_occurrences(
     days = []
     cursor = first_day
     while cursor <= last_day:
-        if cursor.weekday() in tasks.PLANNING_WORKDAYS and cursor.isoformat() not in taken:
+        if tasks.is_planning_workday(cursor) and cursor.isoformat() not in taken:
             days.append(cursor)
         cursor += timedelta(days=1)
     if not days:
@@ -274,6 +274,18 @@ ROUTINE_PLAN_TOOLS = [
         'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False},
     }},
     {'type': 'function', 'function': {
+        'name': 'create_routine',
+        'description': '回数で決まる習慣（練習など。例: 週N回・1回X分）を新しいルーティンとして登録し、続けて今週（またはweek_start）の週間計画を作って空き時間へ承認なしで配置する。既存タスクを毎日配置するschedule_routineとは別物。同名の有効なルーティンがあればlist_routine_plansのIDでplan_routine_weekを使い、このツールで重複作成しない。所要時間が不明なら呼ぶ前に尋ねる。',
+        'parameters': {'type': 'object', 'properties': {
+            'title': {'type': 'string'},
+            'duration_minutes': {'type': 'integer', 'minimum': 1, 'maximum': 1440, 'description': '1回あたりの所要時間（分）。'},
+            'target_count': {'type': 'integer', 'minimum': 1, 'maximum': 31, 'description': '週の目標回数。未指定なら週3回。'},
+            'preferred_period': {'type': 'string', 'description': 'morning/afternoon/evening など。'},
+            'description': {'type': 'string'},
+            'week_start': {'type': 'string', 'format': 'date', 'description': '未指定なら今週の月曜。'},
+        }, 'required': ['title', 'duration_minutes'], 'additionalProperties': False},
+    }},
+    {'type': 'function', 'function': {
         'name': 'plan_routine_week',
         'description': 'ルーティンの週間計画を作り、空き時間へ実施予定を承認なしで配置する。週の目標回数・所要時間だけ変えたい場合に指定し、基本のルーティン設定は変更しない。同じ週に計画が既にあれば失敗する。',
         'parameters': {'type': 'object', 'properties': {
@@ -309,9 +321,28 @@ def execute_routine_plan_tool(name: str, arguments: dict[str, Any]) -> dict[str,
                         (routine['id'],),
                     ).fetchall()]
             return {'ok': True, 'routines': routines}
-        if name == 'plan_routine_week':
+        if name in {'plan_routine_week', 'create_routine'}:
             arguments = dict(arguments)
-            routine_id = arguments.pop('routine_id', '')
+            if name == 'create_routine':
+                count = int(arguments.get('target_count') or 3)
+                title = str(arguments.get('title', '')).strip()
+                with closing(open_database()) as connection:
+                    duplicate = connection.execute(
+                        'SELECT id FROM routines WHERE is_active = 1 AND title = ?', (title,),
+                    ).fetchone()
+                if duplicate:
+                    return {'ok': False, 'error': f'同名のルーティンが既にあります（id={duplicate["id"]}）。plan_routine_weekを使ってください。'}
+                created = create_routine(RoutineDefinitionPayload(
+                    title=title, description=str(arguments.get('description') or ''),
+                    target_count=count, min_count=1, max_count=max(count, 7),
+                    duration_minutes=int(arguments['duration_minutes']),
+                    preferred_period=arguments.get('preferred_period') or None,
+                    adjustment_policy='flexible', flexible=True,
+                ))
+                routine_id = created['id']
+                arguments = {key: arguments[key] for key in ('week_start',) if key in arguments}
+            else:
+                routine_id = arguments.pop('routine_id', '')
             week_start = arguments.get('week_start')
             if isinstance(week_start, str) and week_start:
                 arguments['week_start'] = date.fromisoformat(week_start)

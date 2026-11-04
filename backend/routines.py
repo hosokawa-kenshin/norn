@@ -448,8 +448,8 @@ def schedule_routine(arguments: dict[str, Any], user_content: str = '') -> dict[
                     if duration is None:
                         missing.append({**base, 'reason': '所要時間が不明です。'})
                         continue
-                    if day.weekday() not in tasks.PLANNING_WORKDAYS:
-                        missing.append({**base, 'reason': '設定された作業曜日ではありません。'})
+                    if not tasks.is_planning_workday(day):
+                        missing.append({**base, 'reason': '設定された休日または作業曜日ではありません。'})
                         continue
                     connection.execute('SAVEPOINT routine_occurrence')
                     create_args = None
