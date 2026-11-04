@@ -4512,6 +4512,20 @@ def test_chat_new_routine_request_does_not_create_tasks_with_schedule_routine(mo
         assert len(client.get('/api/routines').json()) == 1
 
 
+def test_routine_occurrence_keeps_break_from_adjacent_busy_blocks(monkeypatch, tmp_path):
+    payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-break', preferred_period=None, duration_minutes=60)
+    day = datetime.fromisoformat(ROUTINE_WEEK).date()
+    now = datetime.combine(day, time(0, 0), TOKYO)
+    busy = [(datetime.combine(day, time(9, 0), TOKYO), datetime.combine(day, time(10, 0), TOKYO))]
+    with TestClient(norn_app.app):
+        slot = routine_planning_module._find_slot(day, 60, busy, now, None)
+        long_slot = routine_planning_module._find_slot(day, 90, busy, now, None)
+
+    assert slot == (datetime.combine(day, time(10, 15), TOKYO), datetime.combine(day, time(11, 15), TOKYO))
+    assert long_slot[0] >= datetime.combine(day, time(10, 15), TOKYO)
+    assert payload['duration_minutes'] == 60
+
+
 def test_execution_log_updates_occurrence_status(monkeypatch, tmp_path):
     routine_payload = routine_planning_setup(monkeypatch, tmp_path, 'routine-log')
     with TestClient(norn_app.app) as client:

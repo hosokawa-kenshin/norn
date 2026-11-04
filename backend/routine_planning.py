@@ -62,7 +62,9 @@ def _find_slot(
 ) -> tuple[datetime, datetime] | None:
     day_start = datetime.combine(day, time.min, tasks.LOCAL_TIMEZONE)
     day_end = datetime.combine(day, time(23, 59, 59), tasks.LOCAL_TIMEZONE)
-    periods = tasks.available_work_periods(max(day_start, now), day_end, sorted(busy))
+    break_gap = timedelta(minutes=tasks.adaptive_break_minutes(None, minutes))
+    padded = [(start - break_gap, end + break_gap) for start, end in busy]
+    periods = tasks.available_work_periods(max(day_start, now), day_end, sorted(padded))
     duration = timedelta(minutes=minutes)
     for window_to_try in ([window, None] if window else [None]):
         for period_start, period_end in periods:
