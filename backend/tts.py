@@ -25,7 +25,6 @@ class SpeechRequest(BaseModel):
 
 @dataclass(frozen=True)
 class SpeechConfiguration:
-    root: Path
     python: Path
     model: Path
     config: Path
@@ -36,7 +35,7 @@ class SpeechConfiguration:
     style: str
 
 
-def speech_configuration(environ=None, base=None, platform=None):
+def speech_configuration(environ=None, base=None):
     env = os.environ if environ is None else environ
     project = settings.PROJECT_ROOT if base is None else Path(base)
 
@@ -44,21 +43,23 @@ def speech_configuration(environ=None, base=None, platform=None):
         candidate = Path(value).expanduser()
         return Path(os.path.abspath(candidate if candidate.is_absolute() else project / candidate))
 
-    missing = [key for key in ('NORN_TTS_ROOT', 'NORN_TTS_MODEL') if not env.get(key, '').strip()]
-    if missing:
-        raise ValueError('音声合成は未設定です。' + '、'.join(missing) + 'を設定してください。')
-    root = resolve(env['NORN_TTS_ROOT'])
+    if not env.get('NORN_TTS_MODEL', '').strip():
+        raise ValueError(
+            '音声合成は未設定です。NORN_TTS_MODELを設定してください。'
+        )
+
     model = resolve(env['NORN_TTS_MODEL'])
-    windows = (sys.platform if platform is None else platform) == 'win32'
-    default_python = root / '.venv' / ('Scripts/python.exe' if windows else 'bin/python')
-    python = resolve(env['NORN_TTS_PYTHON']) if env.get('NORN_TTS_PYTHON', '').strip() else default_python
+    python = (
+        resolve(env['NORN_TTS_PYTHON'])
+        if env.get('NORN_TTS_PYTHON', '').strip()
+        else Path(sys.executable).resolve()
+    )
     config = resolve(env['NORN_TTS_CONFIG']) if env.get('NORN_TTS_CONFIG', '').strip() else model.parent / 'config.json'
     vectors = resolve(env['NORN_TTS_STYLE_VECTORS']) if env.get('NORN_TTS_STYLE_VECTORS', '').strip() else model.parent / 'style_vectors.npy'
     device = env.get('NORN_TTS_DEVICE', 'auto').strip().lower()
     if not re.fullmatch(r'auto|cpu|cuda(?::\d+)?', device):
         raise ValueError('NORN_TTS_DEVICEはauto、cpu、cuda、cuda:番号のいずれかにしてください。')
-    if not root.is_dir():
-        raise ValueError('NORN_TTS_ROOTのディレクトリが見つかりません。')
+
     for key, candidate in [('NORN_TTS_PYTHON', python), ('NORN_TTS_MODEL', model),
                            ('NORN_TTS_CONFIG', config), ('NORN_TTS_STYLE_VECTORS', vectors)]:
         if not candidate.is_file():
@@ -74,7 +75,7 @@ def speech_configuration(environ=None, base=None, platform=None):
         raise ValueError('NORN_TTS_SPEAKER_IDは0以上の整数にしてください。') from error
     if speaker_id < 0:
         raise ValueError('NORN_TTS_SPEAKER_IDは0以上の整数にしてください。')
-    return SpeechConfiguration(root, python, model, config, vectors, device, bert, speaker_id,
+    return SpeechConfiguration(python, model, config, vectors, device, bert, speaker_id,
                                env.get('NORN_TTS_STYLE', 'Neutral').strip() or 'Neutral')
 
 
@@ -93,7 +94,7 @@ class SpeechService:
         try:
             config = speech_configuration()
         except ValueError as error:
-            unconfigured = any(not os.getenv(key, '').strip() for key in ('NORN_TTS_ROOT', 'NORN_TTS_MODEL'))
+            unconfigured = not os.getenv('NORN_TTS_MODEL', '',).strip()
             self.state = {'state': 'unconfigured' if unconfigured else 'unavailable',
                           'device': self.device, 'error': str(error)}
             return
@@ -122,15 +123,15 @@ class SpeechService:
             with self.lock, (settings.DATA_DIR / 'tts-worker.log').open('a', encoding='utf-8') as log:
                 if self.stopped.is_set():
                     return
-                command = [str(config.python), '-u', str(Path(__file__).with_name('tts_worker.py')),
-                           str(config.root), str(config.model), str((settings.DATA_DIR / 'tts-bert-cache').resolve()),
-                           '--config', str(config.config), '--style-vectors', str(config.style_vectors),
-                           '--device', config.device, '--speaker-id', str(config.speaker_id), '--style', config.style]
+                command = [str(config.python), '-u', str(Path(__file__).with_name('tts_worker.py')), str(config.model), 
+                           str((settings.DATA_DIR / 'tts-bert-cache').resolve()), '--config', str(config.config), 
+                           '--style-vectors', str(config.style_vectors), '--device', config.device, '--speaker-id', 
+                           str(config.speaker_id), '--style', config.style]
                 if config.bert_model is not None:
                     command.extend(['--bert-model', str(config.bert_model)])
                 self.process = subprocess.Popen(
                     command,
-                    cwd=config.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                     text=True, bufsize=1,
                     env=dict(os.environ, OMP_NUM_THREADS='4', MKL_NUM_THREADS='4',
                              HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1'),

@@ -3,11 +3,8 @@
 ## NORNとは
 
 NORNは、音声による自然な対話を中心に設計された、個人向けAIアシスタントです。
-
 ユーザーの呼びかけに応じて会話するだけでなく、タスク・スケジュール・目標・長期記憶を統合し、日常生活や作業をサポートします。
-
 音声認識・音声合成をローカル環境で動作させ、ハンズフリーでの会話やWindowsデスクトップへの常駐にも対応しています。
-
 単なる音声操作ツールではなく、日常的に会話しながら使えるパーソナルAIを目指しています。
 
 ## 主な機能
@@ -94,34 +91,23 @@ bash start.sh
 ```
 
 表示されたURLをブラウザで開き、マイクの使用を許可してください。
-
 初回の音声認識時にはfaster-whisperのモデルがダウンロードされます。
 
 ## 音声合成（TTS）の設定
 
 NORNはStyle-Bert-VITS2を利用した日本語音声合成に対応しています。
-
 TTSは任意機能です。無効の場合でもテキストによる会話や音声入力は利用できます。
 
-### 1. Style-Bert-VITS2の準備
+### 1. 音声モデルの準備
 
-Style-Bert-VITS2を別途用意し、専用のPython環境を構築します。
-
-- Style-Bert-VITS2本体
-- PyTorchなどの必要な依存関係
-- 日本語BERT・トークナイザー
-- 対応する音声モデル
-
-音声モデルは `.safetensors` または `.pth` 形式に対応しています。モデルに対応する `config.json` と `style_vectors.npy` も用意してください。
-
-※ NORN本体のPython環境とは分離して構築します。モデルやエンジンは自動ダウンロードされません。
+音声モデルは `.safetensors` または `.pth` 形式に対応しています。
+モデルに対応する `config.json` と `style_vectors.npy` も用意してください。
 
 ### 2. `.env`の設定
 
 ```dotenv
 NORN_TTS_ENABLED=1
 
-NORN_TTS_ROOT=/path/to/Style-Bert-VITS2
 NORN_TTS_MODEL=/path/to/voice/model.safetensors
 
 NORN_TTS_DEVICE=auto
@@ -134,7 +120,6 @@ NORN_TTS_STYLE=Neutral
 | 変数 | 説明 |
 |---|---|
 | `NORN_TTS_ENABLED` | TTSの有効・無効 |
-| `NORN_TTS_ROOT` | Style-Bert-VITS2の配置先 |
 | `NORN_TTS_MODEL` | 使用する音声モデル |
 | `NORN_TTS_DEVICE` | 推論デバイス（auto / cpu / cuda） |
 | `NORN_TTS_SPEAKER_ID` | 使用する話者ID |
@@ -145,9 +130,7 @@ NORN_TTS_STYLE=Neutral
 ### 3. 起動
 
 設定を保存してNORNを再起動します。
-
 モデルの読み込みとウォームアップが完了すると、AIの返答が音声で自動再生されます。
-
 音声合成に失敗した場合もテキストでの会話は継続できます。
 
 ## Google Calendarの初期設定
@@ -173,7 +156,7 @@ Windows上で常駐アプリとして利用する場合は、WSL2上のNORNバ�
 初回セットアップはWindowsのPowerShellで実行します。
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File "\\wsl.localhost\Ubuntu-22.04\home\fukawa\voice_project\norn\desktop\install.ps1"
+pwsh -NoProfile -ExecutionPolicy Bypass -File "\\wsl.localhost\Ubuntu-22.04\home\hosokawa\voice_project\norn\desktop\install.ps1"
 ```
 
 セットアップ後はスタートメニューから起動できます。
