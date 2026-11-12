@@ -4,7 +4,6 @@ import contextlib
 import io
 import json
 import hashlib
-import os
 import re
 import shutil
 import sys
@@ -57,7 +56,6 @@ def select_device(requested, torch_module):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('root', type=Path)
     parser.add_argument('model', type=Path)
     parser.add_argument('cache', type=Path)
     parser.add_argument('--config', type=Path)
@@ -69,10 +67,8 @@ def main():
     args = parser.parse_args()
     protocol = sys.stdout
     with contextlib.redirect_stdout(sys.stderr):
-        root = args.root.resolve()
         model_path = args.model.resolve()
-        os.chdir(root)
-        sys.path.insert(0, str(root))
+
         import numpy as np
         import torch
         from scipy.io import wavfile
